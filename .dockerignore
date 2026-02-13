@@ -1,0 +1,45 @@
+# Ignore virtual environment
+ai_moderator_agent/
+venv/
+ENV/
+env/
+.venv
+
+# Ignore Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore IDE
+.vscode/
+.idea/
+*.swp
+
+# Ignore logs
+logs/
+*.log
+
+# Ignore test files
+tests/
+test_*.py
+*_test.py
+create_test_room.py
+join_room_test.py
+verify_setup.py
+
+# Ignore docs
+*.md
+README.md
+QUICKSTART.md
+SETUP_COMPLETE.md
+
+# Ignore temporary files
+.DS_Store
+*.tmp

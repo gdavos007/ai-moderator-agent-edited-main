@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Join Survey - AI Survey Portal</title>
+    <link rel="stylesheet" href="/static/css/zoom-like.css">
+</head>
+<body>
+    <div class="join-container">
+        <!-- Waiting Room (shown before scheduled time) -->
+        <div id="waiting-room" class="join-card waiting-room" style="display: none;">
+            <div class="waiting-header">
+                <div class="survey-badge">Scheduled Survey</div>
+                <h1 id="waiting-title">AI Survey Session</h1>
+            </div>
+
+            <div class="countdown-section">
+                <p>Survey starts in</p>
+                <div class="countdown-timer">
+                    <div class="countdown-item">
+                        <span id="countdown-days" class="countdown-value">00</span>
+                        <span class="countdown-label">days</span>
+                    </div>
+                    <div class="countdown-item">
+                        <span id="countdown-hours" class="countdown-value">00</span>
+                        <span class="countdown-label">hours</span>
+                    </div>
+                    <div class="countdown-item">
+                        <span id="countdown-minutes" class="countdown-value">00</span>
+                        <span class="countdown-label">min</span>
+                    </div>
+                    <div class="countdown-item">
+                        <span id="countdown-seconds" class="countdown-value">00</span>
+                        <span class="countdown-label">sec</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="waiting-actions">
+                <button class="btn btn-secondary" onclick="testDevices()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                    </svg>
+                    Test Your Microphone
+                </button>
+                <button class="btn btn-outline" onclick="addToCalendar()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="4" width="18" height="18" rx="2" ry="2"/>
+                        <line x1="16" y1="2" x2="16" y2="6"/>
+                        <line x1="8" y1="2" x2="8" y2="6"/>
+                        <line x1="3" y1="10" x2="21" y2="10"/>
+                    </svg>
+                    Add to Calendar
+                </button>
+            </div>
+        </div>
+
+        <!-- Pre-Join Screen (Zoom-like) -->
+        <div id="pre-join" class="join-card pre-join">
+            <div class="pre-join-header">
+                <h1>Join Survey</h1>
+                <p id="survey-title-display">AI Survey Session</p>
+            </div>
+
+            <div class="preview-section">
+                <!-- Video Preview -->
+                <div class="video-preview-container">
+                    <video id="video-preview" autoplay muted playsinline></video>
+                    <div id="video-placeholder" class="video-placeholder">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>
+                        </svg>
+                        <span>Camera off</span>
+                    </div>
+                    <!-- Video Controls -->
+                    <div class="video-controls">
+                        <button id="toggle-camera" class="video-control-btn" onclick="toggleCamera()">
+                            <svg id="camera-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M23 7l-7 5 7 5V7z"/>
+                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+                            </svg>
+                        </button>
+                        <button id="toggle-mic-preview" class="video-control-btn" onclick="toggleMicPreview()">
+                            <svg id="mic-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                                <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                                <line x1="12" y1="19" x2="12" y2="22"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <div class="name-input-section">
+                    <label for="participant-name">Your Name</label>
+                    <input
+                        type="text"
+                        id="participant-name"
+                        placeholder="Enter your name"
+                        autocomplete="name"
+                        required
+                        minlength="2"
+                    >
+                </div>
+
+                {% if observer_enabled %}
+                <div class="role-selection-section" id="role-selection-section">
+                    <label for="role-select">Join As</label>
+                    <select id="role-select" onchange="onRoleChange()">
+                        <option value="participant">Participant</option>
+                        <option value="observer">Observer</option>
+                    </select>
+                </div>
+
+                <div class="observer-password-section" id="observer-password-section" style="display: none;">
+                    <label for="observer-password">Observer Password</label>
+                    <input
+                        type="password"
+                        id="observer-password"
+                        placeholder="Enter observer password"
+                        autocomplete="off"
+                    >
+                </div>
+                {% endif %}
+
+                <div class="device-status">
+                    <div class="device-item" id="camera-status">
+                        <svg class="device-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M23 7l-7 5 7 5V7z"/>
+                            <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+                        </svg>
+                        <span class="device-label">Camera</span>
+                        <span class="device-check pending">Checking...</span>
+                    </div>
+                    <div class="device-item" id="mic-status">
+                        <svg class="device-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" y1="19" x2="12" y2="22"/>
+                        </svg>
+                        <span class="device-label">Microphone</span>
+                        <span class="device-check pending">Checking...</span>
+                    </div>
+                    <div class="device-item" id="speaker-status">
+                        <svg class="device-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                        </svg>
+                        <span class="device-label">Speaker</span>
+                        <span class="device-check ready">Ready</span>
+                    </div>
+                </div>
+
+                <!-- Audio Level Meter -->
+                <div class="audio-meter-section" id="audio-meter-section" style="display: none;">
+                    <label>Microphone Level</label>
+                    <div class="audio-meter">
+                        <div class="audio-meter-bar" id="audio-meter-bar"></div>
+                    </div>
+                    <p class="audio-hint" id="audio-hint">Speak to test your microphone</p>
+                </div>
+            </div>
+
+            <div class="join-actions">
+                <button id="join-button" class="btn btn-primary btn-large" onclick="joinSurvey()" disabled>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+                        <polyline points="10 17 15 12 10 7"/>
+                        <line x1="15" y1="12" x2="3" y2="12"/>
+                    </svg>
+                    Join Survey
+                </button>
+            </div>
+
+            <div class="join-footer">
+                <p class="privacy-note">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    Your responses are recorded for research purposes
+                </p>
+            </div>
+        </div>
+
+        <!-- Loading/Connecting State -->
+        <div id="connecting" class="join-card connecting" style="display: none;">
+            <div class="connecting-content">
+                <div class="spinner"></div>
+                <h2>Connecting to Survey...</h2>
+                <p>Please wait while we set up your session</p>
+            </div>
+        </div>
+
+        <!-- Error State -->
+        <div id="error-state" class="join-card error-state" style="display: none;">
+            <div class="error-content">
+                <div class="error-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="12" y1="8" x2="12" y2="12"/>
+                        <line x1="12" y1="16" x2="12.01" y2="16"/>
+                    </svg>
+                </div>
+                <h2>Connection Error</h2>
+                <p id="error-message">Unable to connect to the survey.</p>
+                <button class="btn btn-primary" onclick="retryJoin()">Try Again</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+    <script>
+        // Configuration from server
+        const SURVEY_ID = "{{ survey_id }}";
+        const LIVEKIT_URL = "{{ livekit_url }}";
+        const OBSERVER_ENABLED = "{{ 'true' if observer_enabled else 'false' }}";
+
+        let audioContext = null;
+        let analyser = null;
+        let microphone = null;
+        let animationId = null;
+
+        // Video/Audio state
+        let mediaStream = null;
+        let cameraEnabled = true;
+        let micEnabled = true;
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', async function() {
+            // Check survey status
+            await checkSurveyStatus();
+
+            // Setup name input validation
+            const nameInput = document.getElementById('participant-name');
+            nameInput.addEventListener('input', validateForm);
+
+            // Setup observer password validation (only if observer is enabled)
+            if (OBSERVER_ENABLED) {
+                const observerPasswordInput = document.getElementById('observer-password');
+                if (observerPasswordInput) {
+                    observerPasswordInput.addEventListener('input', validateForm);
+                }
+            }
+
+            // Request camera and microphone permissions
+            await requestMediaAccess();
+        });
+
+        async function checkSurveyStatus() {
+            try {
+                const response = await fetch(`/api/survey/${SURVEY_ID}/status`);
+                const data = await response.json();
+
+                if (data.status === 'scheduled' && data.seconds_until_start > 0) {
+                    showWaitingRoom(data);
+                } else {
+                    showPreJoin(data);
+                }
+            } catch (error) {
+                console.log('Survey status check failed, showing pre-join');
+                showPreJoin({});
+            }
+        }
+
+        function showWaitingRoom(data) {
+            document.getElementById('waiting-room').style.display = 'block';
+            document.getElementById('pre-join').style.display = 'none';
+
+            if (data.title) {
+                document.getElementById('waiting-title').textContent = data.title;
+            }
+
+            startCountdown(data.seconds_until_start);
+        }
+
+        function showPreJoin(data) {
+            document.getElementById('waiting-room').style.display = 'none';
+            document.getElementById('pre-join').style.display = 'block';
+
+            if (data.title) {
+                document.getElementById('survey-title-display').textContent = data.title;
+            }
+        }
+
+        function startCountdown(totalSeconds) {
+            const countdownInterval = setInterval(() => {
+                if (totalSeconds <= 0) {
+                    clearInterval(countdownInterval);
+                    showPreJoin({});
+                    return;
+                }
+
+                const days = Math.floor(totalSeconds / 86400);
+                const hours = Math.floor((totalSeconds % 86400) / 3600);
+                const minutes = Math.floor((totalSeconds % 3600) / 60);
+                const seconds = totalSeconds % 60;
+
+                document.getElementById('countdown-days').textContent = String(days).padStart(2, '0');
+                document.getElementById('countdown-hours').textContent = String(hours).padStart(2, '0');
+                document.getElementById('countdown-minutes').textContent = String(minutes).padStart(2, '0');
+                document.getElementById('countdown-seconds').textContent = String(seconds).padStart(2, '0');
+
+                totalSeconds--;
+            }, 1000);
+        }
+
+        async function requestMediaAccess() {
+            const cameraStatus = document.getElementById('camera-status');
+            const cameraCheck = cameraStatus.querySelector('.device-check');
+            const micStatus = document.getElementById('mic-status');
+            const micCheck = micStatus.querySelector('.device-check');
+            const videoPreview = document.getElementById('video-preview');
+            const videoPlaceholder = document.getElementById('video-placeholder');
+
+            try {
+                // Request both camera and microphone with optimized audio for speech recognition
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480 },
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true,
+                        sampleRate: 48000,
+                        channelCount: 1
+                    }
+                });
+
+                // Setup video preview
+                videoPreview.srcObject = mediaStream;
+                videoPreview.style.display = 'block';
+                videoPlaceholder.style.display = 'none';
+                cameraCheck.textContent = 'Ready';
+                cameraCheck.className = 'device-check ready';
+
+                // Setup audio analysis
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioContext.createAnalyser();
+                microphone = audioContext.createMediaStreamSource(mediaStream);
+                microphone.connect(analyser);
+                analyser.fftSize = 256;
+
+                // Update mic UI
+                micCheck.textContent = 'Ready';
+                micCheck.className = 'device-check ready';
+
+                // Show audio meter
+                document.getElementById('audio-meter-section').style.display = 'block';
+                startAudioMeter();
+
+                validateForm();
+            } catch (error) {
+                console.error('Media access error:', error);
+
+                // Try audio only if video fails
+                try {
+                    // Audio only with optimized settings for speech recognition
+                    mediaStream = await navigator.mediaDevices.getUserMedia({
+                        audio: {
+                            echoCancellation: true,
+                            noiseSuppression: true,
+                            autoGainControl: true,
+                            sampleRate: 48000,
+                            channelCount: 1
+                        }
+                    });
+
+                    // Audio works, but no camera
+                    cameraCheck.textContent = 'Blocked';
+                    cameraCheck.className = 'device-check error';
+                    videoPlaceholder.style.display = 'flex';
+
+                    // Setup audio
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    analyser = audioContext.createAnalyser();
+                    microphone = audioContext.createMediaStreamSource(mediaStream);
+                    microphone.connect(analyser);
+                    analyser.fftSize = 256;
+
+                    micCheck.textContent = 'Ready';
+                    micCheck.className = 'device-check ready';
+                    document.getElementById('audio-meter-section').style.display = 'block';
+                    startAudioMeter();
+
+                    validateForm();
+                } catch (audioError) {
+                    console.error('Audio access also denied:', audioError);
+                    cameraCheck.textContent = 'Blocked';
+                    cameraCheck.className = 'device-check error';
+                    micCheck.textContent = 'Blocked';
+                    micCheck.className = 'device-check error';
+                    document.getElementById('audio-hint').textContent = 'Please allow camera and microphone access';
+                }
+            }
+        }
+
+        function toggleCamera() {
+            if (!mediaStream) return;
+
+            const videoTrack = mediaStream.getVideoTracks()[0];
+            if (videoTrack) {
+                cameraEnabled = !cameraEnabled;
+                videoTrack.enabled = cameraEnabled;
+
+                const videoPreview = document.getElementById('video-preview');
+                const videoPlaceholder = document.getElementById('video-placeholder');
+                const cameraBtn = document.getElementById('toggle-camera');
+
+                if (cameraEnabled) {
+                    videoPreview.style.display = 'block';
+                    videoPlaceholder.style.display = 'none';
+                    cameraBtn.classList.remove('muted');
+                } else {
+                    videoPreview.style.display = 'none';
+                    videoPlaceholder.style.display = 'flex';
+                    cameraBtn.classList.add('muted');
+                }
+            }
+        }
+
+        function toggleMicPreview() {
+            if (!mediaStream) return;
+
+            const audioTrack = mediaStream.getAudioTracks()[0];
+            if (audioTrack) {
+                micEnabled = !micEnabled;
+                audioTrack.enabled = micEnabled;
+
+                const micBtn = document.getElementById('toggle-mic-preview');
+                if (micEnabled) {
+                    micBtn.classList.remove('muted');
+                } else {
+                    micBtn.classList.add('muted');
+                }
+            }
+        }
+
+        function startAudioMeter() {
+            const meterBar = document.getElementById('audio-meter-bar');
+            const audioHint = document.getElementById('audio-hint');
+            const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+            function updateMeter() {
+                analyser.getByteFrequencyData(dataArray);
+                const average = dataArray.reduce((a, b) => a + b) / dataArray.length;
+                const level = Math.min(100, (average / 128) * 100);
+
+                meterBar.style.width = level + '%';
+
+                if (level > 10) {
+                    meterBar.style.backgroundColor = level > 50 ? '#4CAF50' : '#2196F3';
+                    audioHint.textContent = 'Great! Your microphone is working';
+                } else {
+                    meterBar.style.backgroundColor = '#ddd';
+                    audioHint.textContent = 'Speak to test your microphone';
+                }
+
+                animationId = requestAnimationFrame(updateMeter);
+            }
+
+            updateMeter();
+        }
+
+        function onRoleChange() {
+            const role = document.getElementById('role-select').value;
+            const passwordSection = document.getElementById('observer-password-section');
+
+            if (role === 'observer') {
+                passwordSection.style.display = 'block';
+            } else {
+                passwordSection.style.display = 'none';
+                document.getElementById('observer-password').value = '';
+            }
+
+            validateForm();
+        }
+
+        function validateForm() {
+            const name = document.getElementById('participant-name').value.trim();
+            const micReady = document.getElementById('mic-status').querySelector('.device-check').classList.contains('ready');
+            const roleSelect = document.getElementById('role-select');
+            const role = roleSelect ? roleSelect.value : 'participant';
+            const observerPasswordInput = document.getElementById('observer-password');
+            const observerPassword = observerPasswordInput ? observerPasswordInput.value : '';
+            const joinButton = document.getElementById('join-button');
+
+            // For observer, require password
+            if (role === 'observer') {
+                joinButton.disabled = !(name.length >= 2 && micReady && observerPassword.length > 0);
+            } else {
+                joinButton.disabled = !(name.length >= 2 && micReady);
+            }
+        }
+
+        async function joinSurvey() {
+            const name = document.getElementById('participant-name').value.trim();
+            const roleSelect = document.getElementById('role-select');
+            const role = roleSelect ? roleSelect.value : 'participant';
+            const observerPasswordInput = document.getElementById('observer-password');
+            const observerPassword = observerPasswordInput ? observerPasswordInput.value : '';
+
+            if (!name || name.length < 2) {
+                alert('Please enter your name (at least 2 characters)');
+                return;
+            }
+
+            if (role === 'observer' && !observerPassword) {
+                alert('Please enter the observer password');
+                return;
+            }
+
+            // Show connecting state
+            document.getElementById('pre-join').style.display = 'none';
+            document.getElementById('connecting').style.display = 'block';
+
+            // Stop audio meter
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+
+            try {
+                // Request token from server
+                const response = await fetch('/api/survey/join', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        survey_id: SURVEY_ID,
+                        participant_name: name,
+                        role: role,
+                        observer_password: role === 'observer' ? observerPassword : null
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to join survey');
+                }
+
+                const data = await response.json();
+
+                // Store connection info and redirect to survey page
+                sessionStorage.setItem('survey_token', data.token);
+                sessionStorage.setItem('survey_room', data.room_name);
+                sessionStorage.setItem('livekit_url', data.livekit_url);
+                sessionStorage.setItem('participant_name', name);
+                sessionStorage.setItem('participant_role', data.role);
+                sessionStorage.setItem('camera_enabled', cameraEnabled ? 'true' : 'false');
+                sessionStorage.setItem('mic_enabled', micEnabled ? 'true' : 'false');
+
+                // Stop media stream before navigating
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                }
+
+                window.location.href = `/survey/${SURVEY_ID}`;
+
+            } catch (error) {
+                console.error('Join error:', error);
+                showError(error.message);
+            }
+        }
+
+        function showError(message) {
+            document.getElementById('connecting').style.display = 'none';
+            document.getElementById('error-state').style.display = 'block';
+            document.getElementById('error-message').textContent = message;
+        }
+
+        function retryJoin() {
+            document.getElementById('error-state').style.display = 'none';
+            document.getElementById('pre-join').style.display = 'block';
+            requestMicrophoneAccess();
+        }
+
+        function testDevices() {
+            requestMicrophoneAccess();
+        }
+
+        function addToCalendar() {
+            // Generate ICS file (simplified)
+            alert('Calendar integration coming soon!');
+        }
+    </script>
+</body>
+</html>

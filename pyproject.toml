@@ -1,0 +1,45 @@
+[project]
+name = "ai-moderator-agent"
+version = "0.1.0"
+description = "AI-powered community discussion moderator using LiveKit"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "livekit-agents[silero,turn-detector]~=1.2",
+    "livekit-plugins-noise-cancellation~=0.2",
+    "livekit-agents[openai]~=1.2",
+    "livekit-agents[anthropic]~=1.2",
+    "python-docx>=1.1.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.3.3",
+    "fastapi>=0.128.6",
+    "uvicorn>=0.39.0",
+    "python-multipart>=0.0.20",
+    "jinja2>=3.1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.black]
+line-length = 88
+target-version = ['py39']
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false

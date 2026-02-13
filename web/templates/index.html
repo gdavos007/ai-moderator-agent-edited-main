@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Survey Portal</title>
+    <link rel="stylesheet" href="/static/css/zoom-like.css">
+</head>
+<body>
+    <div class="landing-container">
+        <div class="landing-card">
+            <div class="logo-section">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" y1="19" x2="12" y2="22"/>
+                    </svg>
+                </div>
+                <h1>AI Survey Portal</h1>
+                <p class="tagline">Voice-powered survey interviews with AI</p>
+            </div>
+
+            <div class="action-section">
+                <h2>Join a Survey</h2>
+                <p>Enter your survey code to join</p>
+
+                <form id="join-form" class="join-form">
+                    <div class="input-group">
+                        <input
+                            type="text"
+                            id="survey-code"
+                            placeholder="Enter survey code"
+                            pattern="[A-Za-z0-9\-]+"
+                            required
+                        >
+                        <button type="submit" class="btn btn-primary">
+                            Join
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M5 12h14M12 5l7 7-7 7"/>
+                            </svg>
+                        </button>
+                    </div>
+                </form>
+
+                <div class="divider">
+                    <span>or</span>
+                </div>
+
+                <a href="/quick-start" class="btn btn-secondary btn-full">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polygon points="10 8 16 12 10 16 10 8"/>
+                    </svg>
+                    Quick Start (Demo)
+                </a>
+            </div>
+
+            <div class="features-section">
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        </svg>
+                    </div>
+                    <span>Voice-based</span>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <path d="M12 6v6l4 2"/>
+                        </svg>
+                    </div>
+                    <span>15-20 min</span>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                        </svg>
+                    </div>
+                    <span>Private & Secure</span>
+                </div>
+            </div>
+        </div>
+
+        <footer class="landing-footer">
+            <p>Powered by AI Survey Moderator</p>
+        </footer>
+    </div>
+
+    <script>
+        document.getElementById('join-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const code = document.getElementById('survey-code').value.trim();
+            if (code) {
+                window.location.href = '/join/' + encodeURIComponent(code);
+            }
+        });
+    </script>
+</body>
+</html>

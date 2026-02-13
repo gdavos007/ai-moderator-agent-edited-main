@@ -1,0 +1,63 @@
+# AI Moderator Agent - Survey Configuration
+# This file defines available surveys and their settings
+
+# Default survey to use (can be overridden with SURVEY_ID environment variable)
+# Example: SURVEY_ID=quantitative_example python agent.py
+default_survey: "orange_county_resident_employee_survey"
+
+# Survey definitions
+surveys:
+  - survey_id: "quantitative_example"
+    name: "Orange County Survey - Unified Format"
+    description: "Example quantitative survey"
+    questions_file: "src_data/example_surveys/quantitative_example.json"
+    enabled: true
+
+  - survey_id: "qualitative_example"
+    name: "Amtrak Focus Group"
+    description: "Example qualitative survey with open-ended questions"
+    questions_file: "src_data/example_surveys/qualitative_example.json"
+    enabled: true
+
+  - survey_id: "pace_focus_group"
+    name: "PACE Focus Group"
+    description: "Focus group discussion about healthcare available to seniors, and because members who are enrolled in a PACE program"
+    questions_file: "src_data/product_prototype/pace_focusgroup.json"
+    enabled: true
+
+  - survey_id: "mixed_example"
+    name: "Community Services Survey"
+    description: "Example mixed survey with both question types"
+    questions_file: "src_data/example_surveys/mixed_example.json"
+    enabled: true
+
+  - survey_id: "orange_county_resident_employee_survey"
+    name: "Orange County Resident and Employee Survey (Legacy)"
+    description: "Legacy quantitative survey format"
+    questions_file: "src_data/orange_county_resident_employee_survey/Resident and Employee Survey.json"
+    enabled: true                                                                                                         
+
+
+#surveys:
+#  # Orange County Issues Survey
+#  orange_county_resident_employee_survey:
+#    name: "Orange County Resident and Employee Survey"
+#    questions_file: "src_data/orange_county_resident_employee_survey/Resident and Employee Survey.json"
+#    welcome_message: "Thank you for participating in our Orange County community survey."
+#    response_output_dir: "output/orange_county_resident_employee_survey"
+#    enabled: true
+
+  # Example: Add more surveys here as you create them
+  # another_survey:
+  #   name: "Another Survey Name"
+  #   questions_file: "src_data/another_survey_folder/questions.json"
+  #   welcome_message: "Welcome message here"
+  #   response_output_dir: "output/another_survey"
+  #   enabled: false
+
+# Configuration Fields:
+# - name (REQUIRED): Display name for the survey
+# - questions_file (REQUIRED): Path to questions JSON file (relative to project root)
+# - welcome_message (OPTIONAL): Custom welcome message for participants
+# - response_output_dir (OPTIONAL): Output directory for responses (default: "output")
+# - enabled (OPTIONAL): Enable/disable survey without removing config (default: true)
