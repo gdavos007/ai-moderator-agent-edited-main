@@ -101,12 +101,15 @@ async def handle_welcome_section(session, question_loader, config):
         # Combine into single welcome message
         full_welcome = f"{greeting_text} {instructions_text} {audio_check_text}"
 
+        logger.info(f"🎤 WELCOME TEXT SENT TO TTS: '{full_welcome}'")
+
         welcome_instructions = f"""Say EXACTLY this:
 "{full_welcome}"
 
 Then STOP speaking and WAIT."""
 
         await session.generate_reply(instructions=welcome_instructions)
+        logger.info("✅ Welcome TTS completed")
         return wait_seconds
 
     else:
@@ -114,12 +117,15 @@ Then STOP speaking and WAIT."""
         logger.info("Using default hardcoded welcome message")
         microphone_ready_text = f"Hello! I'm {config.agent_name}, your AI survey moderator. Please make sure your microphone is unmuted and working. I'll wait 1 minute for everyone to get ready before we begin."
 
+        logger.info(f"🎤 WELCOME TEXT SENT TO TTS: '{microphone_ready_text}'")
+
         microphone_ready_instructions = f"""Say EXACTLY this:
 "{microphone_ready_text}"
 
 Then STOP speaking and WAIT."""
 
         await session.generate_reply(instructions=microphone_ready_instructions)
+        logger.info("✅ Welcome TTS completed")
         return 15
 
 
@@ -238,6 +244,7 @@ async def entrypoint(ctx: agents.JobContext):
             tts_model=config.tts_model,
             tts_voice=config.tts_voice,
             deepgram_api_key=config.deepgram_api_key,
+            eleven_api_key=config.eleven_api_key,
             temperature=config.temperature,
             max_turn_duration=config.max_turn_duration,
             turn_warning_duration=config.turn_warning_duration,
@@ -251,15 +258,6 @@ async def entrypoint(ctx: agents.JobContext):
             question_loader=question_loader,
             participant_manager=participant_manager,
             survey_config=survey_config,
-            # Adaptive silence wait time settings
-            silence_wait_turn_exceeded=config.silence_wait_turn_exceeded,
-            silence_wait_long=config.silence_wait_long,
-            silence_wait_multi_option=config.silence_wait_multi_option,
-            silence_wait_qualitative_medium=config.silence_wait_qualitative_medium,
-            silence_wait_qualitative_building=config.silence_wait_qualitative_building,
-            silence_wait_qualitative_short_medium=config.silence_wait_qualitative_short_medium,
-            silence_wait_qualitative_short=config.silence_wait_qualitative_short,
-            silence_wait_quantitative=config.silence_wait_quantitative,
         )
 
         logger.info("Agent is now active and monitoring the discussion")
@@ -426,8 +424,26 @@ async def entrypoint(ctx: agents.JobContext):
         # Wait a moment after greeting, then start asking questions
         await asyncio.sleep(3)
 
-        # Start asking questions
+        # Start asking questions — transition OUT of WELCOME phase
         if hasattr(moderator, 'ask_next_question'):
+            from src.moderator_agent import SurveyState
+            moderator.survey_state = SurveyState.RUNNING
+            logger.info(f"🟢 Survey state: WELCOME → RUNNING (welcome/greeting complete, questions starting)")
+
+            # #region agent log
+            import json as _json
+            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"location": "agent.py:state_transition", "message": "WELCOME → RUNNING transition", "data": {"survey_state": moderator.survey_state.value}, "timestamp": int(__import__('datetime').datetime.now().timestamp() * 1000), "hypothesisId": "B"}) + "\n")
+            # #endregion
+
+            # Clear any response fragments that may have accumulated during welcome
+            moderator.response_fragments = []
+            moderator.latest_user_response = None
+            moderator.pending_stt_transcript = None
+            moderator.last_stt_fragment = ""
+            moderator.response_captured = False
+            logger.info("🧹 Cleared response buffers before first question")
+
             logger.info("Starting question-based survey")
             await moderator.ask_next_question()
         else:

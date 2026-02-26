@@ -24,6 +24,8 @@ dependencies = [
     { name = "jinja2" },
     { name = "livekit-agents", version = "1.3.12", source = { registry = "https://pypi.org/simple" }, extra = ["anthropic", "openai", "silero", "turn-detector"], marker = "python_full_version < '3.10'" },
     { name = "livekit-agents", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, extra = ["anthropic", "openai", "silero", "turn-detector"], marker = "python_full_version >= '3.10'" },
+    { name = "livekit-plugins-deepgram", version = "1.3.12", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "livekit-plugins-deepgram", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
     { name = "livekit-plugins-noise-cancellation" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -56,6 +58,7 @@ requires-dist = [
     { name = "livekit-agents", extras = ["anthropic"], specifier = "~=1.2" },
     { name = "livekit-agents", extras = ["openai"], specifier = "~=1.2" },
     { name = "livekit-agents", extras = ["silero", "turn-detector"], specifier = "~=1.2" },
+    { name = "livekit-plugins-deepgram", specifier = "~=1.2" },
     { name = "livekit-plugins-noise-cancellation", specifier = "~=0.2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0.0" },
     { name = "pandas", specifier = ">=2.3.3" },
@@ -1823,6 +1826,48 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/64/9a/3d5991abccf1271f5c5a371e2774d0df25bf27cd3a4fabbd633558a5717e/livekit_plugins_anthropic-1.4.1.tar.gz", hash = "sha256:f1f7ddd7c80ac73800047293e7409acd527f33b5aab821147be37235d376c31a", size = 7032, upload-time = "2026-02-06T21:29:45.678Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/29/d8/cee8cc2b6fb9d98793dcce80a62569433724ac21f9ef20bf80594de34fc9/livekit_plugins_anthropic-1.4.1-py3-none-any.whl", hash = "sha256:f7d9fd6b564f6c407aef49842d1a0905d395f4602a106ddb71bacde3bdf662fe", size = 8023, upload-time = "2026-02-06T21:29:44.434Z" },
+]
+
+[[package]]
+name = "livekit-plugins-deepgram"
+version = "1.3.12"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version < '3.10'",
+]
+dependencies = [
+    { name = "livekit-agents", version = "1.3.12", source = { registry = "https://pypi.org/simple" }, extra = ["codecs"], marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/dc/0305ffce4c389e6729a7ce99d6ae39aa048aece9f4a7d41add469d841d7e/livekit_plugins_deepgram-1.3.12.tar.gz", hash = "sha256:9f1e64eb410ce3b9a60b6865dc244632d2617105661f2db232aba860497587e0", size = 16380, upload-time = "2026-01-21T22:13:15.615Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/33/8ae4e8d2edcc65ebb77ac0ab5103b4b0b5848687170fd45994032a236b1b/livekit_plugins_deepgram-1.3.12-py3-none-any.whl", hash = "sha256:801f3f3b94dca186dfbf8c4daf3bb3f8194566647e517b85c13ac04aceacd3ff", size = 21670, upload-time = "2026-01-21T22:13:14.523Z" },
+]
+
+[[package]]
+name = "livekit-plugins-deepgram"
+version = "1.4.1"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'win32'",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.10.*'",
+]
+dependencies = [
+    { name = "livekit-agents", version = "1.4.1", source = { registry = "https://pypi.org/simple" }, extra = ["codecs"], marker = "python_full_version >= '3.10'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/08/03/8ce5dcc15126fa4c0c00eb2cef90448abf080361c925c1260164d6caec89/livekit_plugins_deepgram-1.4.1.tar.gz", hash = "sha256:f2da1cee631f0f18dcd245caebcf00504ca974efda0df90a407a5343d756344d", size = 16652, upload-time = "2026-02-06T21:37:50.908Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/15/63/99515b6fbdabbb51068af09fdd5ed671fb320838226fe6eaf5a473a55655/livekit_plugins_deepgram-1.4.1-py3-none-any.whl", hash = "sha256:c6368ea7357413baf2ce3fe1b5e524840d550a33a9fc2f8204b4816c64b4c6a5", size = 21838, upload-time = "2026-02-06T21:37:50.058Z" },
 ]
 
 [[package]]

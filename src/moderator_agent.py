@@ -4,8 +4,9 @@ Main agent implementation with moderation capabilities, time management, and top
 """
 import logging
 import asyncio
+import random
 import re
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from difflib import get_close_matches
@@ -13,6 +14,7 @@ from difflib import get_close_matches
 from livekit import agents, api
 from livekit.agents import Agent, AgentSession, RoomInputOptions
 from livekit.plugins import openai, silero, noise_cancellation
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 import openai as openai_client  # Direct OpenAI client for relevance checks
 try:
     from livekit.plugins import deepgram
@@ -31,6 +33,13 @@ except (ImportError, AttributeError) as e:
     import sys
     print(f"Warning: Google STT plugin not available: {e}", file=sys.stderr)
 
+try:
+    from livekit.plugins import elevenlabs
+    ELEVENLABS_AVAILABLE = True
+except ImportError:
+    ELEVENLABS_AVAILABLE = False
+    elevenlabs = None
+
 from .question_loader import QuestionLoader, Question
 from .participant_manager import ParticipantManager
 from .audit_logger import AuditLogger
@@ -48,6 +57,7 @@ logger = logging.getLogger(__name__)
 # Survey state enum for Observer control
 class SurveyState(Enum):
     """Track the current state of the survey for Observer control."""
+    WELCOME = "welcome"                             # Delivering welcome/greeting (ignore user STT)
     WAITING_FOR_OBSERVER = "waiting_for_observer"  # Observer must trigger start
     RUNNING = "running"                             # Survey in progress
     PAUSED = "paused"                               # Paused by observer
@@ -374,14 +384,17 @@ def is_uncertain_response(text: str) -> bool:
 
 def is_repeat_request(text: str) -> bool:
     """
-    Detect if a response is a request to repeat the question.
+    Deterministic heuristic to detect if a response is a request to repeat
+    the question.  Called BEFORE the LLM analysis so that common phrasing
+    is caught instantly without an extra round-trip.
 
     Matches phrases like:
     - "Can you repeat that?"
     - "Repeat the question"
     - "Say that again"
     - "What was the question?"
-    - "I didn't hear you"
+    - "I didn't hear you" / "I didn't hear the last part"
+    - "Can you say the first part of the question?"
     - "Come again?"
     - etc.
 
@@ -396,53 +409,101 @@ def is_repeat_request(text: str) -> bool:
 
     text_lower = text.lower().strip()
 
-    # Common repeat request phrases
+    # ── Substring-match phrases ──────────────────────────────────────────
     repeat_phrases = [
+        # Explicit "repeat"
         "repeat",
+        # "say … again"
         "say that again",
         "say it again",
+        "say the question again",
+        "say that one more time",
+        # "come again"
         "come again",
+        # "what was the question / last part / first part"
         "what was the question",
         "what's the question",
         "what is the question",
+        "what was the last part",
+        "what was the first part",
+        "what was that last part",
+        "what was that first part",
+        # "didn't hear / catch"
         "didn't hear",
         "did not hear",
         "didn't catch",
         "did not catch",
+        "couldn't hear",
+        "could not hear",
+        # "can you say …"
         "can you say that again",
         "could you say that again",
+        "can you say the last part",
+        "can you say the first part",
+        "could you say the last part",
+        "could you say the first part",
+        "can you say that one more time",
+        # "can you repeat"
         "can you repeat",
         "could you repeat",
         "please repeat",
+        # "one more time"
         "one more time",
         "again please",
+        # politeness / mishearing
         "pardon",
         "excuse me",
         "sorry what",
+        # "what did you …"
         "what did you say",
         "what did you ask",
+        # missed / misunderstood
         "i missed that",
         "missed the question",
         "didn't understand",
         "did not understand",
+        "didn't get that",
+        "did not get that",
+        "i didn't get the question",
+        # audio issues
         "can't hear",
         "cannot hear",
         "speak up",
         "louder please",
+        # short interjections
         "what again",
         "huh",
         "what?",
+        # "last part" / "first part" variants (without "what was")
+        "the last part",
+        "the first part",
+        "last part of the question",
+        "first part of the question",
     ]
 
-    # Check if the response contains any repeat request phrase
     for phrase in repeat_phrases:
         if phrase in text_lower:
-            logger.info(f"Detected repeat request: '{text}' matches phrase '{phrase}'")
+            logger.info(f"🔁 Heuristic repeat-request detected: '{text}' matches phrase '{phrase}'")
             return True
 
-    # Also check for very short responses that are just "what" or "huh"
-    if text_lower in ["what", "what?", "huh", "huh?", "sorry", "sorry?"]:
-        logger.info(f"Detected short repeat request: '{text}'")
+    # ── Regex patterns for harder-to-catch variants ──────────────────────
+    import re
+    _repeat_patterns = [
+        # "say … again" with anything in between: "can you say the question again"
+        r"\bsay\b.{0,30}\bagain\b",
+        # "hear … last/first part": "I didn't hear the last part"
+        r"\bhear\b.{0,20}\b(last|first)\s*part\b",
+        # "what was … part": "what was the second part"
+        r"\bwhat\s+was\b.{0,20}\bpart\b",
+    ]
+    for pattern in _repeat_patterns:
+        if re.search(pattern, text_lower):
+            logger.info(f"🔁 Heuristic repeat-request detected (regex): '{text}' matches /{pattern}/")
+            return True
+
+    # ── Very short responses that are just confusion ─────────────────────
+    if text_lower in ["what", "what?", "huh", "huh?", "sorry", "sorry?", "come again", "come again?"]:
+        logger.info(f"🔁 Heuristic repeat-request detected (short): '{text}'")
         return True
 
     return False
@@ -746,6 +807,26 @@ async def check_response_relevance(question_text: str, response_text: str, surve
     return analysis.is_relevant
 
 
+@dataclass(frozen=True)
+class TurnResult:
+    """Immutable snapshot of who answered and how — used for acknowledgments.
+
+    The ack_name is always derived from the same identity that was used to store
+    the response (actual speaker), preventing stale-name bugs when the mutable
+    ``last_respondent`` field drifts between turns.
+    """
+    expected_identity: str
+    actual_identity: str
+    expected_display: str
+    actual_display: str
+    was_timeout: bool = False
+
+    @property
+    def ack_name(self) -> str:
+        """Display name for the acknowledgment — always the actual speaker."""
+        return self.actual_display
+
+
 @dataclass
 class TurnInfo:
     """Track information about a participant's turn"""
@@ -780,15 +861,6 @@ class CommunityModeratorAgent(Agent):
         question_loader: Optional[QuestionLoader] = None,
         participant_manager: Optional[ParticipantManager] = None,
         survey_config: Optional[SurveyConfig] = None,
-        # Adaptive silence wait time settings (in seconds) - AGGRESSIVE for near-real-time response
-        silence_wait_turn_exceeded: float = 0.3,
-        silence_wait_long: float = 1.5,
-        silence_wait_multi_option: float = 1.2,
-        silence_wait_qualitative_medium: float = 1.5,
-        silence_wait_qualitative_building: float = 1.2,
-        silence_wait_qualitative_short_medium: float = 1.0,
-        silence_wait_qualitative_short: float = 0.8,
-        silence_wait_quantitative: float = 0.5,
     ):
         super().__init__(instructions=instructions)
         self.participant_tracker = {}
@@ -811,16 +883,6 @@ class CommunityModeratorAgent(Agent):
         self.discussion_topic = discussion_topic
         self.off_topic_interrupt_threshold = off_topic_interrupt_threshold
         self.enable_topic_enforcement = enable_topic_enforcement
-
-        # Adaptive silence wait time configuration (in seconds)
-        self.silence_wait_turn_exceeded = silence_wait_turn_exceeded
-        self.silence_wait_long = silence_wait_long
-        self.silence_wait_multi_option = silence_wait_multi_option
-        self.silence_wait_qualitative_medium = silence_wait_qualitative_medium
-        self.silence_wait_qualitative_building = silence_wait_qualitative_building
-        self.silence_wait_qualitative_short_medium = silence_wait_qualitative_short_medium
-        self.silence_wait_qualitative_short = silence_wait_qualitative_short
-        self.silence_wait_quantitative = silence_wait_quantitative
 
         # Current turn tracking
         self.current_turn: Optional[TurnInfo] = None
@@ -864,14 +926,12 @@ class CommunityModeratorAgent(Agent):
         # NETWORK LATENCY TRACKING
         self.speaking_start_time: Optional[datetime] = None  # When user started speaking (for STT latency calc)
         self.first_stt_received = False  # Whether we've received first STT for this speaking segment
-        self.network_latency_threshold_ms = 2000  # Log warning if STT latency exceeds 2 seconds
-        # NETWORK LATENCY ADAPTATION: Track observed latency to adjust timeouts
         self.observed_stt_latency_ms = 0  # Most recent STT latency observed
         self.max_observed_latency_ms = 0  # Maximum latency seen in this session
-        self.network_latency_buffer_s = 0.0  # Extra buffer to add to wait times based on network conditions
         self.is_multi_option_question = False  # Track if current question requires multiple answers (e.g., "Choose THREE")
         self.fragment_gap_timeout = 5.0  # Default gap between fragments (seconds) - increased from 3s
         self.last_respondent = None  # Track the participant who just answered (for personalized acknowledgment)
+        self._last_turn_result: Optional[TurnResult] = None  # Immutable turn snapshot for ack
         self.encouragement_given = False  # Track if we've already encouraged participant on "I don't know" response
         self.question_repeated = False  # Track if we've already repeated the question for this participant
         self.relevance_prompt_given = False  # Track if we've already asked for relevant response (don't check twice)
@@ -885,19 +945,35 @@ class CommunityModeratorAgent(Agent):
         self.participant_audio_activity = {}  # participant_identity -> last_audio_time
         self.active_speaker_track_sid = None  # Currently active audio track SID
 
+        # Delivery state tracking to prevent skip-on-drift behavior
+        self.question_delivery_state: Dict[Tuple[int, str], str] = {}  # (question_num, participant) -> state
+        self.question_delivery_retries: Dict[Tuple[int, str], int] = {}  # bounded retries per question+participant
+        self.question_delivery_retry_after: Dict[Tuple[int, str], datetime] = {}  # retry cooldown timestamp
+        self.max_delivery_retries_per_question = 3
+
         # LiveKit API for muting/unmuting participants
         self.livekit_api = None  # Will be set during session creation
         self.room_name = None  # Will be set during session creation
 
         # Observer/Survey state management
-        self.survey_state = SurveyState.RUNNING  # Default to running (non-observer mode)
+        self.survey_state = SurveyState.WELCOME  # Start in WELCOME phase (ignore user STT until questions begin)
         self.observer_mode_enabled = False  # Set True if observer is present
         self.paused_at_question = None  # Track question number when paused
         self.paused_at_participant = None  # Track participant when paused
         self.pause_start_time: Optional[datetime] = None  # When pause started
         self.accumulated_pause_duration: float = 0.0  # Total paused time for current turn
         self._response_processing_start: Optional[datetime] = None  # LATENCY TRACKING: When response processing began
+        self._transition_filler_said: bool = False  # One-time filler guard per turn transition
+        self._analysis_start_time: Optional[datetime] = None  # For analysis_ms metric
+        self._silence_confirmed_time: Optional[datetime] = None  # For silence_confirmation_ms metric
         self.turn_time_exceeded: bool = False  # Flag set when turn monitor detects time exceeded and user stopped
+        self._tts_in_flight: bool = False  # Single-flight guard: True while a TTS say() is active
+        self._tts_sequence: int = 0  # Monotonic counter to detect overlapping TTS calls
+        self._polling_deadline: Optional[float] = None  # time.time() deadline; extended on repeat
+        self._ack_already_spoken: bool = False  # True when polling loop already spoke the ack
+        self._prewarmed_ack_text: Optional[str] = None  # Pre-computed ack text for concurrent TTS
+        self._gentle_warning_in_progress: bool = False  # True while gentle warning TTS is playing; prevents premature response capture
+        self._first_fragment_time: Optional[datetime] = None  # When first STT fragment arrived for current question; used for stabilization delay
 
         logger.info(
             f"Agent initialized with graceful survey time management: "
@@ -942,6 +1018,17 @@ class CommunityModeratorAgent(Agent):
             logger.error(f"❌ Failed to list participants for muting: {e}")
             return
 
+        # SAFETY: Verify the active_participant actually exists in the room
+        # before muting everyone else. If not found, abort to avoid silencing
+        # the entire room (common in single-participant demos).
+        if active_participant not in room_participants:
+            logger.warning(
+                f"🛡️ MUTING ABORTED: active_participant '{active_participant}' not found "
+                f"in room participants {list(room_participants.keys())}. "
+                f"Skipping mute to avoid silencing the room."
+            )
+            return
+
         for participant_identity in all_participants:
             try:
                 should_mute = (participant_identity != active_participant)
@@ -949,16 +1036,6 @@ class CommunityModeratorAgent(Agent):
                 # Find this participant's info from room
                 participant_info = room_participants.get(participant_identity)
                 if not participant_info:
-                    # #region agent log
-                    import json as _json2
-                    _debug_log_path2 = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
-                    try:
-                        entry = {"timestamp": int(datetime.now().timestamp() * 1000), "location": "moderator_agent.py:manage_participant_muting", "message": "Participant NOT FOUND in room during muting", "data": {"identity": participant_identity, "active_participant": active_participant, "room_identities": list(room_participants.keys()), "pm_participants": list(self.participant_manager.participants)}, "hypothesisId": "H3"}
-                        with open(_debug_log_path2, "a") as f:
-                            f.write(_json2.dumps(entry) + "\n")
-                    except Exception:
-                        pass
-                    # #endregion
                     logger.warning(f"  ⚠️ Participant {participant_identity} not found in room")
                     continue
 
@@ -993,6 +1070,16 @@ class CommunityModeratorAgent(Agent):
                 logger.error(traceback.format_exc())
 
         logger.info(f"✅ Muting management complete - {active_participant} can speak")
+
+    def _active_respondent_count(self) -> int:
+        """Return the number of active (connected, non-observer) respondents."""
+        if not self.participant_manager:
+            return 0
+        available = [
+            p for p in self.participant_manager.participants
+            if p not in self.participant_manager.unavailable_participants
+        ]
+        return len(available)
 
     async def unmute_all_participants(self):
         """
@@ -1042,6 +1129,374 @@ class CommunityModeratorAgent(Agent):
 
         logger.info("✅ All participants unmuted")
 
+    def _delivery_key(self, question_num: int, participant_identity: str) -> Tuple[int, str]:
+        return (question_num, participant_identity)
+
+    def _set_delivery_state(self, question_num: int, participant_identity: str, state: str, context: str = ""):
+        key = self._delivery_key(question_num, participant_identity)
+        old_state = self.question_delivery_state.get(key, "none")
+        self.question_delivery_state[key] = state
+        logger.debug(
+            f"[delivery-state] q={question_num} participant={participant_identity} -> {state}"
+            f"{f' ({context})' if context else ''}"
+        )
+        # #region agent log
+        import json as _json
+        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "moderator_agent.py:_set_delivery_state", "message": f"delivery-state transition", "data": {"question_num": question_num, "participant": participant_identity, "old_state": old_state, "new_state": state, "context": context}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_DELIVERY_TRACE"}) + "\n")
+        # #endregion
+
+    def _is_delivery_confirmed(self, question_num: int, participant_identity: str) -> bool:
+        key = self._delivery_key(question_num, participant_identity)
+        return self.question_delivery_state.get(key) == "delivered"
+
+    def _record_turn_result(self, expected: str, actual: str, *, was_timeout: bool = False) -> TurnResult:
+        """Create an immutable TurnResult and update last_respondent atomically.
+
+        This is the SINGLE place that decides who gets thanked, eliminating
+        stale-name bugs from the mutable ``last_respondent`` field.
+        """
+        expected_display = (
+            self.participant_manager.get_display_name(expected)
+            if self.participant_manager else expected.capitalize()
+        )
+        actual_display = (
+            self.participant_manager.get_display_name(actual)
+            if self.participant_manager else actual.capitalize()
+        )
+        result = TurnResult(
+            expected_identity=expected,
+            actual_identity=actual,
+            expected_display=expected_display,
+            actual_display=actual_display,
+            was_timeout=was_timeout,
+        )
+        self._last_turn_result = result
+        self.last_respondent = actual  # keep legacy field in sync
+        logger.info(
+            f"📋 TURN RESULT: expected={expected} actual={actual} "
+            f"ack_name={result.ack_name} timeout={was_timeout}"
+        )
+
+        # #region agent log
+        import json as _json
+        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "moderator_agent.py:_record_turn_result", "message": "Turn result recorded", "data": {"expected": expected, "actual": actual, "ack_name": result.ack_name, "timeout": was_timeout, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "ACK_NAME"}) + "\n")
+        # #endregion
+
+        return result
+
+    async def _analyze_with_filler(self, question_text: str, response_text: str, survey_desc: str, filler_threshold: float = 2.0):
+        """Run LLM analysis with a transition filler if it takes too long.
+
+        Starts the analysis as a concurrent task. If it doesn't complete
+        within `filler_threshold` seconds AND no filler has been said this
+        turn, a brief "One moment..." is spoken to reduce perceived dead-air.
+        Returns the analysis result and the wall-clock duration in seconds.
+        """
+        self._analysis_start_time = datetime.now()
+        analysis_task = asyncio.create_task(analyze_response(question_text, response_text, survey_desc))
+
+        try:
+            result = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=filler_threshold)
+        except asyncio.TimeoutError:
+            if not self._transition_filler_said and self.agent_session:
+                self._transition_filler_said = True
+                logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
+                # #region agent log
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}) + "\n")
+                # #endregion
+                await self.agent_session.say("One moment...", allow_interruptions=False)
+            result = await analysis_task
+
+        analysis_duration = (datetime.now() - self._analysis_start_time).total_seconds()
+        logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
+
+        # #region agent log
+        import json as _json
+        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}) + "\n")
+        # #endregion
+
+        return result, analysis_duration
+
+    async def _prewarm_ack_tts(self, text: str):
+        """Best-effort background TTS pre-synthesis to warm engine caches.
+
+        Runs concurrently with the LLM analysis so that when the analysis
+        completes and the ack is spoken via session.say(), the TTS engine
+        has already seen/cached the text, reducing first-byte latency.
+        """
+        try:
+            if self.agent_session and hasattr(self.agent_session, 'tts') and self.agent_session.tts:
+                async for _ in self.agent_session.tts.synthesize(text):
+                    pass
+                logger.debug(f"🔊 TTS pre-warm complete for: '{text}'")
+        except Exception as e:
+            logger.debug(f"TTS pre-warm skipped (non-critical): {e}")
+
+    # ── Single-flight TTS with truncation detection + retry ──────────────
+    _TTS_WORDS_PER_SEC = 2.5  # conservative TTS speech rate (real TTS ~1.7-2.8 wps)
+
+    async def _speak_question_safely(
+        self,
+        text: str,
+        *,
+        context: str = "",
+        max_retries: int = 1,
+    ) -> bool:
+        """Speak *text* with truncation detection and bounded retry.
+
+        On the first attempt the question is spoken with
+        ``allow_interruptions=True`` (natural conversational flow).
+        If the TTS returns suspiciously fast (< 50 % of estimated minimum
+        duration), we assume it was interrupted by spillover audio / noise
+        and retry **once** with ``allow_interruptions=False``.
+
+        A single-flight guard prevents overlapping ``say()`` calls: if a
+        previous TTS is still active the new call waits up to 30 s for it
+        to finish.
+
+        Returns ``True`` if the question was (likely) fully spoken.
+        """
+        word_count = len(text.split())
+        estimated_min_sec = word_count / self._TTS_WORDS_PER_SEC
+
+        for attempt in range(1 + max_retries):
+            allow_int = attempt == 0  # first try: interruptible; retry: not
+            seq = self._tts_sequence + 1
+            self._tts_sequence = seq
+
+            # ── Single-flight guard ────────────────────────────────────
+            if self._tts_in_flight:
+                logger.warning(
+                    f"⚠️ TTS OVERLAP: new say() requested while previous TTS still in flight "
+                    f"[{context}]. Waiting up to 30 s…"
+                )
+                # #region agent log
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:overlap", "message": "TTS overlap detected", "data": {"context": context, "seq": seq, "attempt": attempt}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_OVERLAP"}) + "\n")
+                # #endregion
+                for _ in range(60):
+                    await asyncio.sleep(0.5)
+                    if not self._tts_in_flight:
+                        break
+                if self._tts_in_flight:
+                    logger.error("🛑 Previous TTS did not finish in 30 s — proceeding anyway")
+
+            # ── Speak ──────────────────────────────────────────────────
+            self._tts_in_flight = True
+            tts_start = datetime.now()
+            logger.critical(
+                f"🔊 TTS START [{context}] attempt={attempt+1}/{1+max_retries} "
+                f"allow_interruptions={allow_int} words={word_count} "
+                f"est_min={estimated_min_sec:.1f}s text='{text[:80]}…'"
+            )
+
+            # #region agent log
+            import json as _json
+            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:start", "message": "TTS start", "data": {"context": context, "attempt": attempt, "seq": seq, "allow_interruptions": allow_int, "word_count": word_count, "est_min_sec": round(estimated_min_sec, 1), "text_len": len(text)}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_TRUNCATION"}) + "\n")
+            # #endregion
+
+            try:
+                await self.agent_session.say(text, allow_interruptions=allow_int)
+            except Exception as e:
+                logger.error(f"🛑 TTS say() raised: {e}")
+            finally:
+                self._tts_in_flight = False
+
+            tts_duration = (datetime.now() - tts_start).total_seconds()
+            truncated = tts_duration < (estimated_min_sec * 0.5) and estimated_min_sec > 2.0
+
+            logger.critical(
+                f"🔊 TTS END   [{context}] duration={tts_duration:.1f}s "
+                f"est_min={estimated_min_sec:.1f}s truncated={truncated}"
+            )
+
+            # #region agent log
+            import json as _json
+            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:end", "message": "TTS end", "data": {"context": context, "attempt": attempt, "seq": seq, "duration_s": round(tts_duration, 2), "est_min_sec": round(estimated_min_sec, 1), "truncated": truncated, "word_count": word_count}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_TRUNCATION"}) + "\n")
+            # #endregion
+
+            if not truncated:
+                return True
+
+            if attempt < max_retries:
+                logger.warning(
+                    f"⚠️ TTS TRUNCATED [{context}]: {tts_duration:.1f}s actual vs "
+                    f"{estimated_min_sec:.1f}s expected. Retrying with allow_interruptions=False…"
+                )
+                await asyncio.sleep(0.3)  # brief settle before retry
+            else:
+                logger.error(
+                    f"🛑 TTS TRUNCATED [{context}] after {1+max_retries} attempts — "
+                    f"question may not have been fully spoken"
+                )
+
+        return False
+
+    def _reset_for_repeat(self, participant: str, *, context: str = "") -> None:
+        """Reset all mutable state after a repeat so the SAME participant gets
+        a fresh turn.  Centralised here so every repeat path is consistent.
+
+        Invariant enforced: ``expected_respondent`` MUST remain ``participant``
+        after this call — repeating never changes who we're listening to.
+        """
+        saved_expected = self.expected_respondent
+
+        # ── Response / STT state ───────────────────────────────────────
+        self.latest_user_response = None
+        self.response_captured = False
+        self.last_stt_fragment = ""
+        self.pending_stt_transcript = None
+        self.response_fragments = []
+        self.last_fragment_time = None
+        self.actual_respondent = None
+
+        # ── Flow control flags ─────────────────────────────────────────
+        self.encouragement_given = False
+        self.waiting_for_response = True
+        self.last_speech_time = None
+        self._transition_filler_said = False
+        self._ack_already_spoken = False
+        self._prewarmed_ack_text = None
+
+        # ── Timeout monitoring ─────────────────────────────────────────
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant)
+        )
+
+        # ── Turn monitoring ────────────────────────────────────────────
+        if self.turn_monitor_task:
+            self.turn_monitor_task.cancel()
+            self.turn_monitor_task = None
+        self.user_currently_speaking = False
+        self.turn_time_exceeded = False
+        self.current_turn = TurnInfo(
+            participant_identity=participant,
+            start_time=datetime.now(),
+        )
+        self.turn_monitor_task = asyncio.create_task(
+            self.monitor_turn_duration(self.agent_session)
+        )
+
+        # ── Spillover guard timestamp ──────────────────────────────────
+        self.turn_transition_time = datetime.now()
+
+        # ── Extend polling deadline so user gets full time after repeat ─
+        import time as _time
+        polling_timeout = (
+            self.max_turn_duration
+            + self.first_interrupt_grace
+            + self.second_interrupt_grace
+            + 10
+        )
+        self._polling_deadline = _time.time() + polling_timeout
+        logger.info(f"⏱️  Polling deadline extended by {polling_timeout}s after repeat")
+
+        # ── Invariant: expected_respondent MUST NOT change ─────────────
+        assert self.expected_respondent == saved_expected, (
+            f"REPEAT BUG: expected_respondent changed from "
+            f"'{saved_expected}' to '{self.expected_respondent}' during reset"
+        )
+
+        logger.info(
+            f"🔄 _reset_for_repeat({participant}, ctx={context}): "
+            f"expected_respondent={self.expected_respondent}, "
+            f"actual_respondent=None (cleared)"
+        )
+
+        # #region agent log
+        import json as _json
+        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+            _f.write(_json.dumps({"location": "moderator_agent.py:_reset_for_repeat", "message": "Repeat state reset", "data": {"participant": participant, "context": context, "expected_respondent": self.expected_respondent, "actual_respondent": self.actual_respondent, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_IDENTITY"}) + "\n")
+        # #endregion
+
+    async def _get_room_participant_identities(self) -> Optional[Set[str]]:
+        if not self.livekit_api or not self.room_name:
+            return None
+        try:
+            participants_response = await self.livekit_api.room.list_participants(
+                api.ListParticipantsRequest(room=self.room_name)
+            )
+            return {p.identity for p in (participants_response.participants or [])}
+        except Exception as e:
+            logger.warning(f"Could not fetch room roster for delivery validation: {e}")
+            return None
+
+    def _register_missing_participant_for_retry(self, participant_identity: str, context: str):
+        question_num = self.current_question_num
+        key = self._delivery_key(question_num, participant_identity)
+        retries = self.question_delivery_retries.get(key, 0) + 1
+        self.question_delivery_retries[key] = retries
+
+        if retries >= self.max_delivery_retries_per_question:
+            self._set_delivery_state(question_num, participant_identity, "unavailable", context=context)
+            logger.warning(
+                f"Participant {participant_identity} exhausted delivery retries for question {question_num}; "
+                "marking unavailable."
+            )
+            # Sync with participant_manager's unavailable set (single source of truth)
+            if participant_identity not in self.participant_manager.unavailable_participants:
+                logger.warning(f"🔄 Syncing: marking {participant_identity} as unavailable in participant_manager after {retries} delivery retries")
+                self.participant_manager.unavailable_participants.add(participant_identity)
+            if self.participant_manager:
+                self.participant_manager.remove_participant(participant_identity, immediate=True)
+            return
+
+        backoff_seconds = min(2 ** (retries - 1), 4)
+        self.question_delivery_retry_after[key] = datetime.now() + timedelta(seconds=backoff_seconds)
+        self._set_delivery_state(question_num, participant_identity, "pending_retry", context=context)
+        logger.warning(
+            f"Participant {participant_identity} missing for delivery (q={question_num}, retry={retries}/"
+            f"{self.max_delivery_retries_per_question}); requeueing after {backoff_seconds}s."
+        )
+
+    async def _prepare_participant_for_delivery(self, participant_identity: str, context: str) -> bool:
+        if not self.participant_manager:
+            return False
+
+        question_num = self.current_question_num
+        key = self._delivery_key(question_num, participant_identity)
+
+        if participant_identity in self.participant_manager.unavailable_participants:
+            self._set_delivery_state(question_num, participant_identity, "unavailable", context=context)
+            return False
+
+        retry_after = self.question_delivery_retry_after.get(key)
+        if retry_after and datetime.now() < retry_after:
+            return False
+
+        room_ids = await self._get_room_participant_identities()
+        if room_ids is not None and participant_identity not in room_ids:
+            self._register_missing_participant_for_retry(participant_identity, context=f"{context}:not_in_room")
+            return False
+
+        self._set_delivery_state(question_num, participant_identity, "queued", context=context)
+        return True
+
+    async def _select_next_deliverable_participant(self, question_num: int, context: str) -> Optional[str]:
+        if not self.participant_manager:
+            return None
+
+        candidates = self.participant_manager.get_unanswered_participants(question_num)
+        if not candidates:
+            return None
+
+        random.shuffle(candidates)
+        for candidate in candidates:
+            if await self._prepare_participant_for_delivery(candidate, context=context):
+                return candidate
+
+        return None
+
     async def _run_observer_triggered_survey(self):
         """
         Run the full survey flow when triggered by observer's 'start survey' command.
@@ -1082,16 +1537,17 @@ class CommunityModeratorAgent(Agent):
         except Exception as e:
             logger.warning(f"Could not reset STT: {e}")
 
-        # 1. WELCOME MESSAGE
-        logger.info("👁️ Step 1: Delivering welcome message")
+        # 1. WELCOME MESSAGE — enter WELCOME phase so STT transcripts are discarded
+        self.survey_state = SurveyState.WELCOME
+        logger.info("👁️ Step 1: Delivering welcome message (survey_state → WELCOME)")
         if question_loader.use_unified_format and question_loader.welcome_section and question_loader.welcome_section.enabled:
             welcome = question_loader.welcome_section
             if welcome.audio_check and welcome.audio_check.enabled:
                 audio_check_text = welcome.audio_check.message
                 wait_seconds = welcome.audio_check.wait_seconds
             else:
-                audio_check_text = "Please make sure your microphone is unmuted and working."
-                wait_seconds = 10
+                audio_check_text = ""
+                wait_seconds = 0
             # Get agent name: use survey-specific name if available, otherwise config default
             agent_name = question_loader.survey_meta.agent_name if question_loader.survey_meta.agent_name else config.agent_name
             logger.info(f"Using agent name for welcome: {agent_name}")
@@ -1103,7 +1559,9 @@ class CommunityModeratorAgent(Agent):
             full_welcome = f"Hello! I'm {config.agent_name}, your AI survey moderator. Please make sure your microphone is unmuted and working. I'll wait 1 minute for everyone to get ready before we begin."
             wait_seconds = 10
 
+        logger.info(f"🎤 WELCOME TEXT SENT TO TTS: '{full_welcome}'")
         await self.agent_session.say(full_welcome, allow_interruptions=False)
+        logger.info("✅ Welcome TTS completed")
 
         # 2. WAIT FOR PARTICIPANTS
         logger.info(f"👁️ Step 2: Waiting {wait_seconds} seconds for participants")
@@ -1132,7 +1590,18 @@ class CommunityModeratorAgent(Agent):
 
         await asyncio.sleep(2)
 
-        # 4. START ASKING QUESTIONS
+        # 4. START ASKING QUESTIONS — transition OUT of WELCOME phase
+        self.survey_state = SurveyState.RUNNING
+        logger.info(f"🟢 Survey state: WELCOME → RUNNING (welcome/greeting complete, questions starting)")
+
+        # Clear any response fragments that may have accumulated during welcome
+        self.response_fragments = []
+        self.latest_user_response = None
+        self.pending_stt_transcript = None
+        self.last_stt_fragment = ""
+        self.response_captured = False
+        logger.info("🧹 Cleared response buffers before first question")
+
         logger.info("👁️ Step 4: Starting questions")
         await self.ask_next_question()
 
@@ -1147,8 +1616,8 @@ class CommunityModeratorAgent(Agent):
 
         if command == "start":
             if self.survey_state == SurveyState.WAITING_FOR_OBSERVER:
-                self.survey_state = SurveyState.RUNNING
-                logger.info("👁️ Survey STARTED by observer - beginning full survey flow")
+                self.survey_state = SurveyState.WELCOME  # Will transition to RUNNING after welcome/greeting
+                logger.info("👁️ Survey STARTED by observer - entering WELCOME phase")
 
                 # Run the full survey flow
                 await self._run_observer_triggered_survey()
@@ -1364,34 +1833,44 @@ class CommunityModeratorAgent(Agent):
                     )
                     logger.critical(f"🔊 SENDING GENTLE WARNING VIA TTS: '{warning_text}'")
 
-                    # CRITICAL FIX: Record time before speaking warning
-                    warning_start_time = datetime.now() # Record when warning TTS finished (for cooldown)
+                    # CRITICAL FIX: Block the polling loop from capturing the response
+                    # while the warning is being spoken. Without this, the user pauses
+                    # to listen to the warning and the polling loop grabs their partial
+                    # response as the final answer.
+                    self._gentle_warning_in_progress = True
+
+                    warning_start_time = datetime.now()
                     await session.say(warning_text, allow_interruptions=False)
                     warning_duration = (datetime.now() - warning_start_time).total_seconds()
 
-                    # CRITICAL FIX: Reset start_time to NOW so user gets a TRUE
+                    # Reset start_time to NOW so user gets a TRUE
                     # second_interrupt_grace window from when warning finishes.
-                    # The old approach (shifting by warning_duration) left elapsed still far past
-                    # thresholds because wall-clock time had accumulated during STT waits/silence.
                     old_start = turn_info.start_time
                     old_elapsed = (datetime.now() - old_start).total_seconds()
                     turn_info.start_time = datetime.now()
                     new_elapsed = (datetime.now() - turn_info.start_time).total_seconds()
 
-                    # Also recalculate grace periods relative to the reset timer:
-                    # After warning, we only need to track second_interrupt_grace for force-end
-                    # grace_period_1 is already passed (warning was delivered)
-                    # grace_period_2 needs to be second_interrupt_grace from NOW (not from original start)
+                    # Recalculate grace periods relative to the reset timer
                     grace_period_2 = self.second_interrupt_grace
-                    grace_period_1 = max(self.second_interrupt_grace - 2.0, 3.0)  # Give user real wrap-up window (not 0!)
+                    grace_period_1 = max(self.second_interrupt_grace - 2.0, 3.0)
 
                     # Reset VAD accumulator so user gets a full wrap-up window of actual speaking time
                     turn_info.actual_speaking_duration = 0.0
 
+                    # Clear accumulated response so only NEW speech after the warning counts.
+                    # The pre-warning response was already captured; we want the wrap-up.
+                    self.latest_user_response = None
+                    self.last_stt_fragment = ""
+                    self._first_fragment_time = None
+
+                    # Now unblock the polling loop
+                    self._gentle_warning_in_progress = False
+
                     logger.critical(
                         f"✅ GENTLE WARNING SENT (took {warning_duration:.1f}s). "
                         f"Timer RESET: old_elapsed={old_elapsed:.1f}s → new_elapsed={new_elapsed:.1f}s. "
-                        f"User gets full {self.second_interrupt_grace}s to wrap up (force-end at {grace_period_2}s)."
+                        f"User gets full {self.second_interrupt_grace}s to wrap up (force-end at {grace_period_2}s). "
+                        f"Response buffer cleared — only new speech after warning will be captured."
                     )
 
 
@@ -1557,14 +2036,10 @@ class CommunityModeratorAgent(Agent):
     async def monitor_response_timeout(self, participant: str):
         """Monitor for response timeout and prompt/move on if no response."""
         try:
-            # NETWORK LATENCY ADAPTATION: Base timeout + network buffer
             base_timeout = 10
-            network_adjusted_timeout = base_timeout + self.network_latency_buffer_s
-            if self.network_latency_buffer_s > 0:
-                logger.info(f"⏱️ Response timeout adjusted for network: {base_timeout}s + {self.network_latency_buffer_s:.1f}s buffer = {network_adjusted_timeout:.1f}s")
 
             # Wait for participant to start responding
-            await asyncio.sleep(network_adjusted_timeout)
+            await asyncio.sleep(base_timeout)
 
             # Check if paused - don't prompt during pause
             if self.survey_state == SurveyState.PAUSED:
@@ -1573,7 +2048,7 @@ class CommunityModeratorAgent(Agent):
 
             # Check if they started speaking
             if self.last_speech_time is None and self.waiting_for_response:
-                logger.warning(f"No response from {participant} after {network_adjusted_timeout:.0f} seconds, prompting...")
+                logger.warning(f"No response from {participant} after {base_timeout} seconds, prompting...")
 
                 # FIXED: Use direct TTS instead of LLM generate_reply to ensure exact text
                 # The LLM was ignoring instructions and saying "Thank you" instead
@@ -1582,8 +2057,7 @@ class CommunityModeratorAgent(Agent):
                 await self.agent_session.say(prompt_text, allow_interruptions=False)
                 logger.info(f"🔊 Prompted participant with direct TTS: '{prompt_text}'")
 
-                # Wait another timeout period (with network adjustment)
-                await asyncio.sleep(network_adjusted_timeout)
+                await asyncio.sleep(base_timeout)
 
                 # Check if paused - don't timeout during pause
                 if self.survey_state == SurveyState.PAUSED:
@@ -1830,15 +2304,21 @@ class CommunityModeratorAgent(Agent):
             logger.error("No participants available! Cannot ask question.")
             return
 
-        # Select random participant
-        participant = self.participant_manager.select_next_participant(
-            self.current_question_num
-        )
-
+        participant = None
+        for _ in range(3):
+            participant = await self._select_next_deliverable_participant(
+                self.current_question_num,
+                context="ask_next_question",
+            )
+            if participant:
+                break
+            if self.participant_manager.all_participants_answered(self.current_question_num):
+                logger.info("All participants answered, moving to next question")
+                await self.ask_next_question()
+                return
+            await asyncio.sleep(0.1)
         if not participant:
-            # All participants answered this question, move to next
-            logger.info("All participants answered, moving to next question")
-            await self.ask_next_question()
+            logger.warning("No deliverable participant currently available; will retry selection later.")
             return
 
         logger.info(f"Selected participant '{participant}' for question #{self.current_question_num}")
@@ -1872,17 +2352,14 @@ class CommunityModeratorAgent(Agent):
         # Reduced for faster response times while still allowing natural pauses
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                # Qualitative - allow pauses for thinking (reduced from 2.5s)
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.8)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.8s (qualitative question)")
             elif self.current_question_object.is_quantitative():
-                # Quantitative - quick answers
-                self.agent_session.vad.update_options(min_silence_duration=0.6)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.4)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.4s (quantitative question)")
             else:
-                # Default/info - middle ground
-                self.agent_session.vad.update_options(min_silence_duration=1.0)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.0s (default)")
+                self.agent_session.vad.update_options(min_silence_duration=0.5)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.5s (default)")
 
         # Now ask the actual question (using participant's display name)
         exact_text_to_say = f"{participant_display_name}, {self.current_question}"
@@ -1928,6 +2405,7 @@ class CommunityModeratorAgent(Agent):
 
         # Reset response flag before asking question
         self.response_captured = False
+        self._transition_filler_said = False
 
         # Clean up any existing turn monitoring from previous question
         if self.turn_monitor_task:
@@ -1942,12 +2420,36 @@ class CommunityModeratorAgent(Agent):
         # MULTI-PARTICIPANT FIX: Set who we're expecting to respond
         self.expected_respondent = participant
         self.actual_respondent = None  # Will be set when we detect audio activity
+        self.turn_transition_time = datetime.now()  # For spillover detection
+        self._set_delivery_state(self.current_question_num, participant, "delivering", context="ask_next_question")
 
         logger.critical("=" * 80)
         logger.critical(f"🔧 AUDIO ROUTING TRACE - Question #{self.current_question_num} to {participant}")
 
-        # Mute all participants except the one we're asking (run in background to avoid delay)
-        asyncio.create_task(self.manage_participant_muting(participant))
+        _respondent_count = self._active_respondent_count()
+        if _respondent_count > 1:
+            # MULTI-PARTICIPANT: Lock STT + mute others to prevent cross-talk
+            logger.critical(f"   {_respondent_count} active respondents — enabling STT lock + muting")
+            if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
+                room_io = self.agent_session._room_io
+                if hasattr(room_io, '_audio_input') and room_io._audio_input:
+                    audio_input = room_io._audio_input
+                    logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
+                    try:
+                        audio_input.set_participant(participant)
+                        logger.critical(f"✅ STT set_participant('{participant}') — immediate")
+                    except Exception as e:
+                        logger.error(f"❌ EXCEPTION during set_participant: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
+            else:
+                logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
+
+            asyncio.create_task(self.manage_participant_muting(participant))
+        else:
+            logger.critical(f"   {_respondent_count} active respondent — skipping STT lock + muting (solo mode)")
 
         # In observer mode: Keep STT on observer while speaking (to hear pause command)
         if self.observer_mode_enabled:
@@ -1965,12 +2467,12 @@ class CommunityModeratorAgent(Agent):
                 except Exception as e:
                     logger.warning(f"Could not set STT to observer: {e}")
 
-        # DIRECT TTS - Speak the question without any LLM involvement
-        await self.agent_session.say(exact_text_to_say, allow_interruptions=True)
-
-        # Brief delay to allow any observer commands to be processed
-        # (asyncio.create_task schedules the handler but doesn't wait for it)
-        await asyncio.sleep(0.5)
+        # DIRECT TTS - Speak the question with truncation detection + retry
+        await self._speak_question_safely(
+            exact_text_to_say,
+            context=f"ask_Q{self.current_question_num}_{participant}",
+        )
+        self._set_delivery_state(self.current_question_num, participant, "delivered", context="ask_next_question")
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
@@ -1979,66 +2481,28 @@ class CommunityModeratorAgent(Agent):
                 await asyncio.sleep(0.5)
             logger.info("👁️ Survey resumed - continuing with response collection")
 
-        # NOW switch STT to participant for their response
-        logger.critical(f"   agent_session exists: {self.agent_session is not None}")
-        logger.critical(f"   _room_io exists: {hasattr(self.agent_session, '_room_io') and self.agent_session._room_io is not None if self.agent_session else False}")
-
-        if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-            room_io = self.agent_session._room_io
-            logger.critical(f"   _audio_input exists: {hasattr(room_io, '_audio_input') and room_io._audio_input is not None}")
-
-            if hasattr(room_io, '_audio_input') and room_io._audio_input:
-                audio_input = room_io._audio_input
-
-                logger.critical(f"📍 Switching STT to participant for response:")
-                logger.critical(f"   Target participant: {participant}")
-                logger.critical(f"   All participants in room: {list(self.participant_manager.participants) if self.participant_manager else 'N/A'}")
-
-                logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
-                try:
-                    audio_input.set_participant(participant)
-
-                    # Give STT a moment to switch
-                    await asyncio.sleep(0.1)
-
-                    # Verify the switch
-                    new_participant = getattr(audio_input, '_participant_identity', 'UNKNOWN')
-                    logger.critical(f"✅ STT now listening to: {new_participant}")
-
-                except Exception as e:
-                    logger.error(f"❌ EXCEPTION during set_participant: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-            else:
-                logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
-        else:
-            logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
-
         logger.critical("=" * 80)
-
-        # CRITICAL: Add small delay to allow STT to fully initialize after TTS completes
-        # Without this, if user starts speaking immediately, first words are truncated
-        await asyncio.sleep(0.3)  # 300ms buffer for audio pipeline to stabilize
-
         logger.critical(f"✅ Question spoken via DIRECT TTS (0% LLM involvement)")
 
         # Calculate max polling time: Must be longer than max turn duration to allow graceful time management
         # Max turn duration = base + first_grace + second_grace + buffer
         max_turn_time = self.max_turn_duration + self.first_interrupt_grace + self.second_interrupt_grace
         polling_timeout = max_turn_time + 10  # Add 10s buffer for silence detection and processing
-        max_checks = int(polling_timeout / 0.5)  # Convert to number of 0.5s checks
+        max_checks = int(polling_timeout / 0.1)  # Convert to number of 0.1s checks
 
         logger.critical(f"⏳ SMART POLLING: Waiting for user response (max {polling_timeout}s)...")
         logger.critical(f"   - Max turn duration: {max_turn_time}s (base={self.max_turn_duration}s + graces={self.first_interrupt_grace + self.second_interrupt_grace}s)")
         logger.critical(f"   - Polling timeout: {polling_timeout}s (turn + 10s buffer)")
-        logger.critical(f"   - Will wait for user to stop speaking before processing")
-        logger.critical(f"   - Will break immediately once response captured")
+        logger.critical(f"   - Will break immediately once response captured (VAD-trusted)")
 
         # Reset the response variables before waiting (including fragments for multi-part answers)
         self.latest_user_response = None
+        self.pending_stt_transcript = None  # Prevent stale transcripts from previous turn
         self.response_fragments = []
         self.last_fragment_time = None
         self.last_stt_fragment = ""  # Reset fragment tracking for new question
+        self._first_fragment_time = None  # Reset stabilization timer for new question
+        self._gentle_warning_in_progress = False  # Ensure clean state for new question
         self.encouragement_given = False  # Reset encouragement flag for new participant
         self.question_repeated = False  # Reset repeat flag for new participant
         self.relevance_prompt_given = False  # Reset relevance flag for new participant
@@ -2046,6 +2510,8 @@ class CommunityModeratorAgent(Agent):
         self.already_answered_prompt_given = False  # Reset already-answered flag for new question
         self.accumulated_partial_answer = ""  # Clear any accumulated partial answers
         self.turn_time_exceeded = False  # Reset turn time exceeded flag for new question
+        self._ack_already_spoken = False  # Reset ack flag for new question
+        self._prewarmed_ack_text = None  # Clear pre-warmed ack text
         logger.critical(f"🔄 [{question_id}] RESET encouragement/repeat/relevance/partial_repeat/already_answered/turn_time flags (new question)")
 
         # Initialize timeout monitoring variables
@@ -2066,12 +2532,26 @@ class CommunityModeratorAgent(Agent):
         initial_user_msg_count = len([item for item in self.agent_session._chat_ctx.items
                                        if hasattr(item, 'role') and item.role == 'user'])
 
-        for check_num in range(max_checks):
-            await asyncio.sleep(0.5)  # Check every 0.5 seconds
+        import time as _time
+        self._polling_deadline = _time.time() + polling_timeout
+
+        for check_num in range(max_checks * 3):  # generous upper bound; deadline is the real limiter
+            await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
+
+            if _time.time() > self._polling_deadline:
+                logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
+                break
+
+            # TIMEOUT MONITOR SIGNAL: monitor_response_timeout sets this to False
+            # after 20s of total silence — break immediately so we don't wait
+            # for the full polling_timeout (~45s).
+            if not self.waiting_for_response:
+                logger.warning(f"⏱️  Timeout monitor signaled no-response — exiting poll early")
+                break
 
             # OBSERVER COMMAND CHECK: Periodically switch STT to observer to hear pause/resume commands
             # This allows observer to say "pause" at any time during response collection
-            if self.observer_mode_enabled and check_num % 4 == 2:  # Every 2 seconds (at check 2, 6, 10, etc.)
+            if self.observer_mode_enabled and check_num % 20 == 10:  # Every ~2 seconds
                 observer_identity = self.participant_manager.get_observer_identity()
                 if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
                     try:
@@ -2109,10 +2589,18 @@ class CommunityModeratorAgent(Agent):
                 # Exit this polling loop to avoid duplicate processing
                 return
 
+            # GENTLE WARNING GUARD: While the turn monitor is speaking the wrap-up
+            # warning, do NOT capture or process responses. The user naturally pauses
+            # to listen, and we must not mistake that for "finished speaking."
+            if self._gentle_warning_in_progress:
+                if check_num % 20 == 0:
+                    logger.info(f"⏳ Gentle warning in progress — holding response capture (check {check_num})")
+                continue
+
             # CRITICAL: If user is currently speaking, don't process yet - wait for them to finish!
             # EXCEPTION: If turn_time_exceeded is True, process anyway - user has exceeded time limit
             if self.user_currently_speaking and not self.turn_time_exceeded:
-                if check_num % 4 == 0:  # Log every 2 seconds while waiting
+                if check_num % 20 == 0:  # Log every ~2 seconds while waiting
                     logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
                 continue  # Skip to next check, don't process response yet
 
@@ -2120,107 +2608,45 @@ class CommunityModeratorAgent(Agent):
             if self.turn_time_exceeded and self.user_currently_speaking:
                 logger.warning(f"⚡ FORCE PROCESSING: Turn time exceeded but user still speaking - proceeding with accumulated response")
 
-            # METHOD 1: Check if response was stored in our variable (by event handler)
-            # Only process if user has STOPPED speaking AND we have a response
-            # OR if turn_time_exceeded is True (force processing even if user still speaking)
-            should_process = (self.latest_user_response is not None and
-                             (not self.user_currently_speaking or self.turn_time_exceeded))
-            if should_process:
-                # User has stopped speaking and we have fragments
-                # Wait additional time to ensure all fragments arrived
-                # ADAPTIVE SILENCE DETECTION: Wait time depends on how long user has been speaking
-                # - Short responses (< 20s): 3-5s wait → feels natural, responsive
-                # - Long responses (20-30s): 10s wait → allows graceful time management to work
-                # - Very long responses (30s+): Already handled by turn monitoring warnings
-
-                # Use the CAPTURED speaking duration (from when user stopped speaking)
-                # NOT recalculated duration which includes wait time
-                speaking_duration = 0.0
-                if self.current_turn and self.current_turn.actual_speaking_duration > 0:
-                    speaking_duration = self.current_turn.actual_speaking_duration
-                    logger.debug(f"📊 Using captured speaking duration: {speaking_duration:.1f}s")
-                else:
-                    # Fallback: calculate if not captured yet (shouldn't happen normally)
-                    if self.current_turn and self.current_turn.start_time:
-                        speaking_duration = (datetime.now() - self.current_turn.start_time).total_seconds()
-                        logger.warning(f"⚠️  Speaking duration not captured, calculating: {speaking_duration:.1f}s")
-
-                # Adaptive silence wait based on speaking duration
-                # Progressive wait times: longer responses get more thinking time
-                # OPTIMIZED SILENCE WAIT TIMES (reduced ~40% for better responsiveness)
-                # Previous values were causing 5-7s latency; now targeting 2-4s total
-
-                # Get question context for logging
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-
-                # FAST PATH: If turn time exceeded, use minimal silence wait
-                # The turn monitor has already confirmed user stopped speaking after time limit
-                if self.turn_time_exceeded:
-                    silence_wait_time = self.silence_wait_turn_exceeded
-                    reason = "TURN TIME EXCEEDED - fast processing"
-                    logger.info(f"⚡ [{question_context}] Turn time exceeded flag set - using fast processing ({silence_wait_time}s wait)")
-                elif speaking_duration >= 20.0:
-                    # Long response (20s+) - use longest wait for graceful time management
-                    silence_wait_time = self.silence_wait_long
-                    reason = "long response (20s+), allowing time for warnings"
-                elif self.is_multi_option_question:
-                    # Multi-option - wait for all choices
-                    silence_wait_time = self.silence_wait_multi_option
-                    reason = "multi-option question"
-                elif self.current_question_object and self.current_question_object.is_qualitative():
-                    # Qualitative - progressive wait based on length to balance responsiveness vs continuation
-                    if speaking_duration >= 15.0:
-                        # Medium response (15-20s) - likely building to longer answer
-                        silence_wait_time = self.silence_wait_qualitative_medium
-                        reason = "qualitative, medium response (15-20s), likely continuing"
-                    elif speaking_duration >= 10.0:
-                        # Getting longer (10-15s) - give more time
-                        silence_wait_time = self.silence_wait_qualitative_building
-                        reason = "qualitative, building response (10-15s)"
-                    elif speaking_duration >= 6.0:
-                        # Short-medium (6-10s) - balanced wait
-                        silence_wait_time = self.silence_wait_qualitative_short_medium
-                        reason = "qualitative, short-medium response (6-10s)"
-                    else:
-                        # Very short response (< 6s) - quick wait for responsiveness
-                        silence_wait_time = self.silence_wait_qualitative_short
-                        reason = "qualitative, very short response (< 6s)"
-                else:
-                    # Quantitative or default - quick answers
-                    silence_wait_time = self.silence_wait_quantitative
-                    reason = "quantitative/default"
-
-                # NETWORK LATENCY ADAPTATION: Add buffer for slow networks
-                if self.network_latency_buffer_s > 0:
-                    original_wait = silence_wait_time
-                    silence_wait_time += self.network_latency_buffer_s
-                    reason += f" +{self.network_latency_buffer_s:.1f}s network buffer"
-                    logger.info(f"📡 Network buffer applied: {original_wait:.1f}s → {silence_wait_time:.1f}s")
-
-                wait_checks = int(silence_wait_time / 0.5)  # Number of 0.5s checks
-
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                logger.info(f"⏸️  [{question_context}] User STOPPED speaking (spoke for {speaking_duration:.1f}s). Waiting {silence_wait_time:.1f}s for silence confirmation ({reason})")
-
-                # Wait and check if user starts speaking again during this window
-                for wait_check in range(wait_checks):
-                    await asyncio.sleep(0.5)
-                    if self.user_currently_speaking:
-                        logger.info(f"⏳ User started speaking again, continuing to wait for complete response...")
-                        break  # Exit wait loop, continue main polling
-                else:
-                    # User didn't start speaking again during the wait window
-                    # Response is complete!
-                    question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                    logger.info(f"✅ [{question_context}] User silent for {silence_wait_time}s, response is COMPLETE")
-
-                # If user started speaking again, continue main polling loop
-                if self.user_currently_speaking:
+            # STABILIZATION DELAY: Prevent capturing a tiny first fragment (e.g. "How")
+            # before VAD has even detected the user as speaking.  STT events can
+            # arrive 200-400ms ahead of the user_state_changed → speaking event.
+            # If the first fragment arrived very recently, give the VAD time to catch up.
+            if (self.latest_user_response is not None
+                and self._first_fragment_time is not None
+                and not self.user_currently_speaking
+                and not self.turn_time_exceeded):
+                since_first_frag = (datetime.now() - self._first_fragment_time).total_seconds()
+                if since_first_frag < 2.0:
+                    # Too soon since first fragment — VAD may not have fired yet
                     continue
+
+            # Trust VAD + STT events: proceed immediately once response is
+            # captured and the user has stopped speaking (or turn time exceeded).
+            if self.latest_user_response is not None and (not self.user_currently_speaking or self.turn_time_exceeded):
+                self._silence_confirmed_time = datetime.now()
 
                 # FOUND USER RESPONSE VIA EVENT!
                 question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                elapsed_time = (check_num + 1) * 0.5
+                elapsed_time = (check_num + 1) * 0.1
+
+                # ── Delivery-state double-check at acceptance ──
+                if not self._is_delivery_confirmed(self.current_question_num, participant):
+                    _ds_key = self._delivery_key(self.current_question_num, participant)
+                    _ds = self.question_delivery_state.get(_ds_key, "unknown")
+                    logger.warning(
+                        f"🛡️ DELIVERY GUARD (polling-accept): Discarding response — "
+                        f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
+                    )
+                    # #region agent log
+                    import json as _json
+                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_q:polling_accept_guard", "message": "Polling acceptance blocked by delivery guard", "data": {"delivery_state": _ds, "participant": participant, "question_num": self.current_question_num, "response": str(self.latest_user_response)[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_POLL_GUARD"}) + "\n")
+                    # #endregion
+                    self.latest_user_response = None
+                    self.pending_stt_transcript = None
+                    self.response_captured = False
+                    continue
 
                 # LATENCY TRACKING: Record when response processing starts
                 response_processing_start = datetime.now()
@@ -2308,17 +2734,34 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement, accepting response")
 
                 # ============================================================
+                # DETERMINISTIC REPEAT PRE-CHECK (before LLM)
+                # Catches "didn't hear the last part", "say that again", etc.
+                # instantly — no LLM round-trip needed.
+                # ============================================================
+                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+                if is_repeat_request(self.latest_user_response) and not self.question_repeated:
+                    self.question_repeated = True
+                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected — skipping LLM analysis, repeating question immediately")
+
+                    # #region agent log
+                    import json as _json
+                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_question:heuristic_repeat", "message": "Heuristic repeat pre-check fired (1st loop)", "data": {"transcript": str(self.latest_user_response)[:200], "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "C"}) + "\n")
+                    # #endregion
+
+                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
+                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
+                    await self.agent_session.say(self.current_question, allow_interruptions=True)
+                    logger.info(f"🔊 Repeated question (heuristic): '{self.current_question[:100]}...'")
+
+                    self._reset_for_repeat(participant, context="heuristic_repeat_1st_loop")
+                    continue
+
+                # ============================================================
                 # UNIFIED RESPONSE ANALYSIS (LLM-based)
                 # Checks: repeat request, partial answer, already-answered claim, relevance
                 # ============================================================
                 question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-
-                # NETWORK LATENCY FIX: Allow late-arriving STT fragments to settle before analysis
-                # This helps when network is slow and transcripts arrive delayed
-                await asyncio.sleep(0.5)  # 500ms settling time for network latency
-
-                # Check if response was updated during settling period
                 response_to_analyze = self.latest_user_response
 
                 # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
@@ -2328,9 +2771,30 @@ class CommunityModeratorAgent(Agent):
                     logger.info(f"📝 [{question_context}] Combined partial + new response for analysis: '{response_to_analyze[:100]}...'")
 
                 logger.info(f"🔍 [{question_context}] Running unified response analysis...")
-                # Get survey description for context-aware relevance checking
                 survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-                analysis = await analyze_response(question_for_analysis, response_to_analyze, survey_desc)
+
+                # IMMEDIATE ACK: Fire acknowledgment NOW so the user hears
+                # feedback within ~1s.  The LLM analysis runs concurrently;
+                # if it discovers an issue the correction follows naturally.
+                _ack_speaker = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+                self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
+                _ack_handle = self.agent_session.say(self._prewarmed_ack_text, allow_interruptions=False)
+                self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
+                self._ack_already_spoken = True
+                self._transition_filler_said = True  # ack replaces the "One moment…" filler
+                logger.info(f"🗣️ Immediate ack fired (async): '{self._prewarmed_ack_text}'")
+
+                if hasattr(self, '_response_processing_start') and self._response_processing_start:
+                    _latency = (datetime.now() - self._response_processing_start).total_seconds()
+                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {_latency:.2f}s")
+                    logger.info(f"📊 METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
+
+                # LLM analysis runs while the ack TTS is playing
+                analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
+
+                # Ensure ack finishes before any follow-up correction
+                await _ack_handle
+
                 logger.info(f"📊 [{question_context}] Analysis result: relevant={analysis.is_relevant}, repeat_request={analysis.is_repeat_request}, already_answered={analysis.is_already_answered_claim}, partial_status={analysis.partial_repeat_status}")
 
                 # --- CHECK 1: PARTIAL ANSWER + REPEAT REQUEST ---
@@ -2443,37 +2907,10 @@ class CommunityModeratorAgent(Agent):
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
                     await self.agent_session.say(repeat_intro, allow_interruptions=False)
 
-                    # Repeat the actual question
                     await self.agent_session.say(self.current_question, allow_interruptions=True)
                     logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
 
-                    # RESET ALL TIMING AND MONITORING - treat as fresh question
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.encouragement_given = False
-
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset all timing/monitoring after repeating question")
-                    logger.info(f"⏳ Waiting for response after repeating question...")
+                    self._reset_for_repeat(participant, context="llm_repeat_1st_loop")
                     continue
                 elif is_full_repeat and self.question_repeated:
                     logger.info(f"🔁 [{question_context}] Already repeated question once, proceeding with response")
@@ -2501,8 +2938,6 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_acknowledgment(relevance_prompt)
                     logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
 
-                    # Repeat the question
-                    await asyncio.sleep(0.5)
                     question_text = self.current_question_object.question if self.current_question_object else ""
                     if question_text:
                         await self.agent_session.say(question_text, allow_interruptions=False)
@@ -2621,11 +3056,11 @@ class CommunityModeratorAgent(Agent):
 
                 # Mark ACTUAL participant as answered (not the expected one)
                 self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="response_received")
                 logger.info(f"✅ Marked {actual_speaker} as answered for question #{self.current_question_num}")
 
-                # Track who just responded for personalized acknowledgment (use ACTUAL speaker)
-                self.last_respondent = actual_speaker
-                logger.debug(f"📝 Updated last_respondent to: {actual_speaker}")
+                # Record turn result for acknowledgment (immutable snapshot)
+                self._record_turn_result(expected=participant, actual=actual_speaker)
 
                 # Cancel timeout monitoring since we got a response
                 self.waiting_for_response = False
@@ -2738,11 +3173,13 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement (METHOD 2), accepting response")
 
                 # CHECK FOR REPEAT QUESTION REQUESTS (METHOD 2)
-                # Use LLM analysis for context-aware repeat detection (handles "didn't hear about X" correctly)
-                question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-                method2_analysis = await analyze_response(question_for_analysis, transcript, survey_desc)
-                is_method2_repeat = method2_analysis.is_repeat_request or (method2_analysis.partial_repeat_status == "REPEAT_ONLY")
+                # Deterministic heuristic first, then fall back to LLM
+                is_method2_repeat = is_repeat_request(transcript)
+                if not is_method2_repeat:
+                    question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
+                    survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
+                    method2_analysis = await analyze_response(question_for_analysis, transcript, survey_desc)
+                    is_method2_repeat = method2_analysis.is_repeat_request or (method2_analysis.partial_repeat_status == "REPEAT_ONLY")
 
                 if is_method2_repeat:
                     if not self.question_repeated:
@@ -2835,15 +3272,12 @@ class CommunityModeratorAgent(Agent):
                         self.survey_transcript.add_acknowledgment(relevance_prompt)
                         logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
 
-                        # Now repeat the question
-                        await asyncio.sleep(0.5)
                         question_text = self.current_question_object.question if self.current_question_object else ""
                         if question_text:
                             await self.agent_session.say(question_text, allow_interruptions=False)
                             logger.info(f"🔊 Repeated question after off-topic: '{question_text[:60]}...'")
 
                         # RESET ALL TIMING AND MONITORING - treat as fresh question
-                        # Reset encouragement and repeat flags so they work again
                         self.encouragement_given = False
                         self.question_repeated = False
 
@@ -2943,8 +3377,16 @@ class CommunityModeratorAgent(Agent):
         if not user_responded:
             logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected via EVENT or CONTEXT")
 
-            # CRITICAL FIX: Record timeout/no-response in ALL outputs so question is not lost
-            # This ensures ALL questions appear in all outputs, even if STT failed to capture audio
+            # Audible acknowledgment so the user knows the system is still alive
+            try:
+                display_name = self.participant_manager.get_display_name(participant) if self.participant_manager else ""
+                timeout_msg = f"I didn't catch a response, {display_name}. Let me move on." if display_name else "I didn't catch a response. Let me move on."
+                await self.agent_session.say(timeout_msg, allow_interruptions=False)
+                self.survey_transcript.add_acknowledgment(timeout_msg)
+            except Exception as e:
+                logger.warning(f"Could not speak timeout message: {e}")
+
+            # Record timeout/no-response in ALL outputs so question is not lost
             question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
             question_text = self.current_question_object.question if self.current_question_object else ""
             response_options = self.current_question_object.response_options if self.current_question_object else []
@@ -2982,12 +3424,18 @@ class CommunityModeratorAgent(Agent):
             )
             logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in CSV DataFrame")
 
-            # Still mark as answered to avoid getting stuck
-            self.participant_manager.mark_participant_answered(participant, self.current_question_num)
+            # Only count timeout as answered if question delivery was confirmed.
+            if self._is_delivery_confirmed(self.current_question_num, participant):
+                self.participant_manager.mark_participant_answered(participant, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, participant, "timeout", context="timeout_after_delivery")
+            else:
+                logger.warning(
+                    f"Skipping answered-mark on timeout for {participant}: delivery was not confirmed; requeueing."
+                )
+                self._register_missing_participant_for_retry(participant, context="timeout_without_delivery")
 
-            # For timeout, use expected participant for acknowledgment
-            self.last_respondent = participant
-            logger.debug(f"📝 Updated last_respondent to: {participant} (timeout case)")
+            # Record turn result for timeout — expected == actual since no one else spoke
+            self._record_turn_result(expected=participant, actual=participant, was_timeout=True)
 
         # End audit for this question (save to JSON)
         self.audit_logger.end_question()
@@ -3029,65 +3477,105 @@ class CommunityModeratorAgent(Agent):
         answered_count = len(self.participant_manager.asked_participants.get(self.current_question_num, []))
         available_remaining = total_enrolled - answered_count - unavailable_count
 
-        # #region agent log
-        import json as _json3
-        _debug_log_path3 = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
-        try:
-            entry = {"timestamp": int(datetime.now().timestamp() * 1000), "location": "moderator_agent.py:move_to_next_participant", "message": "Checking participant counts (post-fix)", "data": {"question_num": self.current_question_num, "total_enrolled": total_enrolled, "answered_count": answered_count, "unavailable_count": unavailable_count, "available_remaining": available_remaining, "participants": list(self.participant_manager.participants), "unavailable": list(self.participant_manager.unavailable_participants), "asked": self.participant_manager.asked_participants.get(self.current_question_num, [])}, "hypothesisId": "FIX"}
-            with open(_debug_log_path3, "a") as f:
-                f.write(_json3.dumps(entry) + "\n")
-        except Exception:
-            pass
-        # #endregion
-
         logger.info(f"After response: {answered_count}/{total_enrolled} answered, {unavailable_count} unavailable for question #{self.current_question_num}")
 
         # FIXED Issue 3: Check if all participants answered BEFORE saying anything
         if self.participant_manager.all_participants_answered(self.current_question_num):
             logger.info("All participants answered current question, moving to next question")
 
-            # Acknowledge using direct TTS (no LLM) with participant's name
-            try:
-                ack_text = f"Thank you, {self.last_respondent}." if self.last_respondent else "Thank you."
+            if self._ack_already_spoken:
+                logger.info("🗣️ ACK already spoken in polling loop, skipping duplicate")
+                self._ack_already_spoken = False
+                self._prewarmed_ack_text = None
+                self._response_processing_start = None
+            else:
+                # Acknowledge using direct TTS (no LLM) with participant's name
+                try:
+                    _tr = self._last_turn_result
+                    _ack_name = _tr.ack_name if _tr else (self.last_respondent or "")
+                    ack_text = f"Thank you, {_ack_name}." if _ack_name else "Thank you."
+                    logger.info(f"🗣️ ACK: expected={_tr.expected_identity if _tr else '?'} actual={_tr.actual_identity if _tr else '?'} ack_name={_ack_name}")
 
-                # LATENCY TRACKING: Calculate time from response detection to agent speaking
-                if hasattr(self, '_response_processing_start') and self._response_processing_start:
-                    latency = (datetime.now() - self._response_processing_start).total_seconds()
-                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
-                    self._response_processing_start = None  # Reset for next response
+                    # LATENCY TRACKING: Calculate time from response detection to agent speaking
+                    if hasattr(self, '_response_processing_start') and self._response_processing_start:
+                        latency = (datetime.now() - self._response_processing_start).total_seconds()
+                        logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
+                        logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
+                        self._response_processing_start = None  # Reset for next response
 
-                await self.agent_session.say(ack_text, allow_interruptions=False)
-                self.survey_transcript.add_acknowledgment(ack_text)
-                await asyncio.sleep(0.25)  # Brief pause before next question
-            except RuntimeError as e:
-                logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
+                    await self.agent_session.say(ack_text, allow_interruptions=False)
+                    self.survey_transcript.add_acknowledgment(ack_text)
+                except RuntimeError as e:
+                    logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
+
+            # Inter-question breathing room so the session doesn't feel rushed
+            await asyncio.sleep(2)
 
             await self.ask_next_question()
             return
 
-        # Select next participant for same question
-        participant = self.participant_manager.select_next_participant(
-            self.current_question_num
-        )
+        participant = None
+        for _ in range(3):
+            participant = await self._select_next_deliverable_participant(
+                self.current_question_num,
+                context="move_to_next_participant",
+            )
+            if participant:
+                break
+            if self.participant_manager.all_participants_answered(self.current_question_num):
+                break
+            await asyncio.sleep(0.1)
+
+        if not participant:
+            if not self.participant_manager.all_participants_answered(self.current_question_num):
+                # Bounded retry loop (prevents stack overflow under prolonged outages)
+                for _retry in range(10):
+                    logger.warning(f"No deliverable participant available (attempt {_retry+1}/10); retrying in 0.3s")
+                    await asyncio.sleep(0.3)
+                    participant = await self._select_next_deliverable_participant(
+                        self.current_question_num,
+                        context="move_to_next_participant_retry",
+                    )
+                    if participant:
+                        break
+                    if self.participant_manager.all_participants_answered(self.current_question_num):
+                        break
+
+                if participant:
+                    pass
+                else:
+                    logger.warning("Exhausted retries for current question, advancing to next question")
 
         if not participant:
             logger.info("No more participants for this question, moving to next question")
 
-            # Acknowledge using direct TTS (no LLM) with participant's name
-            try:
-                ack_text = f"Thank you, {self.last_respondent}." if self.last_respondent else "Thank you."
+            if self._ack_already_spoken:
+                logger.info("🗣️ ACK already spoken in polling loop, skipping duplicate")
+                self._ack_already_spoken = False
+                self._prewarmed_ack_text = None
+                self._response_processing_start = None
+            else:
+                # Acknowledge using direct TTS (no LLM) with participant's name
+                try:
+                    _tr = self._last_turn_result
+                    _ack_name = _tr.ack_name if _tr else (self.last_respondent or "")
+                    ack_text = f"Thank you, {_ack_name}." if _ack_name else "Thank you."
+                    logger.info(f"🗣️ ACK: expected={_tr.expected_identity if _tr else '?'} actual={_tr.actual_identity if _tr else '?'} ack_name={_ack_name}")
 
-                # LATENCY TRACKING: Calculate time from response detection to agent speaking
-                if hasattr(self, '_response_processing_start') and self._response_processing_start:
-                    latency = (datetime.now() - self._response_processing_start).total_seconds()
-                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
-                    self._response_processing_start = None  # Reset for next response
+                    # LATENCY TRACKING: Calculate time from response detection to agent speaking
+                    if hasattr(self, '_response_processing_start') and self._response_processing_start:
+                        latency = (datetime.now() - self._response_processing_start).total_seconds()
+                        logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
+                        logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
+                        self._response_processing_start = None  # Reset for next response
 
-                await self.agent_session.say(ack_text, allow_interruptions=False)
-                self.survey_transcript.add_acknowledgment(ack_text)
-                await asyncio.sleep(0.25)  # Brief pause before next question
-            except RuntimeError as e:
-                logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
+                    await self.agent_session.say(ack_text, allow_interruptions=False)
+                    self.survey_transcript.add_acknowledgment(ack_text)
+                except RuntimeError as e:
+                    logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
+
+            # Inter-question breathing room so the session doesn't feel rushed
+            await asyncio.sleep(2)
 
             await self.ask_next_question()
             return
@@ -3096,30 +3584,56 @@ class CommunityModeratorAgent(Agent):
         logger.info(f"Moving to next participant '{participant}' for same question")
         logger.info(f"{available_remaining} participant(s) remaining for question #{self.current_question_num}")
 
-        # Context-aware acknowledgment using direct TTS (no LLM) with participant's name
-        total_participants = len(self.participant_manager.participants)
-        respondent_name = self.last_respondent if self.last_respondent else ""
-
-        if total_participants == 1:
-            # Only one participant in entire session - don't mention "next participant"
-            ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
-        elif available_remaining > 1:
-            # Multiple participants still need to answer this question
-            ack_text = f"Thank you, {respondent_name}. Let's hear from the next participant." if respondent_name else "Thank you. Let's hear from the next participant."
+        # PIPELINE: Kick off muting in background BEFORE ack TTS so it runs in
+        # parallel with the acknowledgment speech, eliminating sequential overhead.
+        _respondent_count = self._active_respondent_count()
+        if _respondent_count > 1:
+            asyncio.create_task(self.manage_participant_muting(participant))
         else:
-            # Last participant for this question (shouldn't normally reach here)
-            ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
+            logger.info(f"🔇 Skipping muting — solo respondent mode ({_respondent_count} active)")
 
-        # LATENCY TRACKING: Calculate time from response detection to agent speaking
-        if hasattr(self, '_response_processing_start') and self._response_processing_start:
-            latency = (datetime.now() - self._response_processing_start).total_seconds()
-            logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
-            self._response_processing_start = None  # Reset for next response
+        if self._ack_already_spoken:
+            logger.info("🗣️ ACK already spoken in polling loop, skipping duplicate (multi-participant)")
+            self._ack_already_spoken = False
+            self._prewarmed_ack_text = None
+            self._response_processing_start = None
 
-        await self.agent_session.say(ack_text, allow_interruptions=False)
-        self.survey_transcript.add_acknowledgment(ack_text)
+            # For multi-participant, still append the transition prompt
+            total_participants = len(self.participant_manager.participants)
+            if total_participants > 1 and available_remaining > 1:
+                transition_text = "Let's hear from the next participant."
+                await self.agent_session.say(transition_text, allow_interruptions=False)
+                self.survey_transcript.add_acknowledgment(transition_text)
+        else:
+            # Context-aware acknowledgment using TurnResult for correct name
+            total_participants = len(self.participant_manager.participants)
+            _tr = self._last_turn_result
+            respondent_name = _tr.ack_name if _tr else (self.last_respondent or "")
+            logger.info(f"🗣️ ACK: expected={_tr.expected_identity if _tr else '?'} actual={_tr.actual_identity if _tr else '?'} ack_name={respondent_name}")
 
-        await asyncio.sleep(0.1)  # Minimal pause for natural flow
+            if total_participants == 1:
+                ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
+            elif available_remaining > 1:
+                ack_text = f"Thank you, {respondent_name}. Let's hear from the next participant." if respondent_name else "Thank you. Let's hear from the next participant."
+            else:
+                ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
+
+            # LATENCY TRACKING: Calculate time from response detection to agent speaking
+            if hasattr(self, '_response_processing_start') and self._response_processing_start:
+                latency = (datetime.now() - self._response_processing_start).total_seconds()
+                logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {latency:.2f}s")
+                logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
+
+                # #region agent log
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "moderator_agent.py:move_to_next_participant", "message": "Transition latency", "data": {"response_end_to_next_tts_ms": round(latency * 1000), "question_num": self.current_question_num, "next_participant": participant, "filler_spoken": self._transition_filler_said}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}) + "\n")
+                # #endregion
+
+                self._response_processing_start = None  # Reset for next response
+
+            await self.agent_session.say(ack_text, allow_interruptions=False)
+            self.survey_transcript.add_acknowledgment(ack_text)
 
         # Get participant's display name (from LiveKit token) for natural TTS
         participant_display_name = self.participant_manager.get_display_name(participant)
@@ -3138,7 +3652,9 @@ class CommunityModeratorAgent(Agent):
 
         # Reset response flags and fragments before asking question
         self.response_captured = False
+        self._transition_filler_said = False
         self.latest_user_response = None
+        self.pending_stt_transcript = None  # Prevent stale transcripts from previous turn
         self.response_fragments = []
         self.last_fragment_time = None
         self.last_stt_fragment = ""  # Reset fragment tracking for new question
@@ -3149,6 +3665,8 @@ class CommunityModeratorAgent(Agent):
         self.already_answered_prompt_given = False  # Reset already-answered flag for new participant
         self.accumulated_partial_answer = ""  # Clear any accumulated partial answers
         self.turn_time_exceeded = False  # Reset turn time exceeded flag for new participant
+        self._ack_already_spoken = False  # Reset ack flag for new participant
+        self._prewarmed_ack_text = None  # Clear pre-warmed ack text
 
         # Clean up any existing turn monitoring from previous participant
         if self.turn_monitor_task:
@@ -3160,27 +3678,46 @@ class CommunityModeratorAgent(Agent):
         # Reduced for faster response times while still allowing natural pauses
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                # Qualitative - allow pauses for thinking (reduced from 2.5s)
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.8)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.8s (qualitative question)")
             elif self.current_question_object.is_quantitative():
-                # Quantitative - quick answers
-                self.agent_session.vad.update_options(min_silence_duration=0.6)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.4)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.4s (quantitative question)")
             else:
-                # Default/info - middle ground
-                self.agent_session.vad.update_options(min_silence_duration=1.0)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.0s (default)")
+                self.agent_session.vad.update_options(min_silence_duration=0.5)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.5s (default)")
 
         # MULTI-PARTICIPANT FIX: Set who we're expecting to respond
         self.expected_respondent = participant
         self.actual_respondent = None  # Will be set when we detect audio activity
+        self.turn_transition_time = datetime.now()  # For spillover detection
+        self._set_delivery_state(self.current_question_num, participant, "delivering", context="move_to_next_participant")
 
         logger.critical("=" * 80)
         logger.critical(f"🔧 AUDIO ROUTING TRACE - Question #{self.current_question_num} to {participant}")
 
-        # Mute all participants except the one we're asking (run in background to avoid delay)
-        asyncio.create_task(self.manage_participant_muting(participant))
+        _respondent_count_move = self._active_respondent_count()
+        if _respondent_count_move > 1:
+            # MULTI-PARTICIPANT: Lock STT + mute others to prevent cross-talk
+            logger.critical(f"   {_respondent_count_move} active respondents — enabling STT lock")
+            if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
+                room_io = self.agent_session._room_io
+                if hasattr(room_io, '_audio_input') and room_io._audio_input:
+                    audio_input = room_io._audio_input
+                    logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
+                    try:
+                        audio_input.set_participant(participant)
+                        logger.critical(f"✅ STT set_participant('{participant}') — immediate")
+                    except Exception as e:
+                        logger.error(f"❌ EXCEPTION during set_participant: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+                else:
+                    logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
+            else:
+                logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
+        else:
+            logger.critical(f"   {_respondent_count_move} active respondent — skipping STT lock (solo mode)")
 
         # In observer mode: Keep STT on observer while speaking (to hear pause command)
         if self.observer_mode_enabled:
@@ -3198,12 +3735,12 @@ class CommunityModeratorAgent(Agent):
                 except Exception as e:
                     logger.warning(f"Could not set STT to observer: {e}")
 
-        # DIRECT TTS - Speak the question without any LLM involvement
-        await self.agent_session.say(exact_text_to_say, allow_interruptions=True)
-
-        # Brief delay to allow any observer commands to be processed
-        # (asyncio.create_task schedules the handler but doesn't wait for it)
-        await asyncio.sleep(0.5)
+        # DIRECT TTS - Speak the question with truncation detection + retry
+        await self._speak_question_safely(
+            exact_text_to_say,
+            context=f"move_Q{self.current_question_num}_{participant}",
+        )
+        self._set_delivery_state(self.current_question_num, participant, "delivered", context="move_to_next_participant")
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
@@ -3212,54 +3749,14 @@ class CommunityModeratorAgent(Agent):
                 await asyncio.sleep(0.5)
             logger.info("👁️ Survey resumed - continuing with response collection")
 
-        # NOW switch STT to participant for their response
-        logger.critical(f"   agent_session exists: {self.agent_session is not None}")
-        logger.critical(f"   _room_io exists: {hasattr(self.agent_session, '_room_io') and self.agent_session._room_io is not None if self.agent_session else False}")
-
-        if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-            room_io = self.agent_session._room_io
-            logger.critical(f"   _audio_input exists: {hasattr(room_io, '_audio_input') and room_io._audio_input is not None}")
-
-            if hasattr(room_io, '_audio_input') and room_io._audio_input:
-                audio_input = room_io._audio_input
-
-                logger.critical(f"📍 Switching STT to participant for response:")
-                logger.critical(f"   Target participant: {participant}")
-                logger.critical(f"   All participants in room: {list(self.participant_manager.participants) if self.participant_manager else 'N/A'}")
-
-                logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
-                try:
-                    audio_input.set_participant(participant)
-
-                    # Give STT a moment to switch
-                    await asyncio.sleep(0.1)
-
-                    # Verify the switch
-                    new_participant = getattr(audio_input, '_participant_identity', 'UNKNOWN')
-                    logger.critical(f"✅ STT now listening to: {new_participant}")
-
-                except Exception as e:
-                    logger.error(f"❌ EXCEPTION during set_participant: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-            else:
-                logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
-        else:
-            logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
-
         logger.critical("=" * 80)
-
-        # CRITICAL: Add small delay to allow STT to fully initialize after TTS completes
-        # Without this, if user starts speaking immediately, first words are truncated
-        await asyncio.sleep(0.3)  # 300ms buffer for audio pipeline to stabilize
-
         logger.critical(f"✅ Question spoken via DIRECT TTS (0% LLM involvement)")
 
         # Calculate max polling time: Must be longer than max turn duration to allow graceful time management
         # Max turn duration = base + first_grace + second_grace + buffer
         max_turn_time = self.max_turn_duration + self.first_interrupt_grace + self.second_interrupt_grace
         polling_timeout = max_turn_time + 10  # Add 10s buffer for silence detection and processing
-        max_checks = int(polling_timeout / 0.5)  # Convert to number of 0.5s checks
+        max_checks = int(polling_timeout / 0.1)  # Convert to number of 0.1s checks
 
         logger.critical(f"⏳ SMART POLLING: Waiting for user response (max {polling_timeout}s)...")
         logger.critical(f"   - Max turn duration: {max_turn_time}s (base={self.max_turn_duration}s + graces={self.first_interrupt_grace + self.second_interrupt_grace}s)")
@@ -3282,11 +3779,23 @@ class CommunityModeratorAgent(Agent):
         initial_user_msg_count = len([item for item in self.agent_session._chat_ctx.items
                                        if hasattr(item, 'role') and item.role == 'user'])
 
-        for check_num in range(max_checks):
-            await asyncio.sleep(0.5)  # Check every 0.5 seconds
+        import time as _time
+        self._polling_deadline = _time.time() + polling_timeout
+
+        for check_num in range(max_checks * 3):  # generous upper bound; deadline is the real limiter
+            await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
+
+            if _time.time() > self._polling_deadline:
+                logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
+                break
+
+            # TIMEOUT MONITOR SIGNAL: break early when monitor confirms no-response
+            if not self.waiting_for_response:
+                logger.warning(f"⏱️  Timeout monitor signaled no-response — exiting poll early (2nd loop)")
+                break
 
             # OBSERVER COMMAND CHECK: Periodically switch STT to observer to hear pause/resume commands
-            if self.observer_mode_enabled and check_num % 4 == 2:  # Every 2 seconds
+            if self.observer_mode_enabled and check_num % 20 == 10:  # Every ~2 seconds
                 observer_identity = self.participant_manager.get_observer_identity()
                 if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
                     try:
@@ -3321,108 +3830,37 @@ class CommunityModeratorAgent(Agent):
 
             # CRITICAL: If user is currently speaking, don't process yet - wait for them to finish!
             if self.user_currently_speaking:
-                if check_num % 4 == 0:  # Log every 2 seconds while waiting
+                if check_num % 20 == 0:  # Log every ~2 seconds while waiting
                     logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
                 continue  # Skip to next check, don't process response yet
 
-            # Check if response was stored in our variable (by event handler)
-            # Only process if user has STOPPED speaking AND we have a response
+            # Trust VAD + STT events: proceed immediately once response is
+            # captured and the user has stopped speaking.
             if self.latest_user_response is not None and not self.user_currently_speaking:
-                # User has stopped speaking and we have fragments
-                # Wait additional time to ensure all fragments arrived
-                # ADAPTIVE SILENCE DETECTION: Wait time depends on how long user has been speaking
-                # - Short responses (< 20s): 3-5s wait → feels natural, responsive
-                # - Long responses (20-30s): 10s wait → allows graceful time management to work
-                # - Very long responses (30s+): Already handled by turn monitoring warnings
-
-                # Use the CAPTURED speaking duration (from when user stopped speaking)
-                # NOT recalculated duration which includes wait time
-                speaking_duration = 0.0
-                if self.current_turn and self.current_turn.actual_speaking_duration > 0:
-                    speaking_duration = self.current_turn.actual_speaking_duration
-                    logger.debug(f"📊 Using captured speaking duration: {speaking_duration:.1f}s")
-                else:
-                    # Fallback: calculate if not captured yet (shouldn't happen normally)
-                    if self.current_turn and self.current_turn.start_time:
-                        speaking_duration = (datetime.now() - self.current_turn.start_time).total_seconds()
-                        logger.warning(f"⚠️  Speaking duration not captured, calculating: {speaking_duration:.1f}s")
-
-                # Adaptive silence wait based on speaking duration
-                # Progressive wait times: longer responses get more thinking time
-                # OPTIMIZED SILENCE WAIT TIMES (reduced ~40% for better responsiveness)
-                # Previous values were causing 5-7s latency; now targeting 2-4s total
-
-                # Get question context for logging
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-
-                # FAST PATH: If turn time exceeded, use minimal silence wait
-                # The turn monitor has already confirmed user stopped speaking after time limit
-                if self.turn_time_exceeded:
-                    silence_wait_time = self.silence_wait_turn_exceeded
-                    reason = "TURN TIME EXCEEDED - fast processing"
-                    logger.info(f"⚡ [{question_context}] Turn time exceeded flag set - using fast processing ({silence_wait_time}s wait)")
-                elif speaking_duration >= 20.0:
-                    # Long response (20s+) - use longest wait for graceful time management
-                    silence_wait_time = self.silence_wait_long
-                    reason = "long response (20s+), allowing time for warnings"
-                elif self.is_multi_option_question:
-                    # Multi-option - wait for all choices
-                    silence_wait_time = self.silence_wait_multi_option
-                    reason = "multi-option question"
-                elif self.current_question_object and self.current_question_object.is_qualitative():
-                    # Qualitative - progressive wait based on length to balance responsiveness vs continuation
-                    if speaking_duration >= 15.0:
-                        # Medium response (15-20s) - likely building to longer answer
-                        silence_wait_time = self.silence_wait_qualitative_medium
-                        reason = "qualitative, medium response (15-20s), likely continuing"
-                    elif speaking_duration >= 10.0:
-                        # Getting longer (10-15s) - give more time
-                        silence_wait_time = self.silence_wait_qualitative_building
-                        reason = "qualitative, building response (10-15s)"
-                    elif speaking_duration >= 6.0:
-                        # Short-medium (6-10s) - balanced wait
-                        silence_wait_time = self.silence_wait_qualitative_short_medium
-                        reason = "qualitative, short-medium response (6-10s)"
-                    else:
-                        # Very short response (< 6s) - quick wait for responsiveness
-                        silence_wait_time = self.silence_wait_qualitative_short
-                        reason = "qualitative, very short response (< 6s)"
-                else:
-                    # Quantitative or default - quick answers
-                    silence_wait_time = self.silence_wait_quantitative
-                    reason = "quantitative/default"
-
-                # NETWORK LATENCY ADAPTATION: Add buffer for slow networks
-                if self.network_latency_buffer_s > 0:
-                    original_wait = silence_wait_time
-                    silence_wait_time += self.network_latency_buffer_s
-                    reason += f" +{self.network_latency_buffer_s:.1f}s network buffer"
-                    logger.info(f"📡 Network buffer applied: {original_wait:.1f}s → {silence_wait_time:.1f}s")
-
-                wait_checks = int(silence_wait_time / 0.5)  # Number of 0.5s checks
-
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                logger.info(f"⏸️  [{question_context}] User STOPPED speaking (spoke for {speaking_duration:.1f}s). Waiting {silence_wait_time:.1f}s for silence confirmation ({reason})")
-
-                # Wait and check if user starts speaking again during this window
-                for wait_check in range(wait_checks):
-                    await asyncio.sleep(0.5)
-                    if self.user_currently_speaking:
-                        logger.info(f"⏳ User started speaking again, continuing to wait for complete response...")
-                        break  # Exit wait loop, continue main polling
-                else:
-                    # User didn't start speaking again during the wait window
-                    # Response is complete!
-                    question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                    logger.info(f"✅ [{question_context}] User silent for {silence_wait_time}s, response is COMPLETE")
-
-                # If user started speaking again, continue main polling loop
-                if self.user_currently_speaking:
-                    continue
+                self._silence_confirmed_time = datetime.now()
 
                 # FOUND USER RESPONSE VIA EVENT!
                 question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                elapsed_time = (check_num + 1) * 0.5
+                elapsed_time = (check_num + 1) * 0.1
+
+                # ── Delivery-state double-check at acceptance ──
+                if not self._is_delivery_confirmed(self.current_question_num, participant):
+                    _ds_key = self._delivery_key(self.current_question_num, participant)
+                    _ds = self.question_delivery_state.get(_ds_key, "unknown")
+                    logger.warning(
+                        f"🛡️ DELIVERY GUARD (polling-accept-2nd): Discarding response — "
+                        f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
+                    )
+                    # #region agent log
+                    import json as _json
+                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                        _f.write(_json.dumps({"location": "moderator_agent.py:move_to_next:polling_accept_guard", "message": "Polling acceptance blocked by delivery guard (2nd loop)", "data": {"delivery_state": _ds, "participant": participant, "question_num": self.current_question_num, "response": str(self.latest_user_response)[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_POLL_GUARD"}) + "\n")
+                    # #endregion
+                    self.latest_user_response = None
+                    self.pending_stt_transcript = None
+                    self.response_captured = False
+                    continue
+
                 logger.critical(f"✅ [{question_context}] Response CAPTURED via EVENT (elapsed: {elapsed_time}s from question)")
                 logger.critical(f"📝 [{question_context}] Final response: {len(self.latest_user_response)} chars")
                 logger.critical(f"   Text: '{self.latest_user_response}'")
@@ -3504,16 +3942,26 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement (2nd loop), accepting response")
 
                 # ============================================================
+                # DETERMINISTIC REPEAT PRE-CHECK (before LLM) - 2nd polling loop
+                # ============================================================
+                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+                if is_repeat_request(self.latest_user_response) and not self.question_repeated:
+                    self.question_repeated = True
+                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected (2nd loop) — skipping LLM, repeating question")
+
+                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
+                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
+                    await self.agent_session.say(self.current_question, allow_interruptions=True)
+                    logger.info(f"🔊 Repeated question (heuristic, 2nd loop): '{self.current_question[:100]}...'")
+
+                    self._reset_for_repeat(participant, context="heuristic_repeat_2nd_loop")
+                    continue
+
+                # ============================================================
                 # UNIFIED RESPONSE ANALYSIS (LLM-based) - 2nd polling loop
                 # Checks: repeat request, partial answer, already-answered claim, relevance
                 # ============================================================
                 question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-
-                # NETWORK LATENCY FIX: Allow late-arriving STT fragments to settle before analysis
-                await asyncio.sleep(0.5)  # 500ms settling time for network latency
-
-                # Check if response was updated during settling period
                 response_to_analyze = self.latest_user_response
 
                 # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
@@ -3523,9 +3971,30 @@ class CommunityModeratorAgent(Agent):
                     logger.info(f"📝 [{question_context}] Combined partial + new response for analysis (2nd loop): '{response_to_analyze[:100]}...'")
 
                 logger.info(f"🔍 [{question_context}] Running unified response analysis (2nd loop)...")
-                # Get survey description for context-aware relevance checking
                 survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-                analysis = await analyze_response(question_for_analysis, response_to_analyze, survey_desc)
+
+                # IMMEDIATE ACK: Fire acknowledgment NOW so the user hears
+                # feedback within ~1s.  The LLM analysis runs concurrently;
+                # if it discovers an issue the correction follows naturally.
+                _ack_speaker = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+                self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
+                _ack_handle = self.agent_session.say(self._prewarmed_ack_text, allow_interruptions=False)
+                self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
+                self._ack_already_spoken = True
+                self._transition_filler_said = True  # ack replaces the "One moment…" filler
+                logger.info(f"🗣️ Immediate ack fired (async, 2nd loop): '{self._prewarmed_ack_text}'")
+
+                if hasattr(self, '_response_processing_start') and self._response_processing_start:
+                    _latency = (datetime.now() - self._response_processing_start).total_seconds()
+                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {_latency:.2f}s")
+                    logger.info(f"📊 METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
+
+                # LLM analysis runs while the ack TTS is playing
+                analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
+
+                # Ensure ack finishes before any follow-up correction
+                await _ack_handle
+
                 logger.info(f"📊 [{question_context}] Analysis result: relevant={analysis.is_relevant}, repeat_request={analysis.is_repeat_request}, already_answered={analysis.is_already_answered_claim}, partial_status={analysis.partial_repeat_status}")
 
                 # --- CHECK 1: PARTIAL ANSWER + REPEAT REQUEST ---
@@ -3636,37 +4105,10 @@ class CommunityModeratorAgent(Agent):
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
                     await self.agent_session.say(repeat_intro, allow_interruptions=False)
 
-                    # Repeat the actual question
                     await self.agent_session.say(self.current_question, allow_interruptions=True)
                     logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
 
-                    # RESET ALL TIMING AND MONITORING
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.encouragement_given = False
-
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset all timing/monitoring after repeating question (2nd loop)")
-                    logger.info(f"⏳ Waiting for response after repeating question...")
+                    self._reset_for_repeat(participant, context="llm_repeat_2nd_loop")
                     continue
                 elif is_full_repeat and self.question_repeated:
                     logger.info(f"🔁 [{question_context}] Already repeated question once (2nd loop), proceeding with response")
@@ -3694,8 +4136,6 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_acknowledgment(relevance_prompt)
                     logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
 
-                    # Repeat the question
-                    await asyncio.sleep(0.5)
                     question_text = self.current_question_object.question if self.current_question_object else ""
                     if question_text:
                         await self.agent_session.say(question_text, allow_interruptions=False)
@@ -3778,11 +4218,11 @@ class CommunityModeratorAgent(Agent):
 
                 # Mark ACTUAL participant as answered (not the expected one)
                 self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="response_received")
                 logger.info(f"✅ Marked {actual_speaker} as answered for question #{self.current_question_num}")
 
-                # Track who just responded for personalized acknowledgment (use ACTUAL speaker)
-                self.last_respondent = actual_speaker
-                logger.debug(f"📝 Updated last_respondent to: {actual_speaker}")
+                # Record turn result for acknowledgment (immutable snapshot)
+                self._record_turn_result(expected=participant, actual=actual_speaker)
 
                 # Cancel timeout monitoring since we got a response
                 self.waiting_for_response = False
@@ -3797,10 +4237,18 @@ class CommunityModeratorAgent(Agent):
                 break
 
         if not user_responded:
-            logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected")
+            logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected (2nd loop)")
 
-            # CRITICAL FIX: Record timeout/no-response in ALL outputs so question is not lost
-            # This ensures ALL questions appear in all outputs, even if STT failed to capture audio
+            # Audible acknowledgment so the user knows the system is still alive
+            try:
+                display_name = self.participant_manager.get_display_name(participant) if self.participant_manager else ""
+                timeout_msg = f"I didn't catch a response, {display_name}. Let me move on." if display_name else "I didn't catch a response. Let me move on."
+                await self.agent_session.say(timeout_msg, allow_interruptions=False)
+                self.survey_transcript.add_acknowledgment(timeout_msg)
+            except Exception as e:
+                logger.warning(f"Could not speak timeout message: {e}")
+
+            # Record timeout/no-response in ALL outputs so question is not lost
             question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
             question_text = self.current_question_object.question if self.current_question_object else ""
             response_options = self.current_question_object.response_options if self.current_question_object else []
@@ -3838,8 +4286,18 @@ class CommunityModeratorAgent(Agent):
             )
             logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in CSV DataFrame")
 
-            # Still mark as answered to avoid getting stuck
-            self.participant_manager.mark_participant_answered(participant, self.current_question_num)
+            # Only count timeout as answered if question delivery was confirmed.
+            if self._is_delivery_confirmed(self.current_question_num, participant):
+                self.participant_manager.mark_participant_answered(participant, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, participant, "timeout", context="timeout_after_delivery")
+            else:
+                logger.warning(
+                    f"Skipping answered-mark on timeout for {participant}: delivery was not confirmed; requeueing."
+                )
+                self._register_missing_participant_for_retry(participant, context="timeout_without_delivery")
+
+            # FIX: Record turn result for timeout (was MISSING — caused stale-name acks)
+            self._record_turn_result(expected=participant, actual=participant, was_timeout=True)
 
         # Stop turn duration monitoring (response captured or timeout)
         if self.turn_monitor_task:
@@ -3912,6 +4370,7 @@ async def create_moderator_session(
     tts_model: str = "gpt-4o-mini-tts",
     tts_voice: str = "ash",
     deepgram_api_key: Optional[str] = None,
+    eleven_api_key: Optional[str] = None,
     temperature: float = 0.7,
     max_turn_duration: int = 20,
     turn_warning_duration: int = 15,
@@ -3925,15 +4384,6 @@ async def create_moderator_session(
     question_loader: Optional[QuestionLoader] = None,
     participant_manager: Optional[ParticipantManager] = None,
     survey_config: Optional[SurveyConfig] = None,
-    # Adaptive silence wait time settings (in seconds) - AGGRESSIVE for near-real-time response
-    silence_wait_turn_exceeded: float = 0.3,
-    silence_wait_long: float = 1.5,
-    silence_wait_multi_option: float = 1.2,
-    silence_wait_qualitative_medium: float = 1.5,
-    silence_wait_qualitative_building: float = 1.2,
-    silence_wait_qualitative_short_medium: float = 1.0,
-    silence_wait_qualitative_short: float = 0.8,
-    silence_wait_quantitative: float = 0.5,
 ) -> AgentSession:
     """
     Create and configure the moderator agent session with aggressive interruption and topic tracking.
@@ -3989,15 +4439,6 @@ async def create_moderator_session(
         question_loader=question_loader,
         participant_manager=participant_manager,
         survey_config=survey_config,
-        # Adaptive silence wait time settings
-        silence_wait_turn_exceeded=silence_wait_turn_exceeded,
-        silence_wait_long=silence_wait_long,
-        silence_wait_multi_option=silence_wait_multi_option,
-        silence_wait_qualitative_medium=silence_wait_qualitative_medium,
-        silence_wait_qualitative_building=silence_wait_qualitative_building,
-        silence_wait_qualitative_short_medium=silence_wait_qualitative_short_medium,
-        silence_wait_qualitative_short=silence_wait_qualitative_short,
-        silence_wait_quantitative=silence_wait_quantitative,
     )
 
     # Store room context for disconnection
@@ -4080,7 +4521,7 @@ async def create_moderator_session(
         stt_config = {
             "model": model_to_use,
             "api_key": deepgram_api_key,
-            "interim_results": False,  # CRITICAL: Disable interim results to prevent duplicates/overlaps
+            "interim_results": True,  # Interim results populate latest_user_response while user speaks, eliminating the gap between VAD silence detection and final transcript arrival
             "language": "en-US",  # Explicit language for better accuracy
             "punctuate": True,  # Add punctuation - helps with sentence structure
             "smart_format": True,  # Format numbers, dates, currency for readability
@@ -4135,7 +4576,7 @@ async def create_moderator_session(
         stt_config = {
             "model": model_to_use,
             "languages": "en-US",  # Single language string
-            "interim_results": False,  # Disable interim for consistency
+            "interim_results": True,  # Interim results populate latest_user_response while user speaks
             "punctuate": True,  # Add punctuation
             "use_streaming": True,  # Enable streaming for real-time transcription
         }
@@ -4176,6 +4617,14 @@ async def create_moderator_session(
             model=tts_model_name,
             api_key=deepgram_api_key,
         )
+    elif tts_provider == "elevenlabs":
+        if not ELEVENLABS_AVAILABLE:
+            raise RuntimeError(
+                "ElevenLabs provider selected but livekit-plugins-elevenlabs is not installed. "
+                "Run: pip install livekit-plugins-elevenlabs"
+            )
+        logger.info(f"Using ElevenLabs TTS with voice ID: {tts_voice}")
+        tts_instance = elevenlabs.TTS(voice_id=tts_voice)
     else:  # openai
         logger.info(f"Using OpenAI TTS with model: {tts_model}, voice: {tts_voice}")
         tts_instance = openai.TTS(
@@ -4190,11 +4639,11 @@ async def create_moderator_session(
     #   - Quantitative: 0.8s (fast response for short answers)
     #   - Qualitative: 2.5s (allow natural pauses for long explanations)
     vad_instance = silero.VAD.load(
-        min_silence_duration=0.5,      # Reduced from 1.0s for faster turn-taking (stacks with silence_wait_* values)
+        min_silence_duration=0.4,      # VAD-level silence threshold; polling trusts this directly
         min_speech_duration=0.1,       # Minimum speech duration to trigger (default: 0.05s)
         activation_threshold=0.35,     # Lower than default 0.5 for better sensitivity to soft speech/observer commands
     )
-    logger.info("VAD configured: min_silence_duration=0.5s, activation_threshold=0.35 (sensitive for observer commands)")
+    logger.info("VAD configured: min_silence_duration=0.4s, activation_threshold=0.35 (sensitive for observer commands)")
 
     session = AgentSession(
         stt=stt_instance,
@@ -4281,17 +4730,6 @@ async def create_moderator_session(
         """Handle participant disconnection with grace period."""
         logger.warning(f"⚠️  Participant disconnected: {participant.identity}")
 
-        # #region agent log
-        import json as _json
-        _debug_log_path = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
-        try:
-            entry = {"timestamp": int(datetime.now().timestamp() * 1000), "location": "moderator_agent.py:on_participant_disconnected", "message": "DISCONNECT event fired", "data": {"identity": participant.identity, "expected_respondent": moderator.expected_respondent, "current_question_num": moderator.current_question_num, "participants": list(moderator.participant_manager.participants) if moderator.participant_manager else []}, "hypothesisId": "H1"}
-            with open(_debug_log_path, "a") as f:
-                f.write(_json.dumps(entry) + "\n")
-        except Exception:
-            pass
-        # #endregion
-
         if moderator.participant_manager:
             # Mark as disconnected (starts grace period)
             moderator.participant_manager.mark_participant_disconnected(participant.identity)
@@ -4299,14 +4737,11 @@ async def create_moderator_session(
             # Schedule removal after grace period
             async def remove_after_grace_period():
                 await asyncio.sleep(moderator.participant_manager.disconnect_grace_period)
-                # #region agent log
-                try:
-                    entry = {"timestamp": int(datetime.now().timestamp() * 1000), "location": "moderator_agent.py:remove_after_grace_period", "message": "Grace period expired, attempting removal", "data": {"identity": participant.identity, "expected_respondent": moderator.expected_respondent, "current_question_num": moderator.current_question_num, "participants_before": list(moderator.participant_manager.participants) if moderator.participant_manager else []}, "hypothesisId": "H1"}
-                    with open(_debug_log_path, "a") as f:
-                        f.write(_json.dumps(entry) + "\n")
-                except Exception:
-                    pass
-                # #endregion
+                if participant.identity not in moderator.participant_manager.pending_disconnects:
+                    logger.info(
+                        f"Skipping delayed removal for {participant.identity}: no longer pending disconnect."
+                    )
+                    return
                 moderator.participant_manager.remove_participant(participant.identity, immediate=False)
 
             # Run in background
@@ -4369,8 +4804,8 @@ async def create_moderator_session(
         Check for pending STT transcript and capture it immediately.
         Since we bypass LLM flow, transcripts won't be in conversation context.
         """
-        # Wait briefly for STT to complete
-        await asyncio.sleep(1.5)
+        # Wait briefly for STT to deliver final fragment after silence detected
+        await asyncio.sleep(0.5)
 
         if not moderator.participant_manager or not moderator.current_question_num:
             return
@@ -4379,6 +4814,30 @@ async def create_moderator_session(
         if moderator.response_captured:
             logger.info("Response already captured, skipping duplicate check")
             return
+
+        # ── DELIVERY-STATE GUARD ─────────────────────────────────────
+        # Only accept a response if the question has been fully spoken
+        # to the expected participant.  Transcripts that arrive during
+        # the "delivering" state are stale spillover from the previous
+        # turn and must be discarded.
+        expected = moderator.expected_respondent
+        if expected and moderator.current_question_num:
+            if not moderator._is_delivery_confirmed(moderator.current_question_num, expected):
+                ds_key = moderator._delivery_key(moderator.current_question_num, expected)
+                current_ds = moderator.question_delivery_state.get(ds_key, "unknown")
+                logger.warning(
+                    f"🛡️ DELIVERY GUARD (immediate_capture): Discarding transcript — "
+                    f"delivery_state={current_ds} for Q#{moderator.current_question_num}/{expected} "
+                    f"(need 'delivered')"
+                )
+                # #region agent log
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "moderator_agent.py:immediate_capture:delivery_guard", "message": "Delivery guard blocked capture", "data": {"delivery_state": current_ds, "expected": expected, "question_num": moderator.current_question_num, "pending_transcript": str(moderator.pending_stt_transcript)[:100] if moderator.pending_stt_transcript else None}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_CAPTURE_GUARD"}) + "\n")
+                # #endregion
+                moderator.pending_stt_transcript = None
+                return
+        # ─────────────────────────────────────────────────────────────
 
         # Check for unanswered participants
         current_participants = moderator.participant_manager.participants
@@ -4495,6 +4954,24 @@ async def create_moderator_session(
         """
         logger.critical(f"🔥 EVENT FIRED: user_input_transcribed")
 
+        # ── WELCOME-PHASE GUARD ──────────────────────────────────────────
+        # During welcome/greeting/wait, STT is active but transcripts are
+        # meaningless chatter ("okay", "hello").  Discard them so they
+        # never pollute response_fragments / latest_user_response.
+        if moderator.survey_state == SurveyState.WELCOME:
+            # Extract transcript for logging only
+            _raw = getattr(event, 'transcript', None) or getattr(event, 'text', None) or str(event)
+            logger.info(
+                f"🛡️ WELCOME-PHASE GUARD: Discarding user transcript during welcome/greeting: '{str(_raw)[:80]}'"
+            )
+            # #region agent log
+            import json as _json
+            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"location": "moderator_agent.py:user_input_transcribed:welcome_guard", "message": "WELCOME guard fired — discarding transcript", "data": {"transcript": str(_raw)[:200], "survey_state": moderator.survey_state.value}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "A"}) + "\n")
+            # #endregion
+            return
+        # ─────────────────────────────────────────────────────────────────
+
         # AUDIO ROUTING TRACE: Show which participant's audio was transcribed
         logger.critical("🔍 STT EVENT TRACE:")
         if moderator.agent_session and hasattr(moderator.agent_session, '_room_io') and moderator.agent_session._room_io:
@@ -4507,6 +4984,16 @@ async def create_moderator_session(
 
                 if current_stt_participant != moderator.expected_respondent:
                     logger.error(f"⚠️  STT MISMATCH: Listening to {current_stt_participant} but expecting {moderator.expected_respondent}")
+                    # Use STT source as actual respondent — this is more reliable than
+                    # track_unmuted events (which don't fire for server-initiated unmutes)
+                    if current_stt_participant and current_stt_participant != 'UNKNOWN':
+                        moderator.actual_respondent = current_stt_participant
+                        logger.warning(f"🔄 Setting actual_respondent to STT source: {current_stt_participant}")
+                else:
+                    # STT source matches expected — still set actual_respondent explicitly
+                    # so it's never None (track_unmuted events don't reliably fire)
+                    if current_stt_participant and current_stt_participant != 'UNKNOWN':
+                        moderator.actual_respondent = current_stt_participant
 
         # Extract transcript from UserInputTranscribedEvent
         transcript = ""
@@ -4518,6 +5005,16 @@ async def create_moderator_session(
             transcript = str(event)
 
         logger.critical(f"📝 USER TRANSCRIPT CAPTURED via user_input_transcribed: '{transcript[:100]}'")
+
+        # Guard against STT spillover from previous turn transition
+        if hasattr(moderator, 'turn_transition_time') and moderator.turn_transition_time:
+            elapsed_since_transition = (datetime.now() - moderator.turn_transition_time).total_seconds()
+            if elapsed_since_transition < 2.0:
+                logger.warning(
+                    f"⚠️ Discarding STT transcript arrived {elapsed_since_transition:.1f}s after turn transition "
+                    f"(likely spillover from previous participant): '{transcript[:60]}'"
+                )
+                return
 
         # NETWORK LATENCY TRACKING: Calculate time from speaking start to first STT
         # IMPORTANT: Only track INITIAL latency (first STT after speaking starts)
@@ -4531,20 +5028,7 @@ async def create_moderator_session(
             if stt_latency_ms > moderator.max_observed_latency_ms:
                 moderator.max_observed_latency_ms = stt_latency_ms
 
-            # Calculate network buffer: ONLY based on initial STT latency
-            # Cap buffer at 3 seconds max to prevent runaway waits
-            MAX_NETWORK_BUFFER_S = 3.0
-            if stt_latency_ms > moderator.network_latency_threshold_ms:
-                raw_buffer = (stt_latency_ms - 1000) / 1000.0
-                moderator.network_latency_buffer_s = min(raw_buffer, MAX_NETWORK_BUFFER_S)
-                logger.warning(f"⚠️ NETWORK LATENCY: STT took {stt_latency_ms:.0f}ms (buffer={moderator.network_latency_buffer_s:.1f}s, max={MAX_NETWORK_BUFFER_S}s)")
-            else:
-                # Network is good - decay buffer faster (reduce by 1s each time)
-                moderator.network_latency_buffer_s = max(0, moderator.network_latency_buffer_s - 1.0)
-                if moderator.network_latency_buffer_s > 0:
-                    logger.debug(f"📡 STT latency: {stt_latency_ms:.0f}ms (normal, buffer decayed to {moderator.network_latency_buffer_s:.1f}s)")
-
-        # Log inter-fragment delays for debugging only (DO NOT use to increase buffer)
+        # Log inter-fragment delays for debugging only
         # Large gaps between fragments are usually user pauses, not network issues
         if moderator.last_fragment_time:
             fragment_gap_ms = (datetime.now() - moderator.last_fragment_time).total_seconds() * 1000
@@ -4552,9 +5036,9 @@ async def create_moderator_session(
                 logger.debug(f"📡 Gap between STT fragments: {fragment_gap_ms:.0f}ms (user pause, not adjusting buffer)")
 
         # OBSERVER COMMAND DETECTION: Check if this is an observer command
-        # Only process if observer mode is enabled AND speaker is CONFIRMED to be the observer
-        if moderator.observer_mode_enabled:
-            # First check if this looks like a command at all (before checking speaker)
+        # Only process FINAL transcripts to avoid acting on interim partials
+        _is_final = getattr(event, 'is_final', True)
+        if moderator.observer_mode_enabled and _is_final:
             is_command, command_type = is_observer_command(transcript)
 
             if is_command:
@@ -4610,6 +5094,28 @@ async def create_moderator_session(
                     # NOT the observer - ignore the command-like phrase
                     logger.critical(f"❌ IGNORING command - speaker '{speaker_identity}' is NOT the observer '{observer_identity}'")
                     # Continue processing as a normal participant response
+
+        # ── DELIVERY-STATE GUARD ─────────────────────────────────────
+        # Reject transcripts that arrive while the question is still being
+        # spoken (delivery_state != "delivered").  These are stale spillover
+        # from the previous turn and would pollute the current response.
+        _expected = moderator.expected_respondent
+        if _expected and moderator.current_question_num:
+            if not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
+                _ds_key = moderator._delivery_key(moderator.current_question_num, _expected)
+                _current_ds = moderator.question_delivery_state.get(_ds_key, "unknown")
+                logger.warning(
+                    f"🛡️ DELIVERY GUARD (user_input_transcribed): Discarding transcript — "
+                    f"delivery_state={_current_ds} for Q#{moderator.current_question_num}/{_expected} "
+                    f"(need 'delivered'): '{transcript[:60]}'"
+                )
+                # #region agent log
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "moderator_agent.py:user_input_transcribed:delivery_guard", "message": "Delivery guard blocked transcript", "data": {"delivery_state": _current_ds, "expected": _expected, "question_num": moderator.current_question_num, "transcript": transcript[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_EVENT_GUARD"}) + "\n")
+                # #endregion
+                return
+        # ─────────────────────────────────────────────────────────────
 
         # CRITICAL FIX: STT sends BOTH cumulative updates AND new fragments
         # - Cumulative: "Hello" → "Hello world" (extends previous)
@@ -4720,6 +5226,7 @@ async def create_moderator_session(
             # First fragment for this question
             moderator.latest_user_response = new_fragment
             moderator.last_stt_fragment = new_fragment
+            moderator._first_fragment_time = datetime.now()
             logger.critical(f"💾 [{question_context}] FIRST FRAGMENT ({len(new_fragment)} chars): '{new_fragment[:120]}'...")
 
         # Update timestamp for silence detection
@@ -4740,6 +5247,10 @@ async def create_moderator_session(
             transcript = str(message)
 
         if transcript:
+            _expected = moderator.expected_respondent
+            if _expected and moderator.current_question_num and not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
+                logger.warning(f"🛡️ DELIVERY GUARD (user_speech_committed): Discarding — not delivered yet")
+                return
             logger.critical(f"📝 USER TRANSCRIPT CAPTURED via user_speech_committed: {transcript[:100]}")
             moderator.pending_stt_transcript = transcript
             moderator.latest_user_response = transcript
@@ -4760,6 +5271,10 @@ async def create_moderator_session(
             transcript = str(event)
 
         if transcript:
+            _expected = moderator.expected_respondent
+            if _expected and moderator.current_question_num and not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
+                logger.warning(f"🛡️ DELIVERY GUARD (transcript_received): Discarding — not delivered yet")
+                return
             logger.critical(f"📝 USER TRANSCRIPT CAPTURED via transcript_received: {transcript[:100]}")
             moderator.pending_stt_transcript = transcript
             moderator.latest_user_response = transcript
@@ -4806,7 +5321,12 @@ async def create_moderator_session(
                 moderator.response_timeout_task.cancel()
                 moderator.response_timeout_task = None
             moderator.last_speech_time = datetime.now()
-            moderator.waiting_for_response = False
+            # NOTE: Do NOT set waiting_for_response = False here.
+            # The polling loop interprets that flag as "timeout confirmed no-response."
+            # Cancelling the timeout task + setting last_speech_time is sufficient
+            # to prevent the monitor from firing. waiting_for_response is only
+            # set to False when: (a) the 20s timeout truly fires, or
+            # (b) a transcribed response is captured in the polling loop.
 
             # NETWORK LATENCY TRACKING: Record speaking start time
             moderator.speaking_start_time = datetime.now()
@@ -4860,6 +5380,13 @@ async def create_moderator_session(
         message = event.item
         logger.critical(f"🔥 EVENT FIRED: conversation_item_added - role={message.role if hasattr(message, 'role') else 'unknown'}")
         print(f"🔥 EVENT FIRED: conversation_item_added - role={message.role if hasattr(message, 'role') else 'unknown'}")
+
+        # ── WELCOME-PHASE GUARD ──────────────────────────────────────────
+        if moderator.survey_state == SurveyState.WELCOME:
+            if hasattr(message, 'role') and message.role == "user":
+                logger.info(f"🛡️ WELCOME-PHASE GUARD: Discarding user conversation_item during welcome")
+                return
+        # ─────────────────────────────────────────────────────────────────
 
         # Log assistant messages (LLM/TTS output)
         # DISABLED: We now capture this synchronously immediately after generate_reply()
@@ -4949,16 +5476,32 @@ async def create_moderator_session(
         )
         logger.critical(f"✅ Response logged to JSON (debug): Q#{moderator.current_question_num}, {participant_id}")
 
-        # Track who just responded for personalized acknowledgment
-        moderator.last_respondent = participant_id
-        logger.debug(f"📝 Updated last_respondent to: {participant_id}")
+        # Record turn result for acknowledgment
+        expected = moderator.expected_respondent if moderator.expected_respondent else participant_id
+        moderator._record_turn_result(expected=expected, actual=participant_id)
 
         # Mark participant as answered
         logger.info(f"Marking {participant_id} as answered for question #{moderator.current_question_num}")
-
-        moderator.participant_manager.mark_participant_answered(
-            participant_id, moderator.current_question_num
-        )
+        if moderator._is_delivery_confirmed(moderator.current_question_num, participant_id):
+            moderator.participant_manager.mark_participant_answered(
+                participant_id, moderator.current_question_num
+            )
+            moderator._set_delivery_state(
+                moderator.current_question_num,
+                participant_id,
+                "answered",
+                context="conversation_item_added",
+            )
+        else:
+            logger.warning(
+                f"Skipping mark_participant_answered for {participant_id} because delivery is unconfirmed."
+            )
+            # #region agent log
+            import json as _json
+            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                _f.write(_json.dumps({"location": "moderator_agent.py:conversation_item_added:unconfirmed_delivery", "message": "Skipped mark_answered due to unconfirmed delivery", "data": {"participant_id": participant_id, "question_num": moderator.current_question_num, "expected_respondent": moderator.expected_respondent}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_ANSWERED_GATE"}) + "\n")
+            # #endregion
+            return
 
         # Set flag so polling knows response was captured (fixes wait time issue)
         moderator.response_captured = True

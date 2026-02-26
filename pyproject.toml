@@ -9,6 +9,7 @@ dependencies = [
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit-agents[openai]~=1.2",
     "livekit-agents[anthropic]~=1.2",
+    "livekit-plugins-deepgram~=1.2",
     "python-docx>=1.1.0",
     "python-dotenv>=1.0.0",
     "pandas>=2.3.3",

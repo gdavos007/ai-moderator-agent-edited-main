@@ -19,6 +19,7 @@ class AgentConfig:
     openai_api_key: str
     deepgram_api_key: Optional[str] = ""  # Optional: only needed if using Deepgram
     anthropic_api_key: Optional[str] = ""  # Optional: only needed if using Claude
+    eleven_api_key: Optional[str] = ""  # Optional: only needed if using ElevenLabs TTS
 
     # Agent identity
     agent_name: str = "CommunityModerator"
@@ -26,7 +27,7 @@ class AgentConfig:
 
     # Provider Selection
     stt_provider: str = "openai"  # Options: "openai", "deepgram", or "google"
-    tts_provider: str = "openai"  # Options: "openai" or "deepgram"
+    tts_provider: str = "openai"  # Options: "openai", "deepgram", or "elevenlabs"
 
     # Model configuration
     # OpenAI STT options:
@@ -90,52 +91,6 @@ class AgentConfig:
     # pause and continue, but make the survey feel slower. Shorter waits feel more
     # responsive but may cut off participants who pause to think.
     #
-    # The agent selects the appropriate wait time based on:
-    #   1. Whether turn time was exceeded (uses minimal wait)
-    #   2. How long the participant has been speaking
-    #   3. Whether it's a qualitative (open-ended) or quantitative (multiple choice) question
-    #
-    # USAGE EXAMPLES:
-    #   - If participant speaks for 25 seconds → uses silence_wait_long (3.5s)
-    #   - If participant speaks for 8 seconds on qualitative Q → uses silence_wait_qualitative_short_medium (2.5s)
-    #   - If participant answers a multiple choice Q → uses silence_wait_quantitative (1.5s)
-    # ==================================================================================
-
-    # When turn time limit is exceeded - minimal wait, just confirm they stopped
-    # Example: Participant hit 45s limit, stopped at 47s → wait only 0.3s before processing
-    silence_wait_turn_exceeded: float = 0.3
-
-    # Long responses (20+ seconds of speaking) - maximum wait time
-    # Example: Participant gave detailed 25-second answer → wait 1.5s for any continuation
-    silence_wait_long: float = 1.5
-
-    # Multi-option questions (e.g., "select all that apply")
-    # Example: "Which of these apply to you: A, B, C, D?" → wait 1.2s for all selections
-    silence_wait_multi_option: float = 1.2
-
-    # Qualitative questions - progressive wait based on response length
-    # These are open-ended questions requiring thoughtful answers
-
-    # Medium-length qualitative response (15-20 seconds)
-    # Example: Participant building detailed answer → wait 1.5s, they may continue
-    silence_wait_qualitative_medium: float = 1.5
-
-    # Building qualitative response (10-15 seconds)
-    # Example: Participant developing their thoughts → wait 1.2s
-    silence_wait_qualitative_building: float = 1.2
-
-    # Short-medium qualitative response (6-10 seconds)
-    # Example: Brief but complete answer → wait 1.0s
-    silence_wait_qualitative_short_medium: float = 1.0
-
-    # Very short qualitative response (under 6 seconds)
-    # Example: Quick answer like "I agree with that" → wait 0.8s
-    silence_wait_qualitative_short: float = 0.8
-
-    # Quantitative/default questions (multiple choice, yes/no, ratings)
-    # Example: "On a scale of 1-5..." → wait 0.5s (answers are typically quick)
-    silence_wait_quantitative: float = 0.5
-
     # Topic enforcement
     discussion_topic: str = "Global warming"  # Current discussion topic (TESTING: "Global warming")
     off_topic_interrupt_threshold: int = 15   # Interrupt after 15s of off-topic discussion
@@ -189,6 +144,7 @@ class AgentConfig:
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             deepgram_api_key=os.getenv("DEEPGRAM_API_KEY", ""),
             anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            eleven_api_key=os.getenv("ELEVEN_API_KEY", ""),
             agent_name=agent_name,
             agent_identity=os.getenv("AGENT_IDENTITY", "moderator-bot"),
             # Provider selection
@@ -209,15 +165,6 @@ class AgentConfig:
             second_interrupt_grace=int(os.getenv("SECOND_INTERRUPT_GRACE", "10")),
             enable_turn_limits=os.getenv("ENABLE_TURN_LIMITS", "true").lower() == "true",
             force_interrupt_enabled=os.getenv("FORCE_INTERRUPT_ENABLED", "true").lower() == "true",
-            # Adaptive silence wait time settings (in seconds) - AGGRESSIVE for near-real-time response
-            silence_wait_turn_exceeded=float(os.getenv("SILENCE_WAIT_TURN_EXCEEDED", "0.3")),
-            silence_wait_long=float(os.getenv("SILENCE_WAIT_LONG", "1.5")),
-            silence_wait_multi_option=float(os.getenv("SILENCE_WAIT_MULTI_OPTION", "1.2")),
-            silence_wait_qualitative_medium=float(os.getenv("SILENCE_WAIT_QUALITATIVE_MEDIUM", "1.5")),
-            silence_wait_qualitative_building=float(os.getenv("SILENCE_WAIT_QUALITATIVE_BUILDING", "1.2")),
-            silence_wait_qualitative_short_medium=float(os.getenv("SILENCE_WAIT_QUALITATIVE_SHORT_MEDIUM", "1.0")),
-            silence_wait_qualitative_short=float(os.getenv("SILENCE_WAIT_QUALITATIVE_SHORT", "0.8")),
-            silence_wait_quantitative=float(os.getenv("SILENCE_WAIT_QUANTITATIVE", "0.5")),
             # Topic enforcement settings
             discussion_topic=os.getenv("DISCUSSION_TOPIC", "Global warming"),
             off_topic_interrupt_threshold=int(os.getenv("OFF_TOPIC_INTERRUPT_THRESHOLD", "15")),
@@ -239,6 +186,9 @@ class AgentConfig:
         if self.stt_provider == "deepgram" or self.tts_provider == "deepgram":
             required_fields.append(("DEEPGRAM_API_KEY", self.deepgram_api_key))
 
+        if self.tts_provider == "elevenlabs":
+            required_fields.append(("ELEVEN_API_KEY", self.eleven_api_key))
+
         # Google Cloud uses GOOGLE_APPLICATION_CREDENTIALS env var (checked at runtime by SDK)
         if self.stt_provider == "google":
             google_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
@@ -258,7 +208,7 @@ class AgentConfig:
 
         # Validate provider values
         valid_stt_providers = ["openai", "deepgram", "google"]
-        valid_tts_providers = ["openai", "deepgram"]
+        valid_tts_providers = ["openai", "deepgram", "elevenlabs"]
         if self.stt_provider not in valid_stt_providers:
             raise ValueError(f"Invalid STT_PROVIDER: {self.stt_provider}. Must be one of: {valid_stt_providers}")
         if self.tts_provider not in valid_tts_providers:

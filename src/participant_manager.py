@@ -3,23 +3,11 @@ Participant Manager
 Manages participant selection for round-robin questioning
 """
 import logging
-import json
 import random
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
-
-# #region agent log
-_DEBUG_LOG_PATH = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
-def _dlog(location, message, data=None, hypothesis_id=""):
-    try:
-        entry = {"timestamp": int(datetime.now().timestamp() * 1000), "location": location, "message": message, "data": data or {}, "hypothesisId": hypothesis_id}
-        with open(_DEBUG_LOG_PATH, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
-# #endregion
 
 
 class ParticipantManager:
@@ -92,9 +80,6 @@ class ParticipantManager:
         if participant_identity in self.unavailable_participants:
             self.unavailable_participants.discard(participant_identity)
             logger.info(f"✅ {participant_identity} RECONNECTED (was unavailable) — restored to active pool")
-            # #region agent log
-            _dlog("participant_manager.py:add_participant:restored", "Participant restored from unavailable", {"identity": participant_identity, "unavailable_remaining": list(self.unavailable_participants)}, "FIX")
-            # #endregion
             return  # Already in participants list, just needed to clear unavailable flag
 
         if participant_identity not in self.participants:
@@ -139,6 +124,12 @@ class ParticipantManager:
         if participant_identity in self.unavailable_participants:
             return  # Already marked unavailable, idempotent
 
+        # Reconnected participants are removed from pending_disconnects in add_participant().
+        # If we're no longer pending and this is a delayed removal, skip soft-removal.
+        if not immediate and participant_identity not in self.pending_disconnects:
+            logger.info(f"Skipping removal for {participant_identity}: no longer pending disconnect (likely reconnected)")
+            return
+
         # Check if they're still in grace period
         if not immediate and participant_identity in self.pending_disconnects:
             disconnect_time = self.pending_disconnects[participant_identity]
@@ -147,10 +138,6 @@ class ParticipantManager:
             if elapsed < self.disconnect_grace_period:
                 logger.info(f"Participant {participant_identity} still in grace period ({elapsed:.1f}s/{self.disconnect_grace_period}s)")
                 return
-
-        # #region agent log
-        _dlog("participant_manager.py:remove_participant", "SOFT-REMOVING: marking unavailable (NOT deleting from roster)", {"identity": participant_identity, "immediate": immediate, "participants": list(self.participants), "asked_participants": {str(k): v for k, v in self.asked_participants.items()}}, "FIX")
-        # #endregion
 
         # Soft removal: mark as unavailable instead of deleting from roster
         self.unavailable_participants.add(participant_identity)
@@ -197,10 +184,6 @@ class ParticipantManager:
 
         # Select random participant from available (do NOT add to asked list yet)
         selected = random.choice(available)
-
-        # #region agent log
-        _dlog("participant_manager.py:select_next_participant", "Selected participant", {"selected": selected, "question_num": question_num, "available": available, "answered": answered_this_question, "all_participants": list(self.participants), "pending_disconnects": list(self.pending_disconnects.keys())}, "H3")
-        # #endregion
 
         logger.info(
             f"Selected participant: {selected} for question {question_num} "
@@ -325,9 +308,6 @@ class ParticipantManager:
             participants are accounted for
         """
         if not self.participants:
-            # #region agent log
-            _dlog("participant_manager.py:all_participants_answered", "No participants → True", {"question_num": question_num}, "FIX")
-            # #endregion
             return True
 
         if question_num not in self.asked_participants:
@@ -340,10 +320,5 @@ class ParticipantManager:
         # A participant is "accounted for" if they answered OR are unavailable
         accounted_for = answered | unavailable
         result = all_enrolled.issubset(accounted_for)
-
-        # #region agent log
-        if result:
-            _dlog("participant_manager.py:all_participants_answered", "ALL ACCOUNTED FOR (answered + excused)", {"question_num": question_num, "answered": list(answered), "unavailable_excused": list(unavailable - answered), "all_enrolled": list(all_enrolled), "total": len(all_enrolled)}, "FIX")
-        # #endregion
 
         return result
