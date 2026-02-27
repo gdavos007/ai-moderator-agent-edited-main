@@ -103,12 +103,7 @@ async def handle_welcome_section(session, question_loader, config):
 
         logger.info(f"🎤 WELCOME TEXT SENT TO TTS: '{full_welcome}'")
 
-        welcome_instructions = f"""Say EXACTLY this:
-"{full_welcome}"
-
-Then STOP speaking and WAIT."""
-
-        await session.generate_reply(instructions=welcome_instructions)
+        await session.say(full_welcome, allow_interruptions=False)
         logger.info("✅ Welcome TTS completed")
         return wait_seconds
 
@@ -119,12 +114,7 @@ Then STOP speaking and WAIT."""
 
         logger.info(f"🎤 WELCOME TEXT SENT TO TTS: '{microphone_ready_text}'")
 
-        microphone_ready_instructions = f"""Say EXACTLY this:
-"{microphone_ready_text}"
-
-Then STOP speaking and WAIT."""
-
-        await session.generate_reply(instructions=microphone_ready_instructions)
+        await session.say(microphone_ready_text, allow_interruptions=False)
         logger.info("✅ Welcome TTS completed")
         return 15
 
@@ -151,12 +141,7 @@ async def handle_initial_greeting(session, question_loader, config, participant_
         participant_count = len(participant_manager.participants) if participant_manager else 0
         greeting_text = f"Great! Thank you for joining today. I'll be asking a series of survey questions, and each of you will have about {config.max_turn_duration} seconds to respond. Let's keep our answers brief to ensure everyone has a turn. Let's get started! Please wait for me to call on you for your response."
 
-    greeting_instructions = f"""Say EXACTLY this:
-"{greeting_text}"
-
-Then STOP speaking and WAIT."""
-
-    await session.generate_reply(instructions=greeting_instructions)
+    await session.say(greeting_text, allow_interruptions=False)
 
     # Record greeting in survey transcript and data export
     moderator = session._agent

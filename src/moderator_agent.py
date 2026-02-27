@@ -974,6 +974,7 @@ class CommunityModeratorAgent(Agent):
         self._prewarmed_ack_text: Optional[str] = None  # Pre-computed ack text for concurrent TTS
         self._gentle_warning_in_progress: bool = False  # True while gentle warning TTS is playing; prevents premature response capture
         self._first_fragment_time: Optional[datetime] = None  # When first STT fragment arrived for current question; used for stabilization delay
+        self._user_stopped_speaking_at: Optional[datetime] = None  # Timestamp when user last transitioned from speaking to listening; used for pause cooldown
 
         logger.info(
             f"Agent initialized with graceful survey time management: "
@@ -2502,6 +2503,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.last_stt_fragment = ""  # Reset fragment tracking for new question
         self._first_fragment_time = None  # Reset stabilization timer for new question
+        self._user_stopped_speaking_at = None  # Reset pause-cooldown timer for new question
         self._gentle_warning_in_progress = False  # Ensure clean state for new question
         self.encouragement_given = False  # Reset encouragement flag for new participant
         self.question_repeated = False  # Reset repeat flag for new participant
@@ -2621,6 +2623,19 @@ class CommunityModeratorAgent(Agent):
                     # Too soon since first fragment — VAD may not have fired yet
                     continue
 
+            # PAUSE COOLDOWN: When user pauses mid-thought (e.g. "uhh...", "umm..."),
+            # VAD fires speaking→listening but the user intends to continue. Wait a
+            # cooldown period after the last speaking→listening transition before
+            # treating the response as final. Qualitative questions get more slack.
+            if (self.latest_user_response is not None
+                and not self.user_currently_speaking
+                and not self.turn_time_exceeded
+                and self._user_stopped_speaking_at is not None):
+                pause_cooldown = 1.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
+                if since_stopped < pause_cooldown:
+                    continue
+
             # Trust VAD + STT events: proceed immediately once response is
             # captured and the user has stopped speaking (or turn time exceeded).
             if self.latest_user_response is not None and (not self.user_currently_speaking or self.turn_time_exceeded):
@@ -2653,15 +2668,20 @@ class CommunityModeratorAgent(Agent):
                 self._response_processing_start = response_processing_start  # Store for later tracking
                 logger.critical(f"⏱️  [{question_context}] LATENCY TRACKING: Response processing started at {response_processing_start.isoformat()}")
 
+                # Snapshot the captured response into a local so that a concurrent
+                # gentle-warning reset (which clears self.latest_user_response)
+                # cannot cause a NoneType crash downstream.
+                _captured_response_text: str = self.latest_user_response
+
                 logger.critical(f"✅ [{question_context}] Response CAPTURED via EVENT (elapsed: {elapsed_time}s from question)")
-                logger.critical(f"📝 [{question_context}] Final response: {len(self.latest_user_response)} chars")
-                logger.critical(f"   Text: '{self.latest_user_response}'")
+                logger.critical(f"📝 [{question_context}] Final response: {len(_captured_response_text)} chars")
+                logger.critical(f"   Text: '{_captured_response_text}'")
 
                 # CHECK FOR "I DON'T KNOW" RESPONSES - Encourage participant to try again
                 logger.critical(f"🔍 [{question_context}] CHECKING FOR UNCERTAIN RESPONSE...")
-                logger.critical(f"   Response text: '{self.latest_user_response}'")
+                logger.critical(f"   Response text: '{_captured_response_text}'")
                 logger.critical(f"   encouragement_given flag: {self.encouragement_given}")
-                is_uncertain = is_uncertain_response(self.latest_user_response)
+                is_uncertain = is_uncertain_response(_captured_response_text)
                 logger.critical(f"   is_uncertain_response() returned: {is_uncertain}")
 
                 if is_uncertain:
@@ -2675,9 +2695,9 @@ class CommunityModeratorAgent(Agent):
                         self.survey_transcript.add_response(
                             question_number=self.current_question_num,
                             participant=responder,
-                            response_text=f"[Initial uncertain response before encouragement] {self.latest_user_response}"
+                            response_text=f"[Initial uncertain response before encouragement] {_captured_response_text}"
                         )
-                        logger.info(f"📝 Logged uncertain response before encouragement: '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                        logger.info(f"📝 Logged uncertain response before encouragement: '{_captured_response_text[:100]}...'")
 
                         # Get participant name for personalized encouragement
                         speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
@@ -2739,14 +2759,14 @@ class CommunityModeratorAgent(Agent):
                 # instantly — no LLM round-trip needed.
                 # ============================================================
                 speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                if is_repeat_request(self.latest_user_response) and not self.question_repeated:
+                if is_repeat_request(_captured_response_text) and not self.question_repeated:
                     self.question_repeated = True
                     logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected — skipping LLM analysis, repeating question immediately")
 
                     # #region agent log
                     import json as _json
                     with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_question:heuristic_repeat", "message": "Heuristic repeat pre-check fired (1st loop)", "data": {"transcript": str(self.latest_user_response)[:200], "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "C"}) + "\n")
+                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_question:heuristic_repeat", "message": "Heuristic repeat pre-check fired (1st loop)", "data": {"transcript": str(_captured_response_text)[:200], "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "C"}) + "\n")
                     # #endregion
 
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
@@ -2762,12 +2782,12 @@ class CommunityModeratorAgent(Agent):
                 # Checks: repeat request, partial answer, already-answered claim, relevance
                 # ============================================================
                 question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                response_to_analyze = self.latest_user_response
+                response_to_analyze = _captured_response_text
 
                 # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
                 # with the new response BEFORE analysis. This ensures relevance check sees the full combined answer.
                 if self.partial_repeat_handled and self.accumulated_partial_answer:
-                    response_to_analyze = f"{self.accumulated_partial_answer} {self.latest_user_response}"
+                    response_to_analyze = f"{self.accumulated_partial_answer} {_captured_response_text}"
                     logger.info(f"📝 [{question_context}] Combined partial + new response for analysis: '{response_to_analyze[:100]}...'")
 
                 logger.info(f"🔍 [{question_context}] Running unified response analysis...")
@@ -2855,9 +2875,9 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_response(
                         question_number=self.current_question_num,
                         participant=responder,
-                        response_text=f"[Initial response before rephrase request] {self.latest_user_response}"
+                        response_text=f"[Initial response before rephrase request] {_captured_response_text}"
                     )
-                    logger.info(f"📝 Logged initial response before rephrase: '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                    logger.info(f"📝 Logged initial response before rephrase: '{_captured_response_text[:100]}...'")
 
                     rephrase_prompt = (
                         f"I appreciate that, {speaker_name}, but I may not have captured your response correctly. "
@@ -2925,9 +2945,9 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_response(
                         question_number=self.current_question_num,
                         participant=responder,
-                        response_text=f"[Initial off-topic response] {self.latest_user_response}"
+                        response_text=f"[Initial off-topic response] {_captured_response_text}"
                     )
-                    logger.info(f"📝 Logged off-topic response: '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                    logger.info(f"📝 Logged off-topic response: '{_captured_response_text[:100]}...'")
 
                     relevance_prompt = (
                         f"Thank you {speaker_name}, but I don't think you quite answered the question. "
@@ -2982,8 +3002,9 @@ class CommunityModeratorAgent(Agent):
                 # COMBINE PARTIAL ANSWERS (if any) WITH FINAL RESPONSE
                 # ============================================================
                 if self.accumulated_partial_answer:
-                    combined_response = f"{self.accumulated_partial_answer} {self.latest_user_response}"
+                    combined_response = f"{self.accumulated_partial_answer} {_captured_response_text}"
                     logger.info(f"📝 [{question_context}] Combined partial + final response: '{combined_response[:100]}...'")
+                    _captured_response_text = combined_response
                     self.latest_user_response = combined_response
                     self.accumulated_partial_answer = ""  # Clear after combining
 
@@ -2998,24 +3019,22 @@ class CommunityModeratorAgent(Agent):
                 logger.critical(f"👤 Response from: {actual_speaker} (expected: {participant})")
 
                 # Apply STT correction - handle multi-option questions differently
-                corrected_response = self.latest_user_response
+                corrected_response = _captured_response_text
                 if self.current_question_object and self.current_question_object.response_options:
                     max_sel = self.current_question_object.max_selections or 1
                     if max_sel > 1:
-                        # Multi-option question - parse and match multiple responses
                         corrected_response = parse_multi_option_response(
-                            self.latest_user_response,
+                            _captured_response_text,
                             self.current_question_object.response_options,
                             max_sel
                         )
                     else:
-                        # Single option question - use standard correction
                         corrected_response = correct_transcription(
-                            self.latest_user_response,
+                            _captured_response_text,
                             self.current_question_object.response_options
                         )
-                    if corrected_response != self.latest_user_response:
-                        logger.info(f"Response corrected: '{self.latest_user_response[:50]}' → '{corrected_response[:50]}'")
+                    if corrected_response != _captured_response_text:
+                        logger.info(f"Response corrected: '{_captured_response_text[:50]}' → '{corrected_response[:50]}'")
 
                 # Get question details for logging
                 question_text = self.current_question_object.question if self.current_question_object else ""
@@ -3026,7 +3045,7 @@ class CommunityModeratorAgent(Agent):
                     question_id=question_id,
                     question_text=question_text,
                     participant=actual_speaker,
-                    raw_transcript=self.latest_user_response,
+                    raw_transcript=_captured_response_text,
                     corrected_response=corrected_response,
                     response_options=self.current_question_object.response_options if self.current_question_object else None,
                     expected_respondent=participant
@@ -3658,6 +3677,7 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []
         self.last_fragment_time = None
         self.last_stt_fragment = ""  # Reset fragment tracking for new question
+        self._user_stopped_speaking_at = None  # Reset pause-cooldown timer
         self.encouragement_given = False  # Reset encouragement flag for new participant
         self.question_repeated = False  # Reset repeat flag for new participant
         self.relevance_prompt_given = False  # Reset relevance flag for new participant
@@ -3834,6 +3854,17 @@ class CommunityModeratorAgent(Agent):
                     logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
                 continue  # Skip to next check, don't process response yet
 
+            # PAUSE COOLDOWN (2nd loop): Same as first loop — wait after the user
+            # stops speaking to tolerate "uhh" / "umm" mid-thought pauses.
+            if (self.latest_user_response is not None
+                and not self.user_currently_speaking
+                and not self.turn_time_exceeded
+                and self._user_stopped_speaking_at is not None):
+                pause_cooldown = 1.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
+                if since_stopped < pause_cooldown:
+                    continue
+
             # Trust VAD + STT events: proceed immediately once response is
             # captured and the user has stopped speaking.
             if self.latest_user_response is not None and not self.user_currently_speaking:
@@ -3861,15 +3892,20 @@ class CommunityModeratorAgent(Agent):
                     self.response_captured = False
                     continue
 
+                # Snapshot the captured response into a local so that a concurrent
+                # gentle-warning reset (which clears self.latest_user_response)
+                # cannot cause a NoneType crash downstream.
+                _captured_response_text: str = self.latest_user_response
+
                 logger.critical(f"✅ [{question_context}] Response CAPTURED via EVENT (elapsed: {elapsed_time}s from question)")
-                logger.critical(f"📝 [{question_context}] Final response: {len(self.latest_user_response)} chars")
-                logger.critical(f"   Text: '{self.latest_user_response}'")
+                logger.critical(f"📝 [{question_context}] Final response: {len(_captured_response_text)} chars")
+                logger.critical(f"   Text: '{_captured_response_text}'")
 
                 # CHECK FOR "I DON'T KNOW" RESPONSES - Encourage participant to try again (2nd polling loop)
                 logger.critical(f"🔍 [{question_context}] CHECKING FOR UNCERTAIN RESPONSE (2nd loop)...")
-                logger.critical(f"   Response text: '{self.latest_user_response}'")
+                logger.critical(f"   Response text: '{_captured_response_text}'")
                 logger.critical(f"   encouragement_given flag: {self.encouragement_given}")
-                is_uncertain = is_uncertain_response(self.latest_user_response)
+                is_uncertain = is_uncertain_response(_captured_response_text)
                 logger.critical(f"   is_uncertain_response() returned: {is_uncertain}")
 
                 if is_uncertain:
@@ -3883,9 +3919,9 @@ class CommunityModeratorAgent(Agent):
                         self.survey_transcript.add_response(
                             question_number=self.current_question_num,
                             participant=responder,
-                            response_text=f"[Initial uncertain response before encouragement] {self.latest_user_response}"
+                            response_text=f"[Initial uncertain response before encouragement] {_captured_response_text}"
                         )
-                        logger.info(f"📝 Logged uncertain response before encouragement (2nd loop): '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                        logger.info(f"📝 Logged uncertain response before encouragement (2nd loop): '{_captured_response_text[:100]}...'")
 
                         # Get participant name for personalized encouragement
                         speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
@@ -3945,7 +3981,7 @@ class CommunityModeratorAgent(Agent):
                 # DETERMINISTIC REPEAT PRE-CHECK (before LLM) - 2nd polling loop
                 # ============================================================
                 speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                if is_repeat_request(self.latest_user_response) and not self.question_repeated:
+                if is_repeat_request(_captured_response_text) and not self.question_repeated:
                     self.question_repeated = True
                     logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected (2nd loop) — skipping LLM, repeating question")
 
@@ -3962,12 +3998,12 @@ class CommunityModeratorAgent(Agent):
                 # Checks: repeat request, partial answer, already-answered claim, relevance
                 # ============================================================
                 question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                response_to_analyze = self.latest_user_response
+                response_to_analyze = _captured_response_text
 
                 # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
                 # with the new response BEFORE analysis. This ensures relevance check sees the full combined answer.
                 if self.partial_repeat_handled and self.accumulated_partial_answer:
-                    response_to_analyze = f"{self.accumulated_partial_answer} {self.latest_user_response}"
+                    response_to_analyze = f"{self.accumulated_partial_answer} {_captured_response_text}"
                     logger.info(f"📝 [{question_context}] Combined partial + new response for analysis (2nd loop): '{response_to_analyze[:100]}...'")
 
                 logger.info(f"🔍 [{question_context}] Running unified response analysis (2nd loop)...")
@@ -4053,9 +4089,9 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_response(
                         question_number=self.current_question_num,
                         participant=participant,
-                        response_text=f"[Initial response before rephrase request] {self.latest_user_response}"
+                        response_text=f"[Initial response before rephrase request] {_captured_response_text}"
                     )
-                    logger.info(f"📝 Logged initial response before rephrase (2nd loop): '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                    logger.info(f"📝 Logged initial response before rephrase (2nd loop): '{_captured_response_text[:100]}...'")
 
                     rephrase_prompt = (
                         f"I appreciate that, {speaker_name}, but I may not have captured your response correctly. "
@@ -4123,9 +4159,9 @@ class CommunityModeratorAgent(Agent):
                     self.survey_transcript.add_response(
                         question_number=self.current_question_num,
                         participant=responder,
-                        response_text=f"[Initial off-topic response] {self.latest_user_response}"
+                        response_text=f"[Initial off-topic response] {_captured_response_text}"
                     )
-                    logger.info(f"📝 Logged off-topic response (2nd loop): '{self.latest_user_response[:100] if self.latest_user_response else 'N/A'}...'")
+                    logger.info(f"📝 Logged off-topic response (2nd loop): '{_captured_response_text[:100]}...'")
 
                     relevance_prompt = (
                         f"Thank you {speaker_name}, but I don't think you quite answered the question. "
@@ -4177,8 +4213,9 @@ class CommunityModeratorAgent(Agent):
                 # COMBINE PARTIAL ANSWERS (if any) WITH FINAL RESPONSE - 2nd loop
                 # ============================================================
                 if self.accumulated_partial_answer:
-                    combined_response = f"{self.accumulated_partial_answer} {self.latest_user_response}"
+                    combined_response = f"{self.accumulated_partial_answer} {_captured_response_text}"
                     logger.info(f"📝 [{question_context}] Combined partial + final response (2nd loop): '{combined_response[:100]}...'")
+                    _captured_response_text = combined_response
                     self.latest_user_response = combined_response
                     self.accumulated_partial_answer = ""  # Clear after combining
 
@@ -4201,7 +4238,7 @@ class CommunityModeratorAgent(Agent):
                 self.survey_transcript.add_response(
                     question_number=self.current_question_num,
                     participant=actual_speaker,
-                    response_text=self.latest_user_response
+                    response_text=_captured_response_text
                 )
                 logger.critical(f"✅ Response logged to JSON: Q#{self.current_question_num}, {actual_speaker}")
 
@@ -4212,7 +4249,7 @@ class CommunityModeratorAgent(Agent):
                     question_id=question_id,
                     question_text=question_text,
                     response_options=response_options,
-                    response_text=self.latest_user_response
+                    response_text=_captured_response_text
                 )
                 logger.critical(f"✅ Response added to CSV DataFrame: Q#{self.current_question_num}")
 
@@ -5293,6 +5330,7 @@ async def create_moderator_session(
         elif event.old_state == "speaking":
             # User stopped speaking (moved to listening or away)
             moderator.user_currently_speaking = False
+            moderator._user_stopped_speaking_at = datetime.now()
 
             # ACCUMULATE actual VAD speaking duration (not wall-clock from turn start)
             # Each speaking→listening transition adds the segment length

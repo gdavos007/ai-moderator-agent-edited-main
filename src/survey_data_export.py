@@ -90,6 +90,9 @@ class SurveyDataExport:
         2. Second answer
         3. Third answer
         """
+        if not response_text:
+            return response_text or ""
+
         # Common separators for multiple answers
         separators = [';', ',', ' and ', '&', '\n']
 
