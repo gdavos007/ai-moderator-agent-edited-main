@@ -3,13 +3,15 @@ name = "ai-moderator-agent"
 version = "0.1.0"
 description = "AI-powered community discussion moderator using LiveKit"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "livekit-agents[silero,turn-detector]~=1.2",
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit-agents[openai]~=1.2",
     "livekit-agents[anthropic]~=1.2",
+    "livekit-agents[anam]~=1.4",
     "livekit-plugins-deepgram~=1.2",
+    "livekit-plugins-elevenlabs>=1.2",
     "python-docx>=1.1.0",
     "python-dotenv>=1.0.0",
     "pandas>=2.3.3",

@@ -61,9 +61,10 @@
         <main class="survey-main">
             <!-- Video Grid (Zoom-like layout) -->
             <div class="video-grid">
-                <!-- AI Moderator -->
+                <!-- AI Moderator (Anam avatar video shown when available, else placeholder) -->
                 <div class="video-tile agent-tile" id="agent-tile">
                     <div class="video-tile-content">
+                        <video id="agent-avatar-video" autoplay playsinline style="display: none; width: 100%; height: 100%; object-fit: cover;"></video>
                         <div class="agent-avatar-animated" id="agent-speaking-ring">
                             <div class="avatar-pulse"></div>
                             <div class="avatar-inner">
@@ -231,6 +232,7 @@
         let sessionStartTime = null;
         let timerInterval = null;
         let surveyState = 'waiting'; // waiting, running, paused
+        let avatarParticipantIdentity = null;
 
         // Audio context for visualization
         let audioContext = null;
@@ -459,18 +461,31 @@
                     }
                 }
 
-                // Attach video to remote participant tile
+                // Attach video: agent (Anam avatar) video goes to agent tile; others to remote tile
                 if (track.kind === LivekitClient.Track.Kind.Video) {
-                    const tileId = `remote-tile-${participant.identity.replace(/[^a-zA-Z0-9]/g, '_')}`;
-                    const tile = document.getElementById(tileId);
-                    if (tile) {
-                        const videoElement = tile.querySelector('video');
-                        const placeholder = tile.querySelector('.video-placeholder');
-                        if (videoElement) {
-                            track.attach(videoElement);
-                            videoElement.style.display = 'block';
-                            if (placeholder) placeholder.style.display = 'none';
-                            console.log('Attached video for:', participant.identity);
+                    const isAgent = participant.kind === LivekitClient.ParticipantKind.AGENT || participant.identity.includes('agent');
+                    if (isAgent) {
+                        const agentVideo = document.getElementById('agent-avatar-video');
+                        const agentPlaceholder = document.getElementById('agent-speaking-ring');
+                        if (agentVideo && agentPlaceholder) {
+                            track.attach(agentVideo);
+                            agentVideo.style.display = 'block';
+                            agentPlaceholder.style.display = 'none';
+                            avatarParticipantIdentity = participant.identity;
+                            console.log('Attached Anam avatar video for agent:', participant.identity);
+                        }
+                    } else {
+                        const tileId = `remote-tile-${participant.identity.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                        const tile = document.getElementById(tileId);
+                        if (tile) {
+                            const videoElement = tile.querySelector('video');
+                            const placeholder = tile.querySelector('.video-placeholder');
+                            if (videoElement) {
+                                track.attach(videoElement);
+                                videoElement.style.display = 'block';
+                                if (placeholder) placeholder.style.display = 'none';
+                                console.log('Attached video for:', participant.identity);
+                            }
                         }
                     }
                 }
@@ -478,16 +493,28 @@
 
             room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
                 if (track.kind === LivekitClient.Track.Kind.Video) {
-                    const tileId = `remote-tile-${participant.identity.replace(/[^a-zA-Z0-9]/g, '_')}`;
-                    const tile = document.getElementById(tileId);
-                    if (tile) {
-                        const videoElement = tile.querySelector('video');
-                        const placeholder = tile.querySelector('.video-placeholder');
-                        if (videoElement) {
-                            track.detach(videoElement);
-                            videoElement.style.display = 'none';
+                    if (participant.identity === avatarParticipantIdentity) {
+                        const agentVideo = document.getElementById('agent-avatar-video');
+                        const agentPlaceholder = document.getElementById('agent-speaking-ring');
+                        if (agentVideo && agentPlaceholder) {
+                            track.detach(agentVideo);
+                            agentVideo.style.display = 'none';
+                            agentPlaceholder.style.display = '';
+                            avatarParticipantIdentity = null;
+                            console.log('Detached Anam avatar video');
                         }
-                        if (placeholder) placeholder.style.display = 'flex';
+                    } else {
+                        const tileId = `remote-tile-${participant.identity.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                        const tile = document.getElementById(tileId);
+                        if (tile) {
+                            const videoElement = tile.querySelector('video');
+                            const placeholder = tile.querySelector('.video-placeholder');
+                            if (videoElement) {
+                                track.detach(videoElement);
+                                videoElement.style.display = 'none';
+                            }
+                            if (placeholder) placeholder.style.display = 'flex';
+                        }
                     }
                 }
             });
@@ -679,6 +706,20 @@
             room.remoteParticipants.forEach((participant) => {
                 if (!participant.identity.includes('agent') && participant.kind !== LivekitClient.ParticipantKind.AGENT) {
                     createRemoteParticipantTile(participant);
+                } else if ((participant.kind === LivekitClient.ParticipantKind.AGENT || participant.identity.includes('agent')) && !avatarParticipantIdentity) {
+                    participant.videoTrackPublications.forEach((pub) => {
+                        if (pub.track && avatarParticipantIdentity === null) {
+                            const agentVideo = document.getElementById('agent-avatar-video');
+                            const agentPlaceholder = document.getElementById('agent-speaking-ring');
+                            if (agentVideo && agentPlaceholder) {
+                                pub.track.attach(agentVideo);
+                                agentVideo.style.display = 'block';
+                                agentPlaceholder.style.display = 'none';
+                                avatarParticipantIdentity = participant.identity;
+                                console.log('Attached existing Anam avatar video for:', participant.identity);
+                            }
+                        }
+                    });
                 }
             });
         }

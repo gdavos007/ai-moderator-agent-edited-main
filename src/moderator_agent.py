@@ -4,6 +4,7 @@ Main agent implementation with moderation capabilities, time management, and top
 """
 import logging
 import asyncio
+import os
 import random
 import re
 from typing import Optional, Dict, Any, List, Set, Tuple
@@ -39,6 +40,13 @@ try:
 except ImportError:
     ELEVENLABS_AVAILABLE = False
     elevenlabs = None
+
+try:
+    from livekit.plugins import anam
+    ANAM_AVAILABLE = True
+except ImportError:
+    ANAM_AVAILABLE = False
+    anam = None
 
 from .question_loader import QuestionLoader, Question
 from .participant_manager import ParticipantManager
@@ -428,13 +436,9 @@ def is_repeat_request(text: str) -> bool:
         "what was the first part",
         "what was that last part",
         "what was that first part",
-        # "didn't hear / catch"
-        "didn't hear",
-        "did not hear",
+        # "didn't catch" (non-directional — always a repeat request)
         "didn't catch",
         "did not catch",
-        "couldn't hear",
-        "could not hear",
         # "can you say …"
         "can you say that again",
         "could you say that again",
@@ -465,9 +469,7 @@ def is_repeat_request(text: str) -> bool:
         "didn't get that",
         "did not get that",
         "i didn't get the question",
-        # audio issues
-        "can't hear",
-        "cannot hear",
+        # audio issues (directional "hear" phrases handled via regex below)
         "speak up",
         "louder please",
         # short interjections
@@ -486,8 +488,28 @@ def is_repeat_request(text: str) -> bool:
             logger.info(f"🔁 Heuristic repeat-request detected: '{text}' matches phrase '{phrase}'")
             return True
 
-    # ── Regex patterns for harder-to-catch variants ──────────────────────
+    # ── Context-aware "hear" phrases ────────────────────────────────────
+    # Only match when the *user* is the one who didn't hear (repeat request),
+    # NOT when the user is saying the *agent* didn't hear them (complaint).
+    # e.g. "I didn't hear you" → repeat request
+    #      "you didn't hear me" / "why didn't you hear me" → NOT a repeat request
     import re
+
+    _hear_phrases = [
+        r"didn'?t hear", r"did not hear",
+        r"couldn'?t hear", r"could not hear",
+        r"can'?t hear", r"cannot hear",
+    ]
+    for hp in _hear_phrases:
+        if re.search(hp, text_lower):
+            # Check if "you" is the subject (agent didn't hear) → skip
+            if re.search(r"\byou\b.{0,10}" + hp, text_lower) or re.search(r"\byou'?re\b.{0,10}" + hp, text_lower):
+                logger.debug(f"🔁 Skipping hear-phrase '{hp}' — subject is 'you' (agent complaint, not repeat request): '{text}'")
+            else:
+                logger.info(f"🔁 Heuristic repeat-request detected (hear-phrase): '{text}' matches /{hp}/")
+                return True
+
+    # ── Regex patterns for harder-to-catch variants ──────────────────────
     _repeat_patterns = [
         # "say … again" with anything in between: "can you say the question again"
         r"\bsay\b.{0,30}\bagain\b",
@@ -917,6 +939,7 @@ class CommunityModeratorAgent(Agent):
         self.response_timeout_task: Optional[asyncio.Task] = None
         self.last_speech_time: Optional[datetime] = None
         self.user_currently_speaking = False  # Track if user is actively speaking (for polling)
+        self._last_user_state: Optional[str] = None  # Latest user state from user_state_changed (speaking/listening/away)
         self._vad_speaking_segment_start: Optional[datetime] = None  # When current speaking segment started (for VAD-based duration)
         self.response_captured = False  # Flag set by event handler when STT captures response
         self.latest_user_response = None  # Store latest STT transcript (bypassing LLM context entirely)
@@ -975,6 +998,8 @@ class CommunityModeratorAgent(Agent):
         self._gentle_warning_in_progress: bool = False  # True while gentle warning TTS is playing; prevents premature response capture
         self._first_fragment_time: Optional[datetime] = None  # When first STT fragment arrived for current question; used for stabilization delay
         self._user_stopped_speaking_at: Optional[datetime] = None  # Timestamp when user last transitioned from speaking to listening; used for pause cooldown
+        self._stt_nudge_given: bool = False  # True after we've nudged the participant due to no STT transcripts
+        self._first_vad_speaking_time: Optional[datetime] = None  # When VAD first detected speech for this question; used for STT health check
 
         logger.info(
             f"Agent initialized with graceful survey time management: "
@@ -1030,8 +1055,15 @@ class CommunityModeratorAgent(Agent):
             )
             return
 
+        # Never mute the Anam avatar participant — it publishes the agent's TTS; muting it would make participants unable to hear the agent
+        ANAM_AVATAR_IDENTITY = "anam-avatar-agent"
+
         for participant_identity in all_participants:
             try:
+                if participant_identity == ANAM_AVATAR_IDENTITY or "avatar-agent" in participant_identity:
+                    logger.debug(f"  Skipping mute for avatar participant: {participant_identity}")
+                    continue
+
                 should_mute = (participant_identity != active_participant)
 
                 # Find this participant's info from room
@@ -1247,11 +1279,16 @@ class CommunityModeratorAgent(Agent):
         *,
         context: str = "",
         max_retries: int = 1,
+        allow_interruptions_first: bool = True,
     ) -> bool:
         """Speak *text* with truncation detection and bounded retry.
 
         On the first attempt the question is spoken with
-        ``allow_interruptions=True`` (natural conversational flow).
+        ``allow_interruptions=allow_interruptions_first`` (defaults to True
+        for natural conversational flow).  Set to False when the listener
+        hasn't heard the question yet (e.g. after a participant switch) to
+        prevent STT spillover from truncating the TTS.
+
         If the TTS returns suspiciously fast (< 50 % of estimated minimum
         duration), we assume it was interrupted by spillover audio / noise
         and retry **once** with ``allow_interruptions=False``.
@@ -1266,7 +1303,7 @@ class CommunityModeratorAgent(Agent):
         estimated_min_sec = word_count / self._TTS_WORDS_PER_SEC
 
         for attempt in range(1 + max_retries):
-            allow_int = attempt == 0  # first try: interruptible; retry: not
+            allow_int = allow_interruptions_first if attempt == 0 else False
             seq = self._tts_sequence + 1
             self._tts_sequence = seq
 
@@ -1366,6 +1403,10 @@ class CommunityModeratorAgent(Agent):
         self._transition_filler_said = False
         self._ack_already_spoken = False
         self._prewarmed_ack_text = None
+
+        # ── STT health-check state ────────────────────────────────────
+        self._first_vad_speaking_time = None
+        self._stt_nudge_given = False
 
         # ── Timeout monitoring ─────────────────────────────────────────
         if self.response_timeout_task:
@@ -1840,6 +1881,17 @@ class CommunityModeratorAgent(Agent):
                     # response as the final answer.
                     self._gentle_warning_in_progress = True
 
+                    # Clear accumulated response NOW (before TTS starts) so neither
+                    # the polling loop nor _capture_user_response_immediately() can
+                    # grab stale pre-warning text while the warning plays.
+                    self.latest_user_response = None
+                    self.last_stt_fragment = ""
+                    self._first_fragment_time = None
+                    self.pending_stt_transcript = None
+                    self.response_captured = False
+                    self._first_vad_speaking_time = None
+                    self._stt_nudge_given = False
+
                     warning_start_time = datetime.now()
                     await session.say(warning_text, allow_interruptions=False)
                     warning_duration = (datetime.now() - warning_start_time).total_seconds()
@@ -1858,14 +1910,29 @@ class CommunityModeratorAgent(Agent):
                     # Reset VAD accumulator so user gets a full wrap-up window of actual speaking time
                     turn_info.actual_speaking_duration = 0.0
 
-                    # Clear accumulated response so only NEW speech after the warning counts.
-                    # The pre-warning response was already captured; we want the wrap-up.
+                    # Clear again after TTS — any STT that arrived while the
+                    # warning played is stale echo / cross-talk, not wrap-up speech.
                     self.latest_user_response = None
                     self.last_stt_fragment = ""
                     self._first_fragment_time = None
+                    self.pending_stt_transcript = None
+                    self.response_captured = False
+                    self._first_vad_speaking_time = None
+                    self._stt_nudge_given = False
 
                     # Now unblock the polling loop
                     self._gentle_warning_in_progress = False
+
+                    # CRITICAL FIX (Bug 2): Extend the polling deadline so the
+                    # polling loop does not timeout while the user is wrapping up.
+                    # Without this, the original deadline (set at question start)
+                    # fires immediately after the warning, discarding wrap-up speech.
+                    import time as _time
+                    wrap_up_extension = self.second_interrupt_grace + 10  # wrap-up window + buffer
+                    new_deadline = _time.time() + wrap_up_extension
+                    if self._polling_deadline is None or new_deadline > self._polling_deadline:
+                        self._polling_deadline = new_deadline
+                    logger.info(f"⏱️  Polling deadline extended by {wrap_up_extension}s after gentle warning")
 
                     logger.critical(
                         f"✅ GENTLE WARNING SENT (took {warning_duration:.1f}s). "
@@ -2468,12 +2535,31 @@ class CommunityModeratorAgent(Agent):
                 except Exception as e:
                     logger.warning(f"Could not set STT to observer: {e}")
 
-        # DIRECT TTS - Speak the question with truncation detection + retry
+        # In multi-participant mode, add a brief delay to let STT spillover
+        # from the previous participant's answer drain before speaking.
+        # Kept short (0.5s) because delivery-state guards already block stale transcripts.
+        _is_multi = self._active_respondent_count() > 1
+        if _is_multi:
+            logger.info(f"⏳ Waiting 0.5s for STT spillover to drain before speaking to {participant}")
+            await asyncio.sleep(0.5)
+
+        # DIRECT TTS - Speak the question with truncation detection + retry.
+        # In multi-participant mode, disable interruptions on the first attempt
+        # because STT spillover from the previous participant could truncate
+        # the question before this participant has heard it.
         await self._speak_question_safely(
             exact_text_to_say,
             context=f"ask_Q{self.current_question_num}_{participant}",
+            allow_interruptions_first=not _is_multi,
         )
         self._set_delivery_state(self.current_question_num, participant, "delivered", context="ask_next_question")
+
+        if self._last_user_state == "away":
+            logger.warning(
+                f"⚠️ USER IS 'AWAY' at question delivery — Q#{self.current_question_num} "
+                f"for {participant}. Browser tab may have lost focus or mic input interrupted. "
+                f"VAD/STT may not receive audio until user returns."
+            )
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
@@ -2505,6 +2591,8 @@ class CommunityModeratorAgent(Agent):
         self._first_fragment_time = None  # Reset stabilization timer for new question
         self._user_stopped_speaking_at = None  # Reset pause-cooldown timer for new question
         self._gentle_warning_in_progress = False  # Ensure clean state for new question
+        self._stt_nudge_given = False  # Reset STT health-check nudge for new question
+        self._first_vad_speaking_time = None  # When VAD first detected speech for this question
         self.encouragement_given = False  # Reset encouragement flag for new participant
         self.question_repeated = False  # Reset repeat flag for new participant
         self.relevance_prompt_given = False  # Reset relevance flag for new participant
@@ -2541,8 +2629,17 @@ class CommunityModeratorAgent(Agent):
             await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
 
             if _time.time() > self._polling_deadline:
-                logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
-                break
+                # Safety: never timeout while user is speaking or gentle warning is active
+                if self.user_currently_speaking or self._gentle_warning_in_progress:
+                    self._polling_deadline = _time.time() + 5  # extend 5s and re-check
+                    logger.debug(f"⏱️  Deadline reached but user still speaking/warning active — extending 5s")
+                    continue
+                # Safety: if we have captured STT fragments, don't throw them away
+                if self.latest_user_response is not None:
+                    logger.info(f"⏱️  Deadline reached but STT fragments exist — processing instead of timing out")
+                else:
+                    logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
+                    break
 
             # TIMEOUT MONITOR SIGNAL: monitor_response_timeout sets this to False
             # after 20s of total silence — break immediately so we don't wait
@@ -2609,6 +2706,30 @@ class CommunityModeratorAgent(Agent):
             # If turn time exceeded but user is still speaking, force processing
             if self.turn_time_exceeded and self.user_currently_speaking:
                 logger.warning(f"⚡ FORCE PROCESSING: Turn time exceeded but user still speaking - proceeding with accumulated response")
+
+            # STT HEALTH CHECK: If VAD has detected speech but no STT
+            # transcripts have arrived, the STT pipeline may have silently
+            # failed (audio quality, Deepgram glitch, etc.).  Nudge once.
+            if (self.latest_user_response is None
+                and not self.response_captured
+                and not self._stt_nudge_given
+                and self._first_vad_speaking_time is not None
+                and not self.user_currently_speaking):
+                since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
+                if since_first_vad > 15:
+                    self._stt_nudge_given = True
+                    display_name = self.participant_manager.get_display_name(participant)
+                    nudge_text = (
+                        f"I'm sorry {display_name}, I couldn't quite hear you. "
+                        f"Could you please repeat that a bit louder?"
+                    )
+                    logger.warning(
+                        f"⚠️ STT HEALTH CHECK: VAD detected speech "
+                        f"{since_first_vad:.0f}s ago but no STT transcripts "
+                        f"received for {participant}! Nudging participant."
+                    )
+                    await self.agent_session.say(nudge_text, allow_interruptions=False)
+                    self.survey_transcript.add_acknowledgment(nudge_text)
 
             # STABILIZATION DELAY: Prevent capturing a tiny first fragment (e.g. "How")
             # before VAD has even detected the user as speaking.  STT events can
@@ -2759,15 +2880,9 @@ class CommunityModeratorAgent(Agent):
                 # instantly — no LLM round-trip needed.
                 # ============================================================
                 speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                if is_repeat_request(_captured_response_text) and not self.question_repeated:
+                if is_repeat_request(_captured_response_text):
                     self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected — skipping LLM analysis, repeating question immediately")
-
-                    # #region agent log
-                    import json as _json
-                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_question:heuristic_repeat", "message": "Heuristic repeat pre-check fired (1st loop)", "data": {"transcript": str(_captured_response_text)[:200], "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "C"}) + "\n")
-                    # #endregion
+                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected — repeating question (repeat #{self.question_repeated})")
 
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
                     await self.agent_session.say(repeat_intro, allow_interruptions=False)
@@ -2918,11 +3033,12 @@ class CommunityModeratorAgent(Agent):
                     continue
 
                 # --- CHECK 3: FULL REPEAT REQUEST (no partial answer) ---
-                # Use LLM analysis for repeat detection (context-aware, handles "didn't hear about X" correctly)
+                # A pure repeat request is a control utterance, not an answer.
+                # Always honour it regardless of how many times the user asks.
                 is_full_repeat = analysis.is_repeat_request or (analysis.partial_repeat_status == "REPEAT_ONLY")
-                if is_full_repeat and not self.question_repeated:
+                if is_full_repeat:
                     self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question")
+                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (LLM-confirmed)")
 
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
                     await self.agent_session.say(repeat_intro, allow_interruptions=False)
@@ -2932,8 +3048,6 @@ class CommunityModeratorAgent(Agent):
 
                     self._reset_for_repeat(participant, context="llm_repeat_1st_loop")
                     continue
-                elif is_full_repeat and self.question_repeated:
-                    logger.info(f"🔁 [{question_context}] Already repeated question once, proceeding with response")
 
                 # --- CHECK 4: OFF-TOPIC/IRRELEVANT RESPONSE ---
                 if not analysis.is_relevant and not self.relevance_prompt_given:
@@ -2972,6 +3086,8 @@ class CommunityModeratorAgent(Agent):
                     self.actual_respondent = None
                     self.encouragement_given = False
                     self.question_repeated = False
+                    self._first_vad_speaking_time = None
+                    self._stt_nudge_given = False
 
                     self.waiting_for_response = True
                     self.last_speech_time = None
@@ -3201,61 +3317,22 @@ class CommunityModeratorAgent(Agent):
                     is_method2_repeat = method2_analysis.is_repeat_request or (method2_analysis.partial_repeat_status == "REPEAT_ONLY")
 
                 if is_method2_repeat:
-                    if not self.question_repeated:
-                        # First repeat request - repeat the question
-                        self.question_repeated = True
-                        question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                        logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (METHOD 2)")
+                    # A pure repeat request is a control utterance, not an answer.
+                    # Always honour it regardless of how many times the user asks.
+                    self.question_repeated = True
+                    question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
+                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (METHOD 2)")
 
-                        # Acknowledge and repeat the question
-                        repeat_intro = f"Of course, {participant.capitalize()}. I'll repeat the question."
-                        await self.agent_session.say(repeat_intro, allow_interruptions=False)
+                    repeat_intro = f"Of course, {participant.capitalize()}. I'll repeat the question."
+                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
 
-                        # Repeat the actual question
-                        await self.agent_session.say(self.current_question, allow_interruptions=True)
-                        logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
+                    await self.agent_session.say(self.current_question, allow_interruptions=True)
+                    logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
 
-                        # RESET ALL TIMING AND MONITORING - treat as fresh question
-                        # Reset encouragement flag so they can be encouraged again if needed
-                        self.encouragement_given = False
+                    self._reset_for_repeat(participant, context="method2_repeat")
 
-                        # Reset timeout monitoring
-                        self.waiting_for_response = True
-                        self.last_speech_time = None
-                        if self.response_timeout_task:
-                            self.response_timeout_task.cancel()
-                        self.response_timeout_task = asyncio.create_task(
-                            self.monitor_response_timeout(participant)
-                        )
-
-                        # Reset turn duration monitoring
-                        if self.turn_monitor_task:
-                            self.turn_monitor_task.cancel()
-                            self.turn_monitor_task = None
-
-                        # Reset speech timing
-                        self.user_currently_speaking = False
-                        self.turn_time_exceeded = False
-
-                        # Restart turn monitor for the new response
-                        self.current_turn = TurnInfo(
-                            participant_identity=participant,
-                            start_time=datetime.now(),
-                        )
-                        self.turn_monitor_task = asyncio.create_task(
-                            self.monitor_turn_duration(self.agent_session)
-                        )
-                        logger.info(f"🔄 Reset all timing/monitoring after repeating question (METHOD 2)")
-                        logger.info(f"⏱️  Restarted turn monitor for {participant}")
-
-                        # Continue polling for their response
-                        logger.info(f"⏳ Waiting for response after repeating question...")
-                        initial_user_msg_count = len(current_user_msgs)  # Reset baseline for context check
-                        continue
-                    else:
-                        # Already repeated once - accept whatever response they give
-                        question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                        logger.info(f"🔁 [{question_context}] Already repeated question once (METHOD 2), proceeding with response")
+                    initial_user_msg_count = len(current_user_msgs)
+                    continue
 
                 # CHECK FOR OFF-TOPIC/IRRELEVANT RESPONSES (only on first attempt) - METHOD 2
                 if not self.relevance_prompt_given:
@@ -3393,6 +3470,38 @@ class CommunityModeratorAgent(Agent):
                 user_responded = True
                 break
 
+        # Last-resort rescue: if polling exited but we have captured STT
+        # fragments (e.g. user spoke after a gentle warning), treat them as
+        # the response instead of recording a timeout.
+        if not user_responded and self.latest_user_response:
+            _rescued = self.latest_user_response.strip()
+            if _rescued:
+                logger.info(f"🛟 Rescuing captured STT fragments as response (bypassed normal capture): '{_rescued[:100]}...'")
+                question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
+                actual_speaker = self.actual_respondent if self.actual_respondent else participant
+                self.survey_transcript.add_response(
+                    question_number=self.current_question_num,
+                    participant=actual_speaker,
+                    response_text=_rescued,
+                )
+                logger.critical(f"✅ Response logged to JSON (rescued): Q#{self.current_question_num}, {actual_speaker}")
+                question_text = self.current_question_object.question if self.current_question_object else ""
+                response_options = self.current_question_object.response_options if self.current_question_object else []
+                self.survey_data_export.add_response(
+                    participant=actual_speaker,
+                    question_number=self.current_question_num,
+                    question_id=question_id,
+                    question_text=question_text,
+                    response_options=response_options,
+                    response_text=_rescued,
+                )
+                logger.critical(f"✅ Response added to CSV DataFrame (rescued): Q#{self.current_question_num}")
+                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="rescued_after_deadline")
+                self._record_turn_result(expected=participant, actual=actual_speaker)
+                self.latest_user_response = None
+                user_responded = True
+
         if not user_responded:
             logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected via EVENT or CONTEXT")
 
@@ -3528,7 +3637,7 @@ class CommunityModeratorAgent(Agent):
                     logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
 
             # Inter-question breathing room so the session doesn't feel rushed
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
             await self.ask_next_question()
             return
@@ -3594,7 +3703,7 @@ class CommunityModeratorAgent(Agent):
                     logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
 
             # Inter-question breathing room so the session doesn't feel rushed
-            await asyncio.sleep(2)
+            await asyncio.sleep(1)
 
             await self.ask_next_question()
             return
@@ -3616,13 +3725,8 @@ class CommunityModeratorAgent(Agent):
             self._ack_already_spoken = False
             self._prewarmed_ack_text = None
             self._response_processing_start = None
-
-            # For multi-participant, still append the transition prompt
-            total_participants = len(self.participant_manager.participants)
-            if total_participants > 1 and available_remaining > 1:
-                transition_text = "Let's hear from the next participant."
-                await self.agent_session.say(transition_text, allow_interruptions=False)
-                self.survey_transcript.add_acknowledgment(transition_text)
+            # No transition filler — the next participant will be addressed
+            # by name in the question prompt, providing a natural transition.
         else:
             # Context-aware acknowledgment using TurnResult for correct name
             total_participants = len(self.participant_manager.participants)
@@ -3630,12 +3734,7 @@ class CommunityModeratorAgent(Agent):
             respondent_name = _tr.ack_name if _tr else (self.last_respondent or "")
             logger.info(f"🗣️ ACK: expected={_tr.expected_identity if _tr else '?'} actual={_tr.actual_identity if _tr else '?'} ack_name={respondent_name}")
 
-            if total_participants == 1:
-                ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
-            elif available_remaining > 1:
-                ack_text = f"Thank you, {respondent_name}. Let's hear from the next participant." if respondent_name else "Thank you. Let's hear from the next participant."
-            else:
-                ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
+            ack_text = f"Thank you, {respondent_name}." if respondent_name else "Thank you."
 
             # LATENCY TRACKING: Calculate time from response detection to agent speaking
             if hasattr(self, '_response_processing_start') and self._response_processing_start:
@@ -3678,6 +3777,8 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.last_stt_fragment = ""  # Reset fragment tracking for new question
         self._user_stopped_speaking_at = None  # Reset pause-cooldown timer
+        self._stt_nudge_given = False  # Reset STT health-check nudge
+        self._first_vad_speaking_time = None  # Reset first-VAD tracker
         self.encouragement_given = False  # Reset encouragement flag for new participant
         self.question_repeated = False  # Reset repeat flag for new participant
         self.relevance_prompt_given = False  # Reset relevance flag for new participant
@@ -3755,12 +3856,28 @@ class CommunityModeratorAgent(Agent):
                 except Exception as e:
                     logger.warning(f"Could not set STT to observer: {e}")
 
-        # DIRECT TTS - Speak the question with truncation detection + retry
+        # Brief delay to let STT spillover from previous participant drain.
+        # Kept short (0.5s) because delivery-state guards already block stale transcripts.
+        if self._active_respondent_count() > 1:
+            logger.info(f"⏳ Waiting 0.5s for STT spillover to drain before speaking to {participant}")
+            await asyncio.sleep(0.5)
+
+        # DIRECT TTS - Speak the question with truncation detection + retry.
+        # allow_interruptions_first=False because the new participant hasn't
+        # heard the question yet — no valid reason to allow interruptions.
         await self._speak_question_safely(
             exact_text_to_say,
             context=f"move_Q{self.current_question_num}_{participant}",
+            allow_interruptions_first=False,
         )
         self._set_delivery_state(self.current_question_num, participant, "delivered", context="move_to_next_participant")
+
+        if self._last_user_state == "away":
+            logger.warning(
+                f"⚠️ USER IS 'AWAY' at question delivery — Q#{self.current_question_num} "
+                f"for {participant}. Browser tab may have lost focus or mic input interrupted. "
+                f"VAD/STT may not receive audio until user returns."
+            )
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
@@ -3806,8 +3923,16 @@ class CommunityModeratorAgent(Agent):
             await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
 
             if _time.time() > self._polling_deadline:
-                logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
-                break
+                # Safety: never timeout while user is speaking or gentle warning is active
+                if self.user_currently_speaking or self._gentle_warning_in_progress:
+                    self._polling_deadline = _time.time() + 5
+                    logger.debug(f"⏱️  Deadline reached but user still speaking/warning active — extending 5s (2nd loop)")
+                    continue
+                if self.latest_user_response is not None:
+                    logger.info(f"⏱️  Deadline reached but STT fragments exist — processing instead of timing out (2nd loop)")
+                else:
+                    logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
+                    break
 
             # TIMEOUT MONITOR SIGNAL: break early when monitor confirms no-response
             if not self.waiting_for_response:
@@ -3848,11 +3973,40 @@ class CommunityModeratorAgent(Agent):
                 # Exit this polling loop to avoid duplicate processing
                 return
 
+            # GENTLE WARNING GUARD (2nd loop): While the turn monitor is speaking
+            # the wrap-up warning, do NOT capture or process responses.
+            if self._gentle_warning_in_progress:
+                if check_num % 20 == 0:
+                    logger.info(f"⏳ Gentle warning in progress — holding response capture (check {check_num}, 2nd loop)")
+                continue
+
             # CRITICAL: If user is currently speaking, don't process yet - wait for them to finish!
             if self.user_currently_speaking:
                 if check_num % 20 == 0:  # Log every ~2 seconds while waiting
                     logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
                 continue  # Skip to next check, don't process response yet
+
+            # STT HEALTH CHECK (2nd loop): same logic as first loop
+            if (self.latest_user_response is None
+                and not self.response_captured
+                and not self._stt_nudge_given
+                and self._first_vad_speaking_time is not None
+                and not self.user_currently_speaking):
+                since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
+                if since_first_vad > 15:
+                    self._stt_nudge_given = True
+                    display_name = self.participant_manager.get_display_name(participant)
+                    nudge_text = (
+                        f"I'm sorry {display_name}, I couldn't quite hear you. "
+                        f"Could you please repeat that a bit louder?"
+                    )
+                    logger.warning(
+                        f"⚠️ STT HEALTH CHECK (2nd loop): VAD detected speech "
+                        f"{since_first_vad:.0f}s ago but no STT transcripts "
+                        f"received for {participant}! Nudging participant."
+                    )
+                    await self.agent_session.say(nudge_text, allow_interruptions=False)
+                    self.survey_transcript.add_acknowledgment(nudge_text)
 
             # PAUSE COOLDOWN (2nd loop): Same as first loop — wait after the user
             # stops speaking to tolerate "uhh" / "umm" mid-thought pauses.
@@ -4132,11 +4286,12 @@ class CommunityModeratorAgent(Agent):
                     continue
 
                 # --- CHECK 3: FULL REPEAT REQUEST (no partial answer) ---
-                # Use LLM analysis for repeat detection (context-aware, handles "didn't hear about X" correctly)
+                # A pure repeat request is a control utterance, not an answer.
+                # Always honour it regardless of how many times the user asks.
                 is_full_repeat = analysis.is_repeat_request or (analysis.partial_repeat_status == "REPEAT_ONLY")
-                if is_full_repeat and not self.question_repeated:
+                if is_full_repeat:
                     self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (2nd loop)")
+                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (2nd loop, LLM-confirmed)")
 
                     repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
                     await self.agent_session.say(repeat_intro, allow_interruptions=False)
@@ -4146,8 +4301,6 @@ class CommunityModeratorAgent(Agent):
 
                     self._reset_for_repeat(participant, context="llm_repeat_2nd_loop")
                     continue
-                elif is_full_repeat and self.question_repeated:
-                    logger.info(f"🔁 [{question_context}] Already repeated question once (2nd loop), proceeding with response")
 
                 # --- CHECK 4: OFF-TOPIC/IRRELEVANT RESPONSE ---
                 if not analysis.is_relevant and not self.relevance_prompt_given:
@@ -4272,6 +4425,37 @@ class CommunityModeratorAgent(Agent):
 
                 user_responded = True
                 break
+
+        # Last-resort rescue (2nd loop): if polling exited but we have STT
+        # fragments, treat them as the response instead of recording a timeout.
+        if not user_responded and self.latest_user_response:
+            _rescued = self.latest_user_response.strip()
+            if _rescued:
+                logger.info(f"🛟 Rescuing captured STT fragments as response (2nd loop): '{_rescued[:100]}...'")
+                question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
+                actual_speaker = self.actual_respondent if self.actual_respondent else participant
+                self.survey_transcript.add_response(
+                    question_number=self.current_question_num,
+                    participant=actual_speaker,
+                    response_text=_rescued,
+                )
+                logger.critical(f"✅ Response logged to JSON (rescued, 2nd loop): Q#{self.current_question_num}, {actual_speaker}")
+                question_text = self.current_question_object.question if self.current_question_object else ""
+                response_options = self.current_question_object.response_options if self.current_question_object else []
+                self.survey_data_export.add_response(
+                    participant=actual_speaker,
+                    question_number=self.current_question_num,
+                    question_id=question_id,
+                    question_text=question_text,
+                    response_options=response_options,
+                    response_text=_rescued,
+                )
+                logger.critical(f"✅ Response added to CSV DataFrame (rescued, 2nd loop): Q#{self.current_question_num}")
+                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
+                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="rescued_after_deadline_2nd")
+                self._record_turn_result(expected=participant, actual=actual_speaker)
+                self.latest_user_response = None
+                user_responded = True
 
         if not user_responded:
             logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected (2nd loop)")
@@ -4749,6 +4933,35 @@ async def create_moderator_session(
             logger.info(f"🔇 Audio muted: {participant.identity} (track: {publication.sid})")
             # Don't clear actual_respondent yet - we might still get STT results
 
+    # Anam AI Avatar integration
+    anam_avatar_id = os.environ.get("ANAM_AVATAR_ID")
+    if ANAM_AVAILABLE and anam_avatar_id:
+        logger.info(f"Initializing Anam AI avatar with ID: {anam_avatar_id}")
+        try:
+            avatar = anam.AvatarSession(
+                persona_config=anam.PersonaConfig(
+                    name="Survey Moderator Avatar",
+                    avatarId=anam_avatar_id,
+                ),
+            )
+            await avatar.start(session, room=ctx.room)
+            logger.info("Anam AI avatar started successfully")
+        except Exception as e:
+            logger.warning(
+                "Anam avatar failed to start (agent will run without avatar): %s",
+                e,
+                exc_info=False,
+            )
+            logger.warning(
+                "Check that ANAM_AVATAR_ID exists in your Anam Lab account and matches the API key. "
+                "See https://lab.anam.ai/avatars or the Anam avatar gallery for valid IDs."
+            )
+    else:
+        if not ANAM_AVAILABLE:
+            logger.info("Anam plugin not installed, running without avatar")
+        elif not anam_avatar_id:
+            logger.info("ANAM_AVATAR_ID not set, running without avatar")
+
     # Start the session with the agent
     await session.start(
         room=ctx.room,
@@ -4765,6 +4978,14 @@ async def create_moderator_session(
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
         """Handle participant disconnection with grace period."""
+        # The Anam avatar is not a survey participant — log but skip roster management
+        if "avatar-agent" in participant.identity:
+            logger.warning(
+                f"⚠️  Avatar disconnected: {participant.identity} "
+                f"(not a survey participant — survey continues without avatar)"
+            )
+            return
+
         logger.warning(f"⚠️  Participant disconnected: {participant.identity}")
 
         if moderator.participant_manager:
@@ -4845,6 +5066,14 @@ async def create_moderator_session(
         await asyncio.sleep(0.5)
 
         if not moderator.participant_manager or not moderator.current_question_num:
+            return
+
+        # GENTLE WARNING GUARD: Do not capture while the warning TTS is playing.
+        # The user naturally pauses to listen and we must not treat that as
+        # "finished speaking."  The gentle-warning code will clear the response
+        # buffer and reset timers once the warning finishes.
+        if moderator._gentle_warning_in_progress:
+            logger.info("⏳ Gentle warning in progress — skipping immediate capture")
             return
 
         # Check if already captured (avoid duplicates)
@@ -5132,6 +5361,19 @@ async def create_moderator_session(
                     logger.critical(f"❌ IGNORING command - speaker '{speaker_identity}' is NOT the observer '{observer_identity}'")
                     # Continue processing as a normal participant response
 
+        # ── GENTLE-WARNING GUARD ─────────────────────────────────────
+        # While the wrap-up warning TTS is playing, discard incoming
+        # transcripts.  They are either the user's pre-warning tail or
+        # echo from the agent's own speech.  Fresh wrap-up speech will
+        # arrive after the flag is cleared.
+        if moderator._gentle_warning_in_progress:
+            logger.info(
+                f"🛡️ GENTLE-WARNING GUARD (user_input_transcribed): Discarding "
+                f"transcript during warning TTS: '{transcript[:60]}'"
+            )
+            return
+        # ─────────────────────────────────────────────────────────────
+
         # ── DELIVERY-STATE GUARD ─────────────────────────────────────
         # Reject transcripts that arrive while the question is still being
         # spoken (delivery_state != "delivered").  These are stale spillover
@@ -5321,6 +5563,7 @@ async def create_moderator_session(
         """Called when user state changes (speaking/listening/away)"""
         logger.critical(f"🔥 EVENT FIRED: user_state_changed - {event.old_state} -> {event.new_state}")
         print(f"🔥 EVENT FIRED: user_state_changed - {event.old_state} -> {event.new_state}")
+        moderator._last_user_state = event.new_state
 
         # Track speaking state for polling
         if event.new_state == "speaking":
@@ -5353,6 +5596,10 @@ async def create_moderator_session(
         # When user starts speaking
         if event.new_state == "speaking" and event.old_state != "speaking":
             logger.info("User started speaking")
+
+            # Track the very first VAD event for STT health check
+            if moderator._first_vad_speaking_time is None:
+                moderator._first_vad_speaking_time = datetime.now()
 
             # Cancel response timeout - they're now speaking
             if moderator.response_timeout_task:

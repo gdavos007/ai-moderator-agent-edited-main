@@ -272,13 +272,18 @@ async def entrypoint(ctx: agents.JobContext):
             logger.info("👁️ OBSERVER MODE ENABLED - Agent will stay SILENT until observer says 'start survey'")
 
         # Add existing participants to the participant manager
-        # (participants who joined before agent started)
+        # (participants who joined before agent started; exclude agents e.g. Anam avatar)
+        from livekit.rtc import ParticipantKind
         for participant in ctx.room.remote_participants.values():
+            if getattr(participant, "kind", None) == ParticipantKind.PARTICIPANT_KIND_AGENT:
+                logger.info(f"Skipping agent participant (existing): {participant.identity}")
+                continue
+            if participant.identity.startswith("agent") or participant.identity == "anam-avatar-agent":
+                logger.info(f"Skipping agent participant by identity (existing): {participant.identity}")
+                continue
             logger.info(f"Found existing participant: {participant.identity} (name: {participant.name})")
             if moderator.participant_manager:
-                # Pass both identity (for tracking) and name (for display)
                 moderator.participant_manager.add_participant(participant.identity, display_name=participant.name)
-            # Initialize audio activity tracking for existing participants
             moderator.participant_audio_activity[participant.identity] = None
 
         # ========== OBSERVER MODE: Wait silently for "start survey" ==========
@@ -362,8 +367,12 @@ async def entrypoint(ctx: agents.JobContext):
             logger.info(f"Expecting {expected_participants} total participant(s)")
         await asyncio.sleep(wait_seconds)
 
-        # Check for new participants after waiting
+        # Check for new participants after waiting (exclude agents e.g. Anam avatar)
         for participant in ctx.room.remote_participants.values():
+            if getattr(participant, "kind", None) == ParticipantKind.PARTICIPANT_KIND_AGENT:
+                continue
+            if participant.identity.startswith("agent") or participant.identity == "anam-avatar-agent":
+                continue
             if moderator.participant_manager and participant.identity not in moderator.participant_manager.participants:
                 logger.info(f"Adding participant who joined during wait: {participant.identity} (name: {participant.name})")
                 moderator.participant_manager.add_participant(participant.identity, display_name=participant.name)
