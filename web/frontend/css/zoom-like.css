@@ -865,8 +865,10 @@ body {
     border-radius: var(--radius-lg);
     overflow: hidden;
     border: 2px solid transparent;
-    transition: border-color 0.3s ease;
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
     min-height: 280px;
+    /* Hint to compositor so border/shadow changes don't trigger layout */
+    will-change: border-color, box-shadow;
 }
 
 .video-tile.speaking {
@@ -938,11 +940,22 @@ body {
     white-space: nowrap;
 }
 
-/* Agent Avatar Animation */
+/* Agent Avatar Animation
+ *
+ * Two keyframe sets share the same duration/timing/fill-mode so the
+ * browser continues from the current timeline position when the
+ * animation-name is swapped — no hard visual reset.
+ *
+ * will-change promotes transform + opacity to the compositor layer,
+ * preventing layout shifts during the animation cycle.
+ */
 .agent-avatar-animated {
     position: relative;
     width: 100px;
     height: 100px;
+    /* Isolate this subtree on its own compositor layer */
+    will-change: transform;
+    contain: layout style;
 }
 
 .agent-avatar-animated .avatar-pulse {
@@ -953,15 +966,37 @@ body {
     bottom: 0;
     border-radius: 50%;
     border: 3px solid rgba(255, 255, 255, 0.3);
-    transition: all 0.3s ease;
+
+    /* Animation runs continuously — never restarted by class toggles.
+       animation-fill-mode: both prevents single-frame flashes between
+       the last keyframe and the browser's next style recalculation. */
+    animation: agent-pulse-idle 1.5s ease-in-out infinite both;
+
+    /* Compositor hints — transform + opacity run off main thread */
+    will-change: transform, opacity;
+
+    /* Transition only border-color (not 'all', which triggers layout) */
+    transition: border-color 0.3s ease;
 }
 
+/* Speaking: swap to the active keyframes.  Both sets share the same
+   duration and timing function, so the browser continues from the
+   current position — no visible jump. */
 .agent-avatar-animated.speaking .avatar-pulse {
     border-color: var(--success-color);
-    animation: agent-pulse 1.5s infinite;
+    animation-name: agent-pulse-active;
 }
 
-@keyframes agent-pulse {
+/* Idle: scale and opacity stay at 1.0 throughout — visually invisible */
+@keyframes agent-pulse-idle {
+    0%, 50%, 100% {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+/* Active: pulsing scale + opacity change at midpoint */
+@keyframes agent-pulse-active {
     0%, 100% {
         transform: scale(1);
         opacity: 1;
@@ -1143,7 +1178,10 @@ body {
     align-items: center;
     justify-content: center;
     margin: 0 auto 12px;
-    transition: all 0.3s ease;
+    /* Scope transition to visual-only props; 'all' triggers layout on
+       width/height/display changes and causes flicker. */
+    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    will-change: border-color, box-shadow;
 }
 
 .avatar-ring.speaking {
@@ -1209,7 +1247,7 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    transition: all 0.2s;
+    transition: background-color 0.2s ease;
 }
 
 .mic-indicator svg {

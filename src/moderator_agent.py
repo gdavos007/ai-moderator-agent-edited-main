@@ -7,6 +7,7 @@ import asyncio
 import os
 import random
 import re
+import time as _time_mod
 from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -60,6 +61,204 @@ from enum import Enum
 
 # Setup logging
 logger = logging.getLogger(__name__)
+
+
+# ── TTS prompt constants ─────────────────────────────────────────────────────
+# Centralised here so every TTS utterance is easy to audit / translate.
+# Templates with {name} are formatted at call-sites with the participant's
+# display name.  Name-free constants must NEVER be changed to include names —
+# the question itself already addresses the participant.
+
+# Response timeout nudge (NO name — question already used it)
+TIMEOUT_NUDGE_TEXT = "Please go ahead and share your thoughts."
+
+# STT health-check nudge (name needed — may fire outside question context)
+STT_NUDGE_TEMPLATE = (
+    "I'm sorry {name}, I couldn't quite hear you. "
+    "Could you please repeat that a bit louder?"
+)
+
+# Turn-time gentle warning
+GENTLE_WARNING_TEMPLATE = (
+    "{name}, we're going to need to wrap it up so we can get to others. "
+    "Can you spend the next ten to fifteen seconds finishing your thoughts?"
+)
+
+# Turn-time force end
+FORCE_END_TEMPLATE = (
+    "Thank you, {name}. We need to move on to ensure we complete all questions."
+)
+
+# Repeat-request acknowledgment
+REPEAT_INTRO_TEMPLATE = "Of course, {name}. I'll repeat the question."
+
+# Partial-answer repeat acknowledgment
+PARTIAL_REPEAT_INTRO_TEMPLATE = "Got it, {name}. Let me repeat the rest of the question."
+
+# Off-topic / irrelevance redirect
+RELEVANCE_PROMPT_TEMPLATE = (
+    "Thank you {name}, but I don't think you quite answered the question. "
+    "I may be wrong, but I'm going to repeat the question and would you mind "
+    "answering again after I'm done repeating it?"
+)
+
+# Post-encouragement deterministic follow-up (encouragement already used once)
+POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE = (
+    "That's perfectly fine, {name}. Let's move on to the next question."
+)
+
+# Silence watchdog prompt — fires when no transcript progression for N seconds
+SILENCE_WATCHDOG_PROMPT_TEMPLATE = (
+    "I just want to make sure we're still connected, {name}. "
+    "Would you like me to repeat the question, or shall we move on?"
+)
+
+# Silence watchdog: seconds of no transcript progression before firing
+SILENCE_WATCHDOG_TIMEOUT = 12.0
+
+# Idle-no-VAD watchdog: seconds after question delivery with zero VAD
+# activity before we nudge the participant.  Covers cases where the user
+# stays completely quiet and VAD never fires (partial delivery, mic issues).
+IDLE_NO_VAD_TIMEOUT = 12.0
+
+# Extra seconds added to estimated TTS duration before idle watchdog can fire
+TTS_SAFETY_MARGIN = 3.0
+
+# Partial-delivery fallback nudge (NO name — re-asks question after)
+PARTIAL_DELIVERY_NUDGE_TEXT = (
+    "I'm not sure if you heard the full question. Let me repeat it."
+)
+
+# Avatar disconnect notice (NO name)
+AVATAR_DISCONNECT_TEXT = (
+    "Please bear with us for a moment — our visual display "
+    "had a brief interruption, but the survey will continue."
+)
+
+# Avatar reconnect success notice (NO name)
+AVATAR_RECONNECT_TEXT = (
+    "Our visual display is back. Let's continue."
+)
+
+# ── Avatar health states ────────────────────────────────────────────────────
+AVATAR_STATE_IDLE = "idle"            # Not started / not configured
+AVATAR_STATE_STARTING = "starting"    # start() in progress
+AVATAR_STATE_CONNECTED = "connected"  # Running normally
+AVATAR_STATE_DISCONNECTED = "disconnected"  # Lost connection
+AVATAR_STATE_RECONNECTING = "reconnecting"  # Reconnect attempt in-flight
+AVATAR_STATE_FAILED = "failed"        # Gave up after retries
+
+ANAM_AVATAR_IDENTITY = "anam-avatar-agent"
+
+# ── Off-topic short-response guard constants ──────────────────────────────────
+MIN_OFFTOPIC_WORDS = 3
+MIN_OFFTOPIC_CHARS = 40
+
+# Blatant off-topic topics where even a short answer is worth checking.
+_BLATANT_OFFTOPIC_KEYWORDS = frozenset({
+    "basketball", "breakfast", "cat", "cheese", "dinner", "dog",
+    "football", "lunch", "movie", "movies", "music", "pizza",
+    "soccer", "sport", "sports", "weather", "weekend",
+})
+_BLATANT_OFFTOPIC_PHRASES = (
+    "mind your own business",
+    "none of your business",
+)
+
+# Filler / hedge words that carry no substantive content.
+# Stripped before counting to avoid "um uh well like you know so" (7 words)
+# from reaching the word threshold.
+_FILLER_TOKENS = frozenset({
+    "um", "uh", "uhm", "erm", "hmm", "hm", "ah", "oh",
+    "like", "so", "well", "yeah", "yes", "no", "okay", "ok",
+    "right", "and", "but", "just", "you", "know", "mean",
+    "i", "a", "the", "is", "it", "that", "this",
+})
+
+
+_DEBUG_LOG_PATH = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
+
+
+def _debug_log_write(payload: str) -> None:
+    """Best-effort, non-fatal debug log write.
+
+    Wraps the synchronous file I/O in a try/except so a disk error never
+    crashes a live demo.  The writes are still synchronous (not offloaded to
+    a thread) because they are tiny appends, but they are now non-fatal.
+    """
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as _f:
+            _f.write(payload + "\n")
+    except Exception:
+        pass  # Best-effort — never crash the event loop for debug logging
+
+
+def _substantive_word_count(text: str) -> int:
+    """Count words that are NOT filler/hedge tokens."""
+    return sum(1 for w in text.lower().split() if w.strip(".,!?…") not in _FILLER_TOKENS)
+
+
+def _is_too_short_for_offtopic(text: str) -> bool:
+    """Return True if *text* is too short/insubstantial for an off-topic verdict.
+
+    Uses three gates (any one triggers skip):
+      1. Total word count < MIN_OFFTOPIC_WORDS
+      2. Total char count < MIN_OFFTOPIC_CHARS
+      3. Substantive (non-filler) word count < 4
+    """
+    words = len(text.split())
+    chars = len(text)
+    substantive = _substantive_word_count(text)
+    if words < MIN_OFFTOPIC_WORDS or chars < MIN_OFFTOPIC_CHARS or substantive < 4:
+        return True
+    return False
+
+
+def _estimate_tts_duration(text: str) -> float:
+    """Estimate TTS audio duration from character count.
+
+    ElevenLabs / OpenAI TTS speak at approximately 150 words per minute,
+    which is roughly 15 characters per second including spaces.
+    Intentionally conservative (slightly slow) so we overestimate rather
+    than underestimate — better to wait an extra second than to cut off audio.
+    """
+    return max(len(text) / 15.0, 1.0)
+
+
+_DISFLUENT_STARTER_TOKENS = frozenset({
+    "well", "um", "uh", "uhm", "erm", "hmm", "ah", "oh",
+    "like", "so", "i", "think", "guess", "mean",
+    "you", "know", "yeah", "yes", "no", "okay", "ok",
+    "right", "and", "but", "just", "that", "the", "a",
+    "it", "its", "is", "was", "not", "really",
+})
+
+DISFLUENCY_EXTENSION_BUDGET = 10.0  # Total extra seconds added to _polling_deadline for disfluency
+
+
+def _is_disfluent_starter(text: str) -> bool:
+    """Return True if text consists entirely of disfluent/filler tokens."""
+    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
+    words = [w for w in words if w]
+    if not words:
+        return True
+    return all(w in _DISFLUENT_STARTER_TOKENS for w in words)
+
+
+def _normalize_for_offtopic_compare(text: str) -> str:
+    """Lowercase, strip punctuation and collapse whitespace for off-topic repeat detection."""
+    import re as _re
+    return _re.sub(r'\s+', ' ', _re.sub(r'[^\w\s]', '', text.lower())).strip()
+
+
+def _has_blatant_offtopic_keywords(text: str) -> bool:
+    """Return True for obviously unrelated short-topic cues like food/weather."""
+    normalized = _normalize_for_offtopic_compare(text)
+    if not normalized:
+        return False
+    if any(phrase in normalized for phrase in _BLATANT_OFFTOPIC_PHRASES):
+        return True
+    return bool(set(normalized.split()) & _BLATANT_OFFTOPIC_KEYWORDS)
 
 
 # Survey state enum for Observer control
@@ -416,6 +615,19 @@ def is_repeat_request(text: str) -> bool:
         return False
 
     text_lower = text.lower().strip()
+
+    # ── Length gate ──────────────────────────────────────────────────────
+    # If the response is long, it likely contains substantive content
+    # alongside a trigger phrase (e.g. "I'm an engineer. I live in Dallas.
+    # And what's the last part of the question?").  Defer to LLM analysis
+    # which can distinguish partial-answer+repeat from a pure repeat request.
+    HEURISTIC_MAX_LENGTH = 60
+    if len(text_lower) > HEURISTIC_MAX_LENGTH:
+        logger.debug(
+            f"🔁 Skipping heuristic repeat check — response too long "
+            f"({len(text_lower)} chars > {HEURISTIC_MAX_LENGTH}), deferring to LLM"
+        )
+        return False
 
     # ── Substring-match phrases ──────────────────────────────────────────
     repeat_phrases = [
@@ -859,6 +1071,7 @@ class TurnInfo:
     first_interrupted: bool = False  # Whether we've aggressively interrupted
     force_interrupted: bool = False  # Whether we've force-ended
     interruption_count: int = 0  # Number of times interrupted
+    interrupt_denied_count: int = 0  # session.interrupt() calls that raised RuntimeError
     off_topic_start: Optional[datetime] = None  # When participant went off-topic
     off_topic_interrupted: bool = False  # Whether we've interrupted for off-topic
     actual_speaking_duration: float = 0.0  # Actual speaking time (captured when user stops, doesn't include pauses)
@@ -946,6 +1159,10 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []  # DEPRECATED: No longer used (STT sends cumulative transcripts, not fragments)
         self.last_fragment_time = None  # Track when last transcript was received
         self.last_stt_fragment = ""  # Track the last individual STT fragment (for cumulative detection)
+        self._turn_accumulated_text = ""  # Accumulates completed STT utterances within a turn
+        # Phase 1 additions: Event-based response capture
+        self.captured_response: Optional[str] = None  # Final committed response text
+        self._response_ready: asyncio.Event = asyncio.Event()  # Signaled when user_speech_committed fires
         # NETWORK LATENCY TRACKING
         self.speaking_start_time: Optional[datetime] = None  # When user started speaking (for STT latency calc)
         self.first_stt_received = False  # Whether we've received first STT for this speaking segment
@@ -965,6 +1182,7 @@ class CommunityModeratorAgent(Agent):
         # MULTI-PARTICIPANT FIX: Track WHO is speaking
         self.expected_respondent = None  # Who we asked the question to
         self.actual_respondent = None  # Who actually spoke (detected from audio activity)
+        self._current_stt_participant: Optional[str] = None  # Cached identity of participant STT is locked to
         self.participant_audio_activity = {}  # participant_identity -> last_audio_time
         self.active_speaker_track_sid = None  # Currently active audio track SID
 
@@ -990,16 +1208,42 @@ class CommunityModeratorAgent(Agent):
         self._analysis_start_time: Optional[datetime] = None  # For analysis_ms metric
         self._silence_confirmed_time: Optional[datetime] = None  # For silence_confirmation_ms metric
         self.turn_time_exceeded: bool = False  # Flag set when turn monitor detects time exceeded and user stopped
-        self._tts_in_flight: bool = False  # Single-flight guard: True while a TTS say() is active
-        self._tts_sequence: int = 0  # Monotonic counter to detect overlapping TTS calls
+        # _tts_active property (below) replaces old _tts_active / _tts_lock / _tts_sequence machinery
+        self._estimated_remaining_tts: float = 0.0  # Seconds of TTS estimated still audible on client
         self._polling_deadline: Optional[float] = None  # time.time() deadline; extended on repeat
         self._ack_already_spoken: bool = False  # True when polling loop already spoke the ack
         self._prewarmed_ack_text: Optional[str] = None  # Pre-computed ack text for concurrent TTS
         self._gentle_warning_in_progress: bool = False  # True while gentle warning TTS is playing; prevents premature response capture
+        self._gentle_warning_started_at: Optional[float] = None  # time.time() when warning flag was set; watchdog clears if stuck > 8s
+        self._analysis_in_progress: bool = False  # True while LLM analysis is running; prevents capture from overwriting the snapshot
+        self._last_avatar_disconnect_notice: float = 0.0  # time.time() of last avatar disconnect TTS; dedupe cooldown
         self._first_fragment_time: Optional[datetime] = None  # When first STT fragment arrived for current question; used for stabilization delay
         self._user_stopped_speaking_at: Optional[datetime] = None  # Timestamp when user last transitioned from speaking to listening; used for pause cooldown
         self._stt_nudge_given: bool = False  # True after we've nudged the participant due to no STT transcripts
         self._first_vad_speaking_time: Optional[datetime] = None  # When VAD first detected speech for this question; used for STT health check
+        self._shutting_down: bool = False  # Set True during survey completion/room teardown; stops all loops and TTS
+        self._tts_dedupe_spoken: Set[str] = set()  # Per-turn TTS dedupe keys; cleared on question/participant transitions
+        self._encouragement_followup_given: bool = False  # True after deterministic follow-up to a second uncertain response
+        self._last_transcript_progress_time: Optional[float] = None  # time.time() when latest_user_response last changed; silence watchdog
+        self._silence_watchdog_fired: bool = False  # True after silence watchdog has fired once for this turn
+        self._short_offtopic_count: int = 0  # Number of short off-topic responses this turn (for escalation)
+        self._last_short_offtopic_norm: Optional[str] = None  # Normalized text of last short off-topic response (for repeat detection)
+        self._had_stt_transcript_this_turn: bool = False  # True once any STT transcript has been received this turn; prevents false STT nudges
+        self._polling_start_time: Optional[float] = None  # time.time() when polling loop started; idle-no-VAD watchdog reference
+        self._idle_no_vad_nudge_fired: bool = False  # True after idle-no-VAD watchdog has fired once
+
+        # ── Avatar lifecycle tracking ───────────────────────────────────────
+        self._avatar_state: str = AVATAR_STATE_IDLE
+        self._avatar_enabled: bool = False  # True if avatar was configured and started successfully
+        self._avatar_connected: bool = False  # True while avatar is connected and rendering
+        self._avatar_disconnect_reason: Optional[str] = None  # Human-readable reason for last disconnect
+        self._avatar_disconnect_time: Optional[float] = None  # time.time() of last disconnect
+        self._avatar_reconnect_task: Optional[asyncio.Task] = None  # Single-flight reconnect task
+        self._avatar_reconnect_attempts: int = 0
+        self._avatar_notice_task: Optional[asyncio.Task] = None  # Deferred disconnect notice task
+        self._avatar_session_ref: Optional[object] = None  # Long-lived reference to anam.AvatarSession
+        self._audio_only_mode: bool = os.environ.get("AUDIO_ONLY_MODE", "").lower() in ("1", "true", "yes")
+        self._avatar_reconnect_enabled: bool = os.environ.get("AVATAR_RECONNECT_ENABLED", "").lower() in ("1", "true", "yes")
 
         logger.info(
             f"Agent initialized with graceful survey time management: "
@@ -1056,8 +1300,6 @@ class CommunityModeratorAgent(Agent):
             return
 
         # Never mute the Anam avatar participant — it publishes the agent's TTS; muting it would make participants unable to hear the agent
-        ANAM_AVATAR_IDENTITY = "anam-avatar-agent"
-
         for participant_identity in all_participants:
             try:
                 if participant_identity == ANAM_AVATAR_IDENTITY or "avatar-agent" in participant_identity:
@@ -1113,6 +1355,30 @@ class CommunityModeratorAgent(Agent):
             if p not in self.participant_manager.unavailable_participants
         ]
         return len(available)
+
+    def _get_audio_input(self):
+        """Return the RoomIO audio_input handle, or None if unavailable."""
+        if not self.agent_session:
+            return None
+        room_io = getattr(self.agent_session, '_room_io', None)
+        if not room_io:
+            return None
+        return getattr(room_io, '_audio_input', None)
+
+    def _set_stt_participant(self, identity: str, *, context: str = "") -> bool:
+        """Direct STT to listen to a single participant. Returns True on success."""
+        audio_input = self._get_audio_input()
+        if not audio_input:
+            logger.error(f"audio_input unavailable — cannot set STT to '{identity}' ({context})")
+            return False
+        try:
+            audio_input.set_participant(identity)
+            self._current_stt_participant = identity
+            logger.critical(f"STT set_participant('{identity}') — {context}")
+            return True
+        except Exception as e:
+            logger.error(f"set_participant('{identity}') failed ({context}): {e}")
+            return False
 
     async def unmute_all_participants(self):
         """
@@ -1175,13 +1441,20 @@ class CommunityModeratorAgent(Agent):
         )
         # #region agent log
         import json as _json
-        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-            _f.write(_json.dumps({"location": "moderator_agent.py:_set_delivery_state", "message": f"delivery-state transition", "data": {"question_num": question_num, "participant": participant_identity, "old_state": old_state, "new_state": state, "context": context}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_DELIVERY_TRACE"}) + "\n")
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_set_delivery_state", "message": f"delivery-state transition", "data": {"question_num": question_num, "participant": participant_identity, "old_state": old_state, "new_state": state, "context": context}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_DELIVERY_TRACE"}))
         # #endregion
 
     def _is_delivery_confirmed(self, question_num: int, participant_identity: str) -> bool:
+        """True if question was delivered (fully or partially)."""
         key = self._delivery_key(question_num, participant_identity)
-        return self.question_delivery_state.get(key) == "delivered"
+        return self.question_delivery_state.get(key) in ("delivered_full", "delivered_partial",
+                                                          # backward compat with old "delivered" state
+                                                          "delivered")
+
+    def _is_delivery_full(self, question_num: int, participant_identity: str) -> bool:
+        """True only if TTS completed without truncation."""
+        key = self._delivery_key(question_num, participant_identity)
+        return self.question_delivery_state.get(key) in ("delivered_full", "delivered")
 
     def _record_turn_result(self, expected: str, actual: str, *, was_timeout: bool = False) -> TurnResult:
         """Create an immutable TurnResult and update last_respondent atomically.
@@ -1213,8 +1486,7 @@ class CommunityModeratorAgent(Agent):
 
         # #region agent log
         import json as _json
-        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-            _f.write(_json.dumps({"location": "moderator_agent.py:_record_turn_result", "message": "Turn result recorded", "data": {"expected": expected, "actual": actual, "ack_name": result.ack_name, "timeout": was_timeout, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "ACK_NAME"}) + "\n")
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_record_turn_result", "message": "Turn result recorded", "data": {"expected": expected, "actual": actual, "ack_name": result.ack_name, "timeout": was_timeout, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "ACK_NAME"}))
         # #endregion
 
         return result
@@ -1238,10 +1510,9 @@ class CommunityModeratorAgent(Agent):
                 logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
                 # #region agent log
                 import json as _json
-                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}) + "\n")
+                _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}))
                 # #endregion
-                await self.agent_session.say("One moment...", allow_interruptions=False)
+                await self._safe_say("One moment...", allow_interruptions=False, context="analysis_filler")
             result = await analysis_task
 
         analysis_duration = (datetime.now() - self._analysis_start_time).total_seconds()
@@ -1249,8 +1520,7 @@ class CommunityModeratorAgent(Agent):
 
         # #region agent log
         import json as _json
-        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-            _f.write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}) + "\n")
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
         # #endregion
 
         return result, analysis_duration
@@ -1270,113 +1540,874 @@ class CommunityModeratorAgent(Agent):
         except Exception as e:
             logger.debug(f"TTS pre-warm skipped (non-critical): {e}")
 
-    # ── Single-flight TTS with truncation detection + retry ──────────────
-    _TTS_WORDS_PER_SEC = 2.5  # conservative TTS speech rate (real TTS ~1.7-2.8 wps)
+    # ── Phase 1: Event-driven response capture methods ────────────────────
+
+    def _reset_response_flags(self, participant: str) -> None:
+        """Centralised flag reset before waiting for a new response.
+
+        Called at the start of ``_await_response`` and whenever the turn is
+        retried (repeat, off-topic, encouragement).  Mirrors the flag resets
+        previously scattered across L3441-3469 and the second loop equivalent.
+        """
+        import time as _time
+
+        # Core response state
+        self.captured_response = None
+        self._response_ready.clear()
+        self.latest_user_response = None
+        self.response_captured = False
+        self.last_stt_fragment = ""
+        self.pending_stt_transcript = None
+        self.response_fragments = []
+        self.last_fragment_time = None
+        self._first_fragment_time = None
+        self._user_stopped_speaking_at = None
+        self.actual_respondent = None
+        self._turn_accumulated_text = ""
+
+        # Flow control
+        self._gentle_warning_in_progress = False
+        self._gentle_warning_started_at = None
+        self._stt_nudge_given = False
+        self._first_vad_speaking_time = None
+        self.encouragement_given = False
+        self._encouragement_followup_given = False
+        self._last_transcript_progress_time = None
+        self._silence_watchdog_fired = False
+        self._short_offtopic_count = 0
+        self._last_short_offtopic_norm = None
+        self._had_stt_transcript_this_turn = False
+        self._idle_no_vad_nudge_fired = False
+        self.question_repeated = False
+        self.relevance_prompt_given = False
+        self.partial_repeat_handled = False
+        self.already_answered_prompt_given = False
+        self.accumulated_partial_answer = ""
+        self.turn_time_exceeded = False
+        self._ack_already_spoken = False
+        self._prewarmed_ack_text = None
+        self._transition_filler_said = False
+        self._estimated_remaining_tts = 0.0
+
+        # Timeout / turn monitoring
+        self.waiting_for_response = True
+        self.last_speech_time = None
+        self._polling_start_time = _time.time()
+
+    async def _await_response(
+        self,
+        participant: str,
+        polling_timeout: float,
+        tts_fully_spoken: bool,
+    ) -> Optional[str]:
+        """Wait for a committed user response, running watchdog checks.
+
+        Replaces both SMART POLLING loops.  Returns the captured response
+        text, ``None`` on timeout/shutdown, or ``"PAUSED"`` sentinel.
+        """
+        import time as _time
+
+        _saved_tts_estimate = self._estimated_remaining_tts
+        self._reset_response_flags(participant)
+        self._estimated_remaining_tts = _saved_tts_estimate
+
+        # Start timeout monitor
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant)
+        )
+
+        self._polling_deadline = _time.time() + polling_timeout
+
+        # Observer STT switching task
+        observer_stt_task: Optional[asyncio.Task] = None
+        if self.observer_mode_enabled:
+            observer_stt_task = asyncio.create_task(
+                self._observer_stt_polling(participant)
+            )
+
+        try:
+            while True:
+                # Wait on the event with a 2s granularity for watchdog checks
+                remaining = self._polling_deadline - _time.time()
+                if remaining <= 0 and not self.user_currently_speaking and not self._gentle_warning_in_progress:
+                    if self.captured_response is not None:
+                        logger.info("Deadline reached but captured_response exists — processing")
+                    else:
+                        logger.warning(f"Polling deadline reached ({polling_timeout}s effective)")
+                        break
+
+                try:
+                    await asyncio.wait_for(
+                        self._response_ready.wait(),
+                        timeout=min(max(remaining, 0.1), 2.0),
+                    )
+                except asyncio.TimeoutError:
+                    pass  # Fall through to watchdog checks
+
+                # ── Shutdown guard ──
+                if self._shutting_down:
+                    logger.info("_await_response exiting: _shutting_down=True")
+                    break
+
+                # ── Timeout monitor signal ──
+                if not self.waiting_for_response:
+                    logger.warning("Timeout monitor signaled no-response — exiting")
+                    break
+
+                # ── Pause check ──
+                if self.survey_state == SurveyState.PAUSED:
+                    logger.info("Survey PAUSED during _await_response — waiting for resume")
+                    # Switch STT to observer while paused
+                    observer_identity = self.participant_manager.get_observer_identity()
+                    if observer_identity:
+                        self._set_stt_participant(observer_identity, context="pause_in_await_response")
+                    while self.survey_state == SurveyState.PAUSED:
+                        await asyncio.sleep(0.5)
+                    logger.info("Survey RESUMED — exiting _await_response for re-ask")
+                    return "PAUSED"
+
+                # ── Gentle warning guard ──
+                if self._gentle_warning_in_progress:
+                    if self._gentle_warning_started_at and (_time.time() - self._gentle_warning_started_at) > 8.0:
+                        logger.error("WATCHDOG: _gentle_warning_in_progress stuck >8s — force-clearing")
+                        self._gentle_warning_in_progress = False
+                        self._gentle_warning_started_at = None
+                    else:
+                        # While gentle warning plays, clear event and keep waiting
+                        if self._response_ready.is_set():
+                            self.captured_response = None
+                            self._response_ready.clear()
+                        continue
+
+                # ── Deadline extension while speaking ──
+                if _time.time() > self._polling_deadline:
+                    if self.user_currently_speaking or self._gentle_warning_in_progress:
+                        self._polling_deadline = _time.time() + 5
+                        continue
+                    if self.captured_response is None and self.latest_user_response is None:
+                        logger.warning(f"Polling deadline reached ({polling_timeout}s effective)")
+                        break
+
+                # ── Watchdog: STT health ──
+                await self._check_stt_health(participant)
+
+                # ── Watchdog: Silence ──
+                await self._check_silence_watchdog(participant)
+
+                # ── Watchdog: Idle no-VAD ──
+                await self._check_idle_no_vad(participant, tts_fully_spoken)
+
+                # ── Response ready? ──
+                if self._response_ready.is_set() and self.captured_response is not None:
+                    # User speaking guard: wait for silence (unless turn time exceeded)
+                    if self.user_currently_speaking and not self.turn_time_exceeded:
+                        continue
+
+                    # Stabilization delay: if first fragment arrived <2s ago, wait
+                    if (self._first_fragment_time is not None
+                        and not self.turn_time_exceeded
+                        and (datetime.now() - self._first_fragment_time).total_seconds() < 2.0):
+                        continue
+
+                    # Pause cooldown: wait after user stops speaking
+                    if (not self.user_currently_speaking
+                        and not self.turn_time_exceeded
+                        and self._user_stopped_speaking_at is not None):
+                        pause_cooldown = 2.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                        since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
+                        if since_stopped < pause_cooldown:
+                            continue
+
+                    # Delivery-state double-check
+                    if not self._is_delivery_confirmed(self.current_question_num, participant):
+                        _ds_key = self._delivery_key(self.current_question_num, participant)
+                        _ds = self.question_delivery_state.get(_ds_key, "unknown")
+                        logger.warning(
+                            f"DELIVERY GUARD (_await_response): Discarding response — "
+                            f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
+                        )
+                        self.captured_response = None
+                        self._response_ready.clear()
+                        continue
+
+                    self._silence_confirmed_time = datetime.now()
+                    return self.captured_response
+
+                # ── Legacy fallback: check latest_user_response from fragment handler ──
+                if (self.latest_user_response is not None
+                    and not self._response_ready.is_set()
+                    and not self.user_currently_speaking
+                    and not self.turn_time_exceeded):
+                    # Fragment handler captured something but committed event hasn't fired yet
+                    # Check stabilization and pause cooldown same as above
+                    if (self._first_fragment_time is not None
+                        and (datetime.now() - self._first_fragment_time).total_seconds() < 2.0):
+                        continue
+                    if (self._user_stopped_speaking_at is not None):
+                        pause_cooldown = 2.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                        since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
+                        if since_stopped < pause_cooldown:
+                            continue
+                    # Promote fragment to captured_response
+                    if self._is_delivery_confirmed(self.current_question_num, participant):
+                        self.captured_response = self.latest_user_response
+                        self._silence_confirmed_time = datetime.now()
+                        return self.captured_response
+
+        finally:
+            # Cancel observer STT task
+            if observer_stt_task and not observer_stt_task.done():
+                observer_stt_task.cancel()
+                try:
+                    await observer_stt_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Last-resort rescue: if we have STT fragments, use them
+        if self.captured_response:
+            return self.captured_response
+        if self.latest_user_response and self.latest_user_response.strip():
+            logger.info(f"Rescuing STT fragments as response: '{self.latest_user_response[:100]}...'")
+            return self.latest_user_response.strip()
+
+        return None
+
+    async def _check_stt_health(self, participant: str) -> None:
+        """STT health check: nudge if VAD detected speech but no STT arrived."""
+        if (self.captured_response is None
+            and self.latest_user_response is None
+            and not self.response_captured
+            and not self._stt_nudge_given
+            and not self._had_stt_transcript_this_turn
+            and self._first_vad_speaking_time is not None
+            and not self.user_currently_speaking):
+            since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
+            if since_first_vad > 6:
+                self._stt_nudge_given = True
+                display_name = self.participant_manager.get_display_name(participant)
+                nudge_text = STT_NUDGE_TEMPLATE.format(name=display_name)
+                logger.warning(
+                    f"STT HEALTH CHECK: VAD detected speech {since_first_vad:.0f}s ago "
+                    f"but no STT transcripts received for {participant}! Nudging."
+                )
+                await self._safe_say(nudge_text, allow_interruptions=False, context="stt_nudge")
+                self.survey_transcript.add_acknowledgment(nudge_text)
+
+    async def _check_silence_watchdog(self, participant: str) -> None:
+        """Silence watchdog: prompt if no transcript progress after encouragement."""
+        import time as _time
+        if (not self._silence_watchdog_fired
+            and not self.user_currently_speaking
+            and not self._gentle_warning_in_progress
+            and self.encouragement_given
+            and self.captured_response is None
+            and self.latest_user_response is None
+            and self._last_transcript_progress_time is not None):
+            silence_elapsed = _time.time() - self._last_transcript_progress_time
+            if silence_elapsed > SILENCE_WATCHDOG_TIMEOUT:
+                self._silence_watchdog_fired = True
+                display_name = self.participant_manager.get_display_name(participant)
+                watchdog_text = SILENCE_WATCHDOG_PROMPT_TEMPLATE.format(name=display_name)
+                logger.warning(
+                    f"SILENCE WATCHDOG: No transcript progression for "
+                    f"{silence_elapsed:.0f}s after encouragement — prompting {participant}"
+                )
+                await self._safe_say(watchdog_text, allow_interruptions=True, context="silence_watchdog")
+                self.survey_transcript.add_acknowledgment(watchdog_text)
+                if self._polling_deadline is not None:
+                    new_deadline = _time.time() + 8.0
+                    if new_deadline > self._polling_deadline:
+                        self._polling_deadline = new_deadline
+
+    async def _check_idle_no_vad(self, participant: str, tts_fully_spoken: bool) -> None:
+        """Idle-no-VAD watchdog: re-prompt if no VAD/STT activity at all."""
+        import time as _time
+        if (not self._idle_no_vad_nudge_fired
+            and not self.user_currently_speaking
+            and not self._gentle_warning_in_progress
+            and self._first_vad_speaking_time is None
+            and not self._had_stt_transcript_this_turn
+            and self.captured_response is None
+            and self.latest_user_response is None
+            and self._polling_start_time is not None):
+            _idle_elapsed = _time.time() - self._polling_start_time
+            _remaining_tts = getattr(self, '_estimated_remaining_tts', 0.0)
+            _tts_offset = _remaining_tts + TTS_SAFETY_MARGIN if _remaining_tts > 0 else 0.0
+            if _idle_elapsed - _tts_offset > IDLE_NO_VAD_TIMEOUT:
+                self._idle_no_vad_nudge_fired = True
+                logger.warning(
+                    f"IDLE-NO-VAD WATCHDOG: {_idle_elapsed:.0f}s since polling start "
+                    f"with no VAD/STT activity"
+                )
+
+                if self.response_timeout_task:
+                    self.response_timeout_task.cancel()
+                    self.response_timeout_task = None
+
+                if not tts_fully_spoken:
+                    await self._safe_say(
+                        PARTIAL_DELIVERY_NUDGE_TEXT,
+                        allow_interruptions=False,
+                        context="idle_no_vad_partial_reprompt",
+                    )
+                    question_text = self.current_question_object.question if self.current_question_object else self.current_question
+                    if question_text and not self._shutting_down and self.agent_session:
+                        try:
+                            _rq_tts_start = _time.time()
+                            rq_handle = self.agent_session.say(question_text, allow_interruptions=True)
+                            await rq_handle
+                            try:
+                                await asyncio.wait_for(rq_handle.wait_for_playout(), timeout=120.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("Idle-no-VAD repeat playout timed out")
+                            _rq_elapsed = _time.time() - _rq_tts_start
+                            _rq_est = _estimate_tts_duration(question_text)
+                            self._estimated_remaining_tts = max(_rq_est - _rq_elapsed, 0.0)
+                        except (asyncio.CancelledError, RuntimeError) as e:
+                            logger.warning(f"Idle-no-VAD repeat TTS failed: {e}")
+                else:
+                    await self._safe_say(
+                        TIMEOUT_NUDGE_TEXT,
+                        allow_interruptions=False,
+                        context="idle_no_vad_nudge",
+                    )
+
+                self.last_speech_time = None
+                self.response_timeout_task = asyncio.create_task(
+                    self.monitor_response_timeout(participant)
+                )
+                logger.info("Restarted timeout monitor after idle-no-VAD re-prompt")
+
+                if self._polling_deadline is not None:
+                    new_deadline = _time.time() + 15.0
+                    if new_deadline > self._polling_deadline:
+                        self._polling_deadline = new_deadline
+
+    async def _observer_stt_polling(self, participant: str) -> None:
+        """Standalone task: periodically switch STT to observer for commands."""
+        try:
+            while True:
+                await asyncio.sleep(2.0)
+                if self._shutting_down or self.survey_state == SurveyState.PAUSED:
+                    return
+                observer_identity = self.participant_manager.get_observer_identity()
+                if not observer_identity:
+                    continue
+                self._set_stt_participant(observer_identity, context="observer_polling_check")
+                await asyncio.sleep(0.3)
+                if self.survey_state != SurveyState.PAUSED:
+                    self._set_stt_participant(participant, context="observer_polling_restore")
+        except asyncio.CancelledError:
+            pass
+
+    async def _process_captured_response(
+        self,
+        participant: str,
+        captured_text: str,
+        question_context: str,
+    ) -> str:
+        """Consolidated response processing. Returns 'accepted', 'retry', or 'move_on'."""
+        import time as _time
+
+        # LATENCY TRACKING
+        response_processing_start = datetime.now()
+        self._response_processing_start = response_processing_start
+        logger.critical(f"[{question_context}] LATENCY TRACKING: Response processing started")
+
+        speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+
+        # ── CHECK 1: Uncertain response ──
+        if is_uncertain_response(captured_text):
+            _uncertain_result = await self._handle_uncertain_response(
+                captured_text, participant, question_context, loop_label="unified")
+            if _uncertain_result == "encouraged":
+                return "retry"
+            elif _uncertain_result == "move_on":
+                return "move_on"
+
+        # ── CHECK 2: Deterministic repeat pre-check ──
+        if is_repeat_request(captured_text) and not self.question_repeated:
+            self.question_repeated = True
+            logger.info(f"[{question_context}] HEURISTIC repeat detected — repeating question")
+
+            if self.response_timeout_task:
+                self.response_timeout_task.cancel()
+                self.response_timeout_task = None
+
+            import time as _time
+            repeat_intro = REPEAT_INTRO_TEMPLATE.format(name=speaker_name)
+            await self.agent_session.say(repeat_intro, allow_interruptions=False)
+            _repeat_tts_start = _time.time()
+            q_handle = self.agent_session.say(self.current_question, allow_interruptions=True)
+            await q_handle
+            try:
+                await asyncio.wait_for(q_handle.wait_for_playout(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("Heuristic repeat playout timed out")
+            _elapsed = _time.time() - _repeat_tts_start
+            _est = _estimate_tts_duration(self.current_question)
+            self._estimated_remaining_tts = max(_est - _elapsed, 0.0)
+            logger.info(f"Repeated question (heuristic): '{self.current_question[:100]}...'")
+
+            self._reset_for_repeat(participant, context="heuristic_repeat")
+            return "retry"
+
+        # ── DISFLUENCY GUARD: one-budget extension anchored to _polling_deadline ──
+        _disfluency_budget_used = False
+        while (_is_disfluent_starter(captured_text)
+               and not self.encouragement_given
+               and not self.relevance_prompt_given
+               and self._short_offtopic_count == 0):
+            if not _disfluency_budget_used and self._polling_deadline is not None:
+                self._polling_deadline += DISFLUENCY_EXTENSION_BUDGET
+                _disfluency_budget_used = True
+                logger.info(
+                    f"[{question_context}] Disfluent starter — extended polling deadline "
+                    f"by {DISFLUENCY_EXTENSION_BUDGET}s: '{captured_text[:60]}'"
+                )
+            # Local deadline: min of budget window and polling deadline
+            import time as _time
+            _budget_deadline = _time.time() + DISFLUENCY_EXTENSION_BUDGET
+            _disfluency_deadline = min(_budget_deadline, self._polling_deadline) if self._polling_deadline else _budget_deadline
+
+            self.captured_response = None
+            self._response_ready.clear()
+
+            _got_new_text = False
+            while _time.time() < _disfluency_deadline:
+                if self._shutting_down:
+                    return "move_on"
+                await asyncio.sleep(0.3)
+                # Primary path: committed response arrived
+                if self._response_ready.is_set() and self.captured_response:
+                    if not self.user_currently_speaking:
+                        captured_text = self.captured_response
+                        _got_new_text = True
+                        break
+                # Legacy fallback: fragment accumulation
+                if (self.latest_user_response
+                    and not self._response_ready.is_set()
+                    and not self.user_currently_speaking
+                    and self._user_stopped_speaking_at is not None):
+                    _pc = 2.5 if (self.current_question_object and
+                                  self.current_question_object.is_qualitative()) else 1.0
+                    _since = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
+                    if _since >= _pc:
+                        new_text = self.latest_user_response.strip()
+                        if new_text and new_text != captured_text:
+                            captured_text = new_text
+                            _got_new_text = True
+                            break
+            if not _got_new_text:
+                break  # Deadline hit or no new speech → fall through to LLM
+            # Loop back: re-check if new captured_text is still disfluent
+
+        response_to_analyze = captured_text
+
+        # ── CHECK 3: Unified LLM analysis ──
+        question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
+
+        if self.partial_repeat_handled and self.accumulated_partial_answer:
+            response_to_analyze = f"{self.accumulated_partial_answer} {captured_text}"
+            logger.info(f"[{question_context}] Combined partial + new response for analysis")
+
+        survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
+
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+
+        if self._response_processing_start:
+            _latency = (datetime.now() - self._response_processing_start).total_seconds()
+            logger.info(f"METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
+
+        analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
+        logger.info(
+            f"[{question_context}] Analysis: relevant={analysis.is_relevant}, "
+            f"repeat={analysis.is_repeat_request}, already_answered={analysis.is_already_answered_claim}, "
+            f"partial_status={analysis.partial_repeat_status}"
+        )
+
+        # --- CHECK 3a: PARTIAL ANSWER + REPEAT REQUEST ---
+        if analysis.partial_repeat_status == "PARTIAL" and not self.partial_repeat_handled:
+            self.partial_repeat_handled = True
+            self.accumulated_partial_answer = analysis.partial_answer
+
+            partial_intro = PARTIAL_REPEAT_INTRO_TEMPLATE.format(name=speaker_name)
+            await self._safe_say(partial_intro, allow_interruptions=False, context="partial_repeat_intro")
+
+            import time as _time
+            _partial_tts_start = _time.time()
+            _partial_handle = self.agent_session.say(analysis.unanswered_questions, allow_interruptions=True)
+            self._estimated_remaining_tts = 0.0  # Clear stale immediately
+            await _partial_handle
+            try:
+                await asyncio.wait_for(_partial_handle.wait_for_playout(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("Partial repeat playout timed out")
+            _elapsed = _time.time() - _partial_tts_start
+            _est = _estimate_tts_duration(analysis.unanswered_questions)
+            self._estimated_remaining_tts = max(_est - _elapsed, 0.0)
+
+            # Reset for new response (keep accumulated_partial_answer)
+            self.captured_response = None
+            self._response_ready.clear()
+            self.latest_user_response = None
+            self.response_captured = False
+            self.last_stt_fragment = ""
+            self.encouragement_given = False
+            self.waiting_for_response = True
+            self.last_speech_time = None
+            if self.response_timeout_task:
+                self.response_timeout_task.cancel()
+            self.response_timeout_task = asyncio.create_task(
+                self.monitor_response_timeout(participant)
+            )
+            if self.turn_monitor_task:
+                self.turn_monitor_task.cancel()
+                self.turn_monitor_task = None
+            self.user_currently_speaking = False
+            self.turn_time_exceeded = False
+            self.current_turn = TurnInfo(participant_identity=participant, start_time=datetime.now())
+            self.turn_monitor_task = asyncio.create_task(
+                self.monitor_turn_duration(self.agent_session)
+            )
+            return "retry"
+
+        # --- CHECK 3b: "ALREADY ANSWERED" CLAIM ---
+        if analysis.is_already_answered_claim and not self.already_answered_prompt_given:
+            self.already_answered_prompt_given = True
+            responder = self.actual_respondent if self.actual_respondent else participant
+            self.survey_transcript.add_response(
+                question_number=self.current_question_num, participant=responder,
+                response_text=f"[Initial response before rephrase request] {captured_text}")
+
+            rephrase_prompt = (
+                f"I appreciate that, {speaker_name}, but I may not have captured your response correctly. "
+                f"Could you please rephrase or elaborate on your answer? "
+                f"This helps ensure we have your thoughts recorded accurately."
+            )
+            await self._safe_say(rephrase_prompt, allow_interruptions=False, context="rephrase_prompt")
+            self.survey_transcript.add_acknowledgment(rephrase_prompt)
+
+            self.captured_response = None
+            self._response_ready.clear()
+            self.latest_user_response = None
+            self.response_captured = False
+            self.last_stt_fragment = ""
+            self.waiting_for_response = True
+            self.last_speech_time = None
+            if self.response_timeout_task:
+                self.response_timeout_task.cancel()
+            self.response_timeout_task = asyncio.create_task(
+                self.monitor_response_timeout(participant)
+            )
+            if self.turn_monitor_task:
+                self.turn_monitor_task.cancel()
+                self.turn_monitor_task = None
+            self.user_currently_speaking = False
+            self.turn_time_exceeded = False
+            self.current_turn = TurnInfo(participant_identity=participant, start_time=datetime.now())
+            self.turn_monitor_task = asyncio.create_task(
+                self.monitor_turn_duration(self.agent_session)
+            )
+            return "retry"
+
+        # --- CHECK 3c: FULL REPEAT REQUEST ---
+        is_full_repeat = analysis.is_repeat_request or (analysis.partial_repeat_status == "REPEAT_ONLY")
+        if is_full_repeat:
+            import time as _time
+            self.question_repeated = True
+            repeat_intro = REPEAT_INTRO_TEMPLATE.format(name=speaker_name)
+            await self.agent_session.say(repeat_intro, allow_interruptions=False)
+            _repeat_tts_start = _time.time()
+            q_handle = self.agent_session.say(self.current_question, allow_interruptions=True)
+            await q_handle
+            try:
+                await asyncio.wait_for(q_handle.wait_for_playout(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning("LLM repeat playout timed out")
+            _elapsed = _time.time() - _repeat_tts_start
+            _est = _estimate_tts_duration(self.current_question)
+            self._estimated_remaining_tts = max(_est - _elapsed, 0.0)
+            self._reset_for_repeat(participant, context="llm_repeat")
+            return "retry"
+
+        # --- CHECK 3d: OFF-TOPIC/IRRELEVANT ---
+        # After any prior redirect (short nudge or full relevance prompt), accept
+        # the response to prevent looping.  Maximum = 1 redirect + 1 acceptance.
+        _already_redirected = self.relevance_prompt_given or self._short_offtopic_count > 0
+        if not analysis.is_relevant and _already_redirected:
+            logger.info(
+                f"[{question_context}] Off-topic detected but already redirected "
+                f"(relevance_prompt={self.relevance_prompt_given}, "
+                f"short_count={self._short_offtopic_count}) — accepting response"
+            )
+            # Fall through to acceptance below
+
+        if not analysis.is_relevant and _is_too_short_for_offtopic(captured_text) and not _already_redirected:
+            _sw = _substantive_word_count(captured_text)
+            _norm = _normalize_for_offtopic_compare(captured_text)
+            _has_blatant_keyword = _has_blatant_offtopic_keywords(captured_text)
+            _is_repeat_short = (_norm == self._last_short_offtopic_norm) if self._last_short_offtopic_norm else False
+            self._short_offtopic_count += 1
+            self._last_short_offtopic_norm = _norm
+
+            _should_escalate = (
+                self.encouragement_given or _is_repeat_short or self._short_offtopic_count >= 2
+            )
+
+            if not _should_escalate:
+                await self._nudge_for_short_offtopic_retry(
+                    participant, speaker_name, captured_text,
+                    question_context=question_context, loop_label="unified",
+                )
+                return "retry"
+
+        if not analysis.is_relevant and not self.relevance_prompt_given and not _already_redirected:
+            self.relevance_prompt_given = True
+            responder = self.actual_respondent if self.actual_respondent else participant
+            self.survey_transcript.add_response(
+                question_number=self.current_question_num, participant=responder,
+                response_text=f"[Initial off-topic response] {captured_text}")
+
+            relevance_prompt = RELEVANCE_PROMPT_TEMPLATE.format(name=speaker_name)
+            await self._safe_say(relevance_prompt, allow_interruptions=False, context="relevance_prompt")
+            self.survey_transcript.add_acknowledgment(relevance_prompt)
+
+            question_text = self.current_question_object.question if self.current_question_object else ""
+            if question_text:
+                import time as _time
+                _reask_tts_start = _time.time()
+                _reask_handle = self.agent_session.say(question_text, allow_interruptions=False)
+                self._estimated_remaining_tts = 0.0  # Clear stale immediately
+                await _reask_handle
+                try:
+                    await asyncio.wait_for(_reask_handle.wait_for_playout(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Off-topic re-ask playout timed out")
+                _elapsed = _time.time() - _reask_tts_start
+                _est = _estimate_tts_duration(question_text)
+                self._estimated_remaining_tts = max(_est - _elapsed, 0.0)
+
+            self._reset_for_off_topic(participant, context="offtopic_unified")
+            return "retry"
+
+        # ── Response accepted — fire acknowledgment ──
+        await self._acknowledge_response(participant, speaker_name)
+
+        return "accepted"
+
+    async def _acknowledge_response(self, participant: str, speaker_name: str) -> None:
+        """Fire a brief acknowledgment after a valid response."""
+        _ack_speaker = speaker_name
+        self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
+        try:
+            _ack_handle = self.agent_session.say(self._prewarmed_ack_text, allow_interruptions=False)
+            self._estimated_remaining_tts = 0.0  # Clear stale immediately
+            self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
+            self._ack_already_spoken = True
+            self._transition_filler_said = True
+            logger.info(f"Ack fired (post-analysis): '{self._prewarmed_ack_text}'")
+            await _ack_handle
+        except Exception as e:
+            logger.warning(f"generate_reply/ack failed, using static fallback: {e}")
+            fallback = f"Thank you, {speaker_name}."
+            await self._safe_say(fallback, allow_interruptions=False, context="ack_fallback")
+            self.survey_transcript.add_acknowledgment(fallback)
+            self._ack_already_spoken = True
+            self._transition_filler_said = True
+
+    def _record_response_to_exports(
+        self,
+        participant: str,
+        captured_text: str,
+        question_id: str,
+    ) -> None:
+        """Record accepted response to all export targets (transcript, CSV, STT debug)."""
+        # Combine partial answers if any
+        if self.accumulated_partial_answer:
+            captured_text = f"{self.accumulated_partial_answer} {captured_text}"
+            self.accumulated_partial_answer = ""
+
+        actual_speaker = self.actual_respondent if self.actual_respondent else participant
+
+        if self.actual_respondent and self.actual_respondent != participant:
+            logger.warning(f"MISMATCH: Expected {participant} to respond, but {self.actual_respondent} spoke!")
+            logger.info(f"ACCEPTING response from {self.actual_respondent}")
+
+        # Apply STT correction
+        corrected_response = captured_text
+        if self.current_question_object and self.current_question_object.response_options:
+            max_sel = self.current_question_object.max_selections or 1
+            if max_sel > 1:
+                corrected_response = parse_multi_option_response(
+                    captured_text, self.current_question_object.response_options, max_sel)
+            else:
+                corrected_response = correct_transcription(
+                    captured_text, self.current_question_object.response_options)
+            if corrected_response != captured_text:
+                logger.info(f"Response corrected: '{captured_text[:50]}' -> '{corrected_response[:50]}'")
+
+        question_text = self.current_question_object.question if self.current_question_object else ""
+        response_options = self.current_question_object.response_options if self.current_question_object else []
+
+        # STT debug log
+        self.stt_debug_logger.log_question_response(
+            question_num=self.current_question_num,
+            question_id=question_id,
+            question_text=question_text,
+            participant=actual_speaker,
+            raw_transcript=captured_text,
+            corrected_response=corrected_response,
+            response_options=response_options,
+            expected_respondent=participant,
+        )
+
+        # Survey transcript (JSON)
+        self.survey_transcript.add_response(
+            question_number=self.current_question_num,
+            participant=actual_speaker,
+            response_text=corrected_response,
+        )
+
+        # CSV export
+        self.survey_data_export.add_response(
+            participant=actual_speaker,
+            question_number=self.current_question_num,
+            question_id=question_id,
+            question_text=question_text,
+            response_options=response_options,
+            response_text=corrected_response,
+        )
+
+        # Mark participant as answered
+        self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
+        self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="response_received")
+        self._record_turn_result(expected=participant, actual=actual_speaker)
+
+        # Clean up
+        self.waiting_for_response = False
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+        self.captured_response = None
+        self._response_ready.clear()
+        self.latest_user_response = None
+
+    def _record_timeout_to_exports(self, participant: str, question_id: str) -> None:
+        """Record a timeout/no-response to all export targets."""
+        question_text = self.current_question_object.question if self.current_question_object else ""
+        response_options = self.current_question_object.response_options if self.current_question_object else []
+        timeout_marker = "[NO RESPONSE - TIMEOUT]"
+
+        self.stt_debug_logger.log_question_response(
+            question_num=self.current_question_num,
+            question_id=question_id,
+            question_text=question_text,
+            participant=participant,
+            raw_transcript=timeout_marker,
+            corrected_response=timeout_marker,
+            response_options=response_options,
+            expected_respondent=participant,
+        )
+
+        self.survey_transcript.add_response(
+            question_number=self.current_question_num,
+            participant=participant,
+            response_text=timeout_marker,
+        )
+
+        self.survey_data_export.add_response(
+            participant=participant,
+            question_number=self.current_question_num,
+            question_id=question_id,
+            question_text=question_text,
+            response_options=response_options,
+            response_text=timeout_marker,
+        )
+
+        if self._is_delivery_confirmed(self.current_question_num, participant):
+            self.participant_manager.mark_participant_answered(participant, self.current_question_num)
+            self._set_delivery_state(self.current_question_num, participant, "timeout", context="timeout_after_delivery")
+        else:
+            logger.warning(f"Skipping answered-mark on timeout for {participant}: delivery not confirmed; requeueing.")
+            self._register_missing_participant_for_retry(participant, context="timeout_without_delivery")
+
+        self._record_turn_result(expected=participant, actual=participant, was_timeout=True)
+
+    # ── End Phase 1 methods ────────────────────────────────────────────────
+
+    @property
+    def _tts_active(self) -> bool:
+        """True if the agent is currently playing TTS audio (SDK-native check)."""
+        if not self.agent_session:
+            return False
+        speech = self.agent_session.current_speech
+        return speech is not None and not speech.done()
 
     async def _speak_question_safely(
         self,
         text: str,
         *,
+        retry_text: Optional[str] = None,
         context: str = "",
-        max_retries: int = 1,
+        max_retries: int = 2,
         allow_interruptions_first: bool = True,
+        dedupe_key: Optional[str] = None,
     ) -> bool:
-        """Speak *text* with truncation detection and bounded retry.
+        """Speak *text* via SDK say(). SDK serializes and manages TTS internally.
 
-        On the first attempt the question is spoken with
-        ``allow_interruptions=allow_interruptions_first`` (defaults to True
-        for natural conversational flow).  Set to False when the listener
-        hasn't heard the question yet (e.g. after a participant switch) to
-        prevent STT spillover from truncating the TTS.
+        Args:
+            text: Text to speak.
+            retry_text: Accepted for signature compat (unused — no retry loop).
+            context: Logging context string.
+            max_retries: Accepted for signature compat (unused).
+            allow_interruptions_first: Whether speech allows user interruption.
+            dedupe_key: Per-turn key to prevent re-speaking the same prompt.
 
-        If the TTS returns suspiciously fast (< 50 % of estimated minimum
-        duration), we assume it was interrupted by spillover audio / noise
-        and retry **once** with ``allow_interruptions=False``.
-
-        A single-flight guard prevents overlapping ``say()`` calls: if a
-        previous TTS is still active the new call waits up to 30 s for it
-        to finish.
-
-        Returns ``True`` if the question was (likely) fully spoken.
+        Returns ``True`` if speech completed without interruption.
         """
-        word_count = len(text.split())
-        estimated_min_sec = word_count / self._TTS_WORDS_PER_SEC
-
-        for attempt in range(1 + max_retries):
-            allow_int = allow_interruptions_first if attempt == 0 else False
-            seq = self._tts_sequence + 1
-            self._tts_sequence = seq
-
-            # ── Single-flight guard ────────────────────────────────────
-            if self._tts_in_flight:
-                logger.warning(
-                    f"⚠️ TTS OVERLAP: new say() requested while previous TTS still in flight "
-                    f"[{context}]. Waiting up to 30 s…"
-                )
-                # #region agent log
-                import json as _json
-                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:overlap", "message": "TTS overlap detected", "data": {"context": context, "seq": seq, "attempt": attempt}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_OVERLAP"}) + "\n")
-                # #endregion
-                for _ in range(60):
-                    await asyncio.sleep(0.5)
-                    if not self._tts_in_flight:
-                        break
-                if self._tts_in_flight:
-                    logger.error("🛑 Previous TTS did not finish in 30 s — proceeding anyway")
-
-            # ── Speak ──────────────────────────────────────────────────
-            self._tts_in_flight = True
-            tts_start = datetime.now()
-            logger.critical(
-                f"🔊 TTS START [{context}] attempt={attempt+1}/{1+max_retries} "
-                f"allow_interruptions={allow_int} words={word_count} "
-                f"est_min={estimated_min_sec:.1f}s text='{text[:80]}…'"
-            )
-
-            # #region agent log
-            import json as _json
-            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:start", "message": "TTS start", "data": {"context": context, "attempt": attempt, "seq": seq, "allow_interruptions": allow_int, "word_count": word_count, "est_min_sec": round(estimated_min_sec, 1), "text_len": len(text)}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_TRUNCATION"}) + "\n")
-            # #endregion
-
-            try:
-                await self.agent_session.say(text, allow_interruptions=allow_int)
-            except Exception as e:
-                logger.error(f"🛑 TTS say() raised: {e}")
-            finally:
-                self._tts_in_flight = False
-
-            tts_duration = (datetime.now() - tts_start).total_seconds()
-            truncated = tts_duration < (estimated_min_sec * 0.5) and estimated_min_sec > 2.0
-
-            logger.critical(
-                f"🔊 TTS END   [{context}] duration={tts_duration:.1f}s "
-                f"est_min={estimated_min_sec:.1f}s truncated={truncated}"
-            )
-
-            # #region agent log
-            import json as _json
-            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"location": "moderator_agent.py:_speak_question_safely:end", "message": "TTS end", "data": {"context": context, "attempt": attempt, "seq": seq, "duration_s": round(tts_duration, 2), "est_min_sec": round(estimated_min_sec, 1), "truncated": truncated, "word_count": word_count}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_TRUNCATION"}) + "\n")
-            # #endregion
-
-            if not truncated:
+        # Per-turn dedupe
+        if dedupe_key:
+            if dedupe_key in self._tts_dedupe_spoken:
+                logger.info(f"TTS DEDUPE: '{dedupe_key}' already spoken this turn — skipping")
                 return True
+            self._tts_dedupe_spoken.add(dedupe_key)
 
-            if attempt < max_retries:
-                logger.warning(
-                    f"⚠️ TTS TRUNCATED [{context}]: {tts_duration:.1f}s actual vs "
-                    f"{estimated_min_sec:.1f}s expected. Retrying with allow_interruptions=False…"
-                )
-                await asyncio.sleep(0.3)  # brief settle before retry
-            else:
-                logger.error(
-                    f"🛑 TTS TRUNCATED [{context}] after {1+max_retries} attempts — "
-                    f"question may not have been fully spoken"
-                )
+        if self._shutting_down or not self.agent_session:
+            return False
 
-        return False
+        try:
+            import time as _time
+            _tts_dispatch_time = _time.time()
+            handle = self.agent_session.say(text, allow_interruptions=allow_interruptions_first)
+            await handle
+            try:
+                await asyncio.wait_for(handle.wait_for_playout(), timeout=120.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"Question playout timed out after 120s ({context})")
+            # wait_for_playout() resolves when frames are queued (~0.5s), not when
+            # the client finishes playback. Track estimated remaining duration so
+            # the idle-no-VAD watchdog doesn't fire while audio is still playing.
+            _elapsed = _time.time() - _tts_dispatch_time
+            _estimated = _estimate_tts_duration(text)
+            self._estimated_remaining_tts = max(_estimated - _elapsed, 0.0)
+            if self._estimated_remaining_tts > 0:
+                logger.info(
+                    f"Estimated {self._estimated_remaining_tts:.1f}s remaining TTS playback "
+                    f"({len(text)} chars, est={_estimated:.1f}s, elapsed={_elapsed:.1f}s)"
+                )
+            return not handle.interrupted
+        except asyncio.CancelledError:
+            return False
+        except RuntimeError as e:
+            if "closing" in str(e).lower() or "closed" in str(e).lower():
+                self._shutting_down = True
+            return False
 
     def _reset_for_repeat(self, participant: str, *, context: str = "") -> None:
         """Reset all mutable state after a repeat so the SAME participant gets
@@ -1388,6 +2419,8 @@ class CommunityModeratorAgent(Agent):
         saved_expected = self.expected_respondent
 
         # ── Response / STT state ───────────────────────────────────────
+        self.captured_response = None
+        self._response_ready.clear()
         self.latest_user_response = None
         self.response_captured = False
         self.last_stt_fragment = ""
@@ -1395,9 +2428,17 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []
         self.last_fragment_time = None
         self.actual_respondent = None
+        self._turn_accumulated_text = ""
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
+        self._encouragement_followup_given = False
+        self._last_transcript_progress_time = None
+        self._silence_watchdog_fired = False
+        self._short_offtopic_count = 0
+        self._last_short_offtopic_norm = None
+        self._had_stt_transcript_this_turn = False
+        self._idle_no_vad_nudge_fired = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -1419,7 +2460,11 @@ class CommunityModeratorAgent(Agent):
         if self.turn_monitor_task:
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
-        self.user_currently_speaking = False
+        # NOTE: Do NOT reset user_currently_speaking — let VAD events drive it.
+        # If the user is already speaking when this reset runs, forcing False
+        # causes the polling loop to capture a partial fragment immediately.
+        self._first_fragment_time = None  # Reset stabilization timer
+        self._user_stopped_speaking_at = None  # Reset pause cooldown
         self.turn_time_exceeded = False
         self.current_turn = TurnInfo(
             participant_identity=participant,
@@ -1457,9 +2502,246 @@ class CommunityModeratorAgent(Agent):
 
         # #region agent log
         import json as _json
-        with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-            _f.write(_json.dumps({"location": "moderator_agent.py:_reset_for_repeat", "message": "Repeat state reset", "data": {"participant": participant, "context": context, "expected_respondent": self.expected_respondent, "actual_respondent": self.actual_respondent, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_IDENTITY"}) + "\n")
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_reset_for_repeat", "message": "Repeat state reset", "data": {"participant": participant, "context": context, "expected_respondent": self.expected_respondent, "actual_respondent": self.actual_respondent, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_IDENTITY"}))
         # #endregion
+
+    async def _handle_uncertain_response(self, captured_text: str, participant: str, question_context: str, *, loop_label: str = "1st") -> str:
+        """Unified uncertain-response handler for all polling loops.
+
+        Returns: "encouraged" (continue polling), "move_on" (skip to next), or "accepted" (accept as-is).
+        """
+        import time as _time
+        logger.critical(f"🔍 [{question_context}] UNCERTAIN RESPONSE ({loop_label}): '{captured_text}'")
+        logger.critical(f"   encouragement_given={self.encouragement_given}, followup_given={self._encouragement_followup_given}")
+        speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
+
+        # ── FIRST uncertain response: encourage ──────────────────────────
+        if not self.encouragement_given:
+            self.encouragement_given = True
+            responder = self.actual_respondent if self.actual_respondent else participant
+            self.survey_transcript.add_response(
+                question_number=self.current_question_num, participant=responder,
+                response_text=f"[Initial uncertain response before encouragement] {captured_text}")
+            if self.current_question_object and self.current_question_object.is_qualitative():
+                encouragement = (f"Are you sure, {speaker_name}? There's no right or wrong answer here. "
+                                 f"Feel free to share whatever comes to mind, even if it's just a quick thought.")
+            else:
+                encouragement = (f"Are you sure, {speaker_name}? Take a moment to think about it. "
+                                 f"Any answer you give is valuable.")
+            await self._safe_say(encouragement, allow_interruptions=False, context="encouragement")
+            self.survey_transcript.add_acknowledgment(encouragement)
+            # Reset response state for retry
+            self.captured_response = None
+            self._response_ready.clear()
+            self.latest_user_response = None
+            self.response_captured = False
+            self.last_stt_fragment = ""
+            self.pending_stt_transcript = None
+            if not self.user_currently_speaking:
+                self._first_vad_speaking_time = None
+            self._stt_nudge_given = False
+            self._first_fragment_time = None
+            self._user_stopped_speaking_at = None
+            self._last_transcript_progress_time = _time.time()
+            self._silence_watchdog_fired = False
+            if self.turn_monitor_task:
+                self.turn_monitor_task.cancel()
+                self.turn_monitor_task = None
+            self.turn_time_exceeded = False
+            self.current_turn = TurnInfo(participant_identity=participant, start_time=datetime.now())
+            self.turn_monitor_task = asyncio.create_task(self.monitor_turn_duration(self.agent_session))
+            logger.info(f"🔄 Reset turn monitoring after encouragement ({loop_label})")
+            # Bounded wait: extend polling deadline by 15s max
+            if self._polling_deadline is not None:
+                new_deadline = _time.time() + 15.0
+                if new_deadline > self._polling_deadline:
+                    self._polling_deadline = new_deadline
+                    logger.info(f"⏱️  Extended polling deadline by 15s for post-encouragement wait")
+            return "encouraged"
+
+        # ── SECOND uncertain response: deterministic follow-up ────────────
+        if not self._encouragement_followup_given:
+            self._encouragement_followup_given = True
+            logger.info(f"🤷 [{question_context}] Still uncertain after encouragement ({loop_label}), follow-up")
+            followup = POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE.format(name=speaker_name)
+            await self._safe_say(followup, allow_interruptions=False, context=f"uncertain_followup_{loop_label}")
+            self.survey_transcript.add_acknowledgment(followup)
+            responder = self.actual_respondent if self.actual_respondent else participant
+            self.survey_transcript.add_response(
+                question_number=self.current_question_num, participant=responder,
+                response_text=f"[Uncertain response accepted after encouragement] {captured_text}")
+            return "move_on"
+
+        # ── Already followed up: just accept ─────────────────────────────
+        logger.info(f"🤷 [{question_context}] Still uncertain after follow-up ({loop_label}), accepting")
+        return "accepted"
+
+    async def _nudge_for_short_offtopic_retry(
+        self,
+        participant: str,
+        speaker_name: str,
+        captured_text: str,
+        *,
+        question_context: str,
+        loop_label: str,
+    ) -> None:
+        """Prompt for a more complete answer instead of silently waiting forever."""
+        import time as _time
+
+        nudge_text = (
+            f"Could you say a bit more about your answer, {speaker_name}? "
+            f"I want to make sure it responds to the question."
+        )
+        logger.info(
+            f"📢 [{question_context}] Short off-topic response needs clarification "
+            f"({loop_label}): '{captured_text[:100]}'"
+        )
+        await self._safe_say(
+            nudge_text,
+            allow_interruptions=False,
+            context=f"short_offtopic_nudge_{loop_label}",
+        )
+        self.survey_transcript.add_acknowledgment(nudge_text)
+
+        # Fresh retry state, but preserve short off-topic counters so a repeat
+        # or second non-sequitur can still escalate on the next attempt.
+        self.captured_response = None
+        self._response_ready.clear()
+        self.latest_user_response = None
+        self.response_captured = False
+        self.last_stt_fragment = ""
+        self._turn_accumulated_text = ""
+        self.pending_stt_transcript = None
+        self.response_fragments = []
+        self.last_fragment_time = None
+        self.actual_respondent = None
+
+        self.waiting_for_response = True
+        self.last_speech_time = None
+        self._had_stt_transcript_this_turn = False
+        self._idle_no_vad_nudge_fired = False
+        self._stt_nudge_given = False
+        self._first_fragment_time = None
+        self._user_stopped_speaking_at = None
+        self._last_transcript_progress_time = _time.time()
+        self._silence_watchdog_fired = False
+        if not self.user_currently_speaking:
+            self._first_vad_speaking_time = None
+
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant)
+        )
+
+        if self.turn_monitor_task:
+            self.turn_monitor_task.cancel()
+            self.turn_monitor_task = None
+        self.turn_time_exceeded = False
+        self.current_turn = TurnInfo(
+            participant_identity=participant,
+            start_time=datetime.now(),
+        )
+        self.turn_monitor_task = asyncio.create_task(
+            self.monitor_turn_duration(self.agent_session)
+        )
+
+        if self._polling_deadline is not None:
+            new_deadline = _time.time() + 15.0
+            if new_deadline > self._polling_deadline:
+                self._polling_deadline = new_deadline
+                logger.info(
+                    f"⏱️  Extended polling deadline by 15s after short off-topic nudge ({loop_label})"
+                )
+
+    def _reset_for_off_topic(self, participant: str, *, context: str = "") -> None:
+        """Reset all mutable state after an off-topic redirect so the participant
+        gets a fresh turn to answer the same question.
+
+        Centralised here so the 1st loop, 2nd loop, and METHOD 2 fallback share
+        identical reset logic.  Key invariants:
+          - ``user_currently_speaking`` is NEVER forced False — VAD events are
+            the single source of truth.
+          - ``_polling_deadline`` is ALWAYS extended.
+          - Timeout and turn monitor tasks are safely cancelled then restarted.
+        """
+        import time as _time
+
+        logger.critical(f"OFF-TOPIC RESET START for {participant} (ctx={context})")
+
+        # ── Response / STT state ───────────────────────────────────────
+        self.captured_response = None
+        self._response_ready.clear()
+        self.latest_user_response = None
+        self.response_captured = False
+        self.last_stt_fragment = ""
+        self.pending_stt_transcript = None
+        self.response_fragments = []
+        self.last_fragment_time = None
+        self.actual_respondent = None
+
+        # ── Flow control flags ─────────────────────────────────────────
+        self.encouragement_given = False
+        self.question_repeated = False
+        self._short_offtopic_count = 0
+        self._last_short_offtopic_norm = None
+        self._had_stt_transcript_this_turn = False
+        self._idle_no_vad_nudge_fired = False
+        self.waiting_for_response = True
+        self.last_speech_time = None
+        self._transition_filler_said = False
+        self._ack_already_spoken = False
+        self._prewarmed_ack_text = None
+
+        # ── STT health-check state ────────────────────────────────────
+        self._first_vad_speaking_time = None
+        self._stt_nudge_given = False
+
+        # ── Timeout monitoring ─────────────────────────────────────────
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant)
+        )
+
+        # ── Turn monitoring ────────────────────────────────────────────
+        if self.turn_monitor_task:
+            self.turn_monitor_task.cancel()
+            self.turn_monitor_task = None
+        # NOTE: Do NOT reset user_currently_speaking — let VAD events drive it.
+        # If the user is already speaking when this reset runs, forcing False
+        # causes the polling loop to capture a partial fragment immediately
+        # (the user never triggers a new 'speaking' event).
+        self.current_speaking_duration = 0.0
+        self.accumulated_pause_duration = 0.0
+        self._first_fragment_time = None
+        self._user_stopped_speaking_at = None
+        self.turn_time_exceeded = False
+        self.current_turn = TurnInfo(
+            participant_identity=participant,
+            start_time=datetime.now(),
+        )
+        self.turn_monitor_task = asyncio.create_task(
+            self.monitor_turn_duration(self.agent_session)
+        )
+
+        # ── Spillover guard timestamp ──────────────────────────────────
+        self.turn_transition_time = datetime.now()
+
+        # ── Extend polling deadline so user gets full time after redirect ─
+        max_turn_time = (
+            self.max_turn_duration
+            + self.first_interrupt_grace
+            + self.second_interrupt_grace
+        )
+        off_topic_extension = max_turn_time + 10
+        self._polling_deadline = _time.time() + off_topic_extension
+        logger.info(f"⏱️  Polling deadline extended by {off_topic_extension}s after off-topic reset")
+
+        logger.critical(
+            f"🔄 OFF-TOPIC RESET COMPLETE (ctx={context}) — "
+            f"participant gets full {self.max_turn_duration}s again"
+        )
 
     async def _get_room_participant_identities(self) -> Optional[Set[str]]:
         if not self.livekit_api or not self.room_name:
@@ -1566,18 +2848,12 @@ class CommunityModeratorAgent(Agent):
         # Note: set_participant(None) breaks STT - it stops listening entirely
         # Instead, we'll rely on NOT calling set_participant for specific participants in observer mode
         # This means STT will listen to whatever the default room audio is
-        try:
-            # Get first participant to reset STT to a working state
-            participants = list(self.participant_manager.participants)
-            if participants:
-                audio_input = self.agent_session._room_io._audio_input
-                # Temporarily set to first participant to "wake up" STT
-                audio_input.set_participant(participants[0])
-                logger.info(f"👁️ STT reset to first participant: {participants[0]}")
-            else:
-                logger.warning("👁️ No participants available to reset STT")
-        except Exception as e:
-            logger.warning(f"Could not reset STT: {e}")
+        # Reset STT to first participant to "wake up" STT
+        participants = list(self.participant_manager.participants)
+        if participants:
+            self._set_stt_participant(participants[0], context="observer_start_survey_reset")
+        else:
+            logger.warning("No participants available to reset STT")
 
         # 1. WELCOME MESSAGE — enter WELCOME phase so STT transcripts are discarded
         self.survey_state = SurveyState.WELCOME
@@ -1704,12 +2980,7 @@ class CommunityModeratorAgent(Agent):
                 # (set_participant(None) breaks STT - we must set to a valid participant)
                 observer_identity = self.participant_manager.get_observer_identity()
                 if observer_identity:
-                    try:
-                        audio_input = self.agent_session._room_io._audio_input
-                        audio_input.set_participant(observer_identity)
-                        logger.info(f"👁️ STT set to observer for 'resume' command: {observer_identity}")
-                    except Exception as e:
-                        logger.warning(f"Could not set STT to observer: {e}")
+                    self._set_stt_participant(observer_identity, context="pause_command_stt_to_observer")
             else:
                 logger.warning(f"👁️ Cannot pause - current state: {self.survey_state}")
 
@@ -1750,6 +3021,180 @@ class CommunityModeratorAgent(Agent):
             else:
                 logger.warning(f"👁️ Cannot resume - current state: {self.survey_state}")
 
+    async def _safe_interrupt(self, session: AgentSession, *, context: str = "") -> bool:
+        """Call session.interrupt(), treating ALL RuntimeErrors as non-fatal.
+
+        On denial, waits for current speech to finish via SDK wait_for_playout().
+        Returns True if interrupt succeeded, False if denied/failed.
+        """
+        try:
+            session.interrupt()
+            return True
+        except RuntimeError as e:
+            if self.current_turn:
+                self.current_turn.interrupt_denied_count += 1
+            logger.warning(f"session.interrupt() denied ({context}): {e}")
+            speech = session.current_speech
+            if speech and not speech.done():
+                try:
+                    await asyncio.wait_for(speech.wait_for_playout(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    pass
+            return False
+
+    async def _safe_say(self, text: str, *, allow_interruptions: bool = True, context: str = "") -> bool:
+        """Wrapper for session.say() that is safe during shutdown.
+
+        Returns True if speech completed, False on failure/shutdown.
+        SDK serializes say() calls internally — no manual lock needed.
+        """
+        if self._shutting_down:
+            logger.info(f"_safe_say suppressed (shutting down): {context} — '{text[:60]}'")
+            return False
+        if not self.agent_session:
+            logger.warning(f"_safe_say skipped (no session): {context}")
+            return False
+        try:
+            handle = self.agent_session.say(text, allow_interruptions=allow_interruptions)
+            self._estimated_remaining_tts = 0.0  # Stale question-TTS estimate is now invalid
+            await handle
+            return True
+        except asyncio.CancelledError:
+            return False
+        except RuntimeError as e:
+            if "closing" in str(e).lower() or "closed" in str(e).lower():
+                self._shutting_down = True
+            return False
+
+    def _cancel_all_monitor_tasks(self):
+        """Central cleanup: cancel response_timeout_task, turn_monitor_task, and avatar tasks."""
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+        if self.turn_monitor_task:
+            self.turn_monitor_task.cancel()
+            self.turn_monitor_task = None
+        self.current_turn = None
+        self._cancel_avatar_tasks()
+        logger.info("🧹 All monitor tasks cancelled (central cleanup)")
+
+    def _cancel_avatar_tasks(self):
+        """Cancel all outstanding avatar-related async tasks (notice + reconnect)."""
+        if self._avatar_notice_task and not self._avatar_notice_task.done():
+            self._avatar_notice_task.cancel()
+            self._avatar_notice_task = None
+            logger.info("🧹 Avatar disconnect notice task cancelled")
+        if self._avatar_reconnect_task and not self._avatar_reconnect_task.done():
+            self._avatar_reconnect_task.cancel()
+            self._avatar_reconnect_task = None
+            logger.info("🧹 Avatar reconnect task cancelled")
+
+    async def _cleanup_avatar(self):
+        """Idempotent avatar teardown.  Safe to call multiple times.
+
+        Cancels all avatar tasks, attempts to stop the avatar session if the
+        Anam SDK supports it, and logs the final lifecycle status.
+        """
+        self._cancel_avatar_tasks()
+
+        avatar_ref = self._avatar_session_ref
+        if avatar_ref is not None:
+            self._avatar_session_ref = None
+            self._avatar_connected = False
+            # The Anam SDK may expose .stop(), .close(), or .disconnect().
+            # Try each in order; swallow errors to keep teardown non-fatal.
+            for method_name in ("stop", "close", "disconnect"):
+                method = getattr(avatar_ref, method_name, None)
+                if callable(method):
+                    try:
+                        result = method()
+                        # Handle both sync and async teardown methods
+                        if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                            try:
+                                await asyncio.wait_for(result, timeout=5.0)
+                            except asyncio.TimeoutError:
+                                logger.info(
+                                    f"AVATAR_LIFECYCLE teardown via {method_name}() "
+                                    f"timed out (5s, expected post-disconnect cleanup noise)"
+                                )
+                        logger.info(f"AVATAR_LIFECYCLE teardown via {method_name}() succeeded")
+                    except Exception as exc:
+                        _severity = logger.debug if not self._avatar_connected else logger.warning
+                        _severity(
+                            f"AVATAR_LIFECYCLE teardown via {method_name}() "
+                            f"failed (non-fatal, connected={self._avatar_connected}): {exc}"
+                        )
+                    break  # Only call the first available method
+            else:
+                logger.info("AVATAR_LIFECYCLE avatar session released (no stop/close/disconnect method)")
+
+        logger.info(
+            f"AVATAR_LIFECYCLE cleanup_complete state={self._avatar_state} "
+            f"reconnect_attempts={self._avatar_reconnect_attempts} "
+            f"disconnect_reason={self._avatar_disconnect_reason} "
+            f"audio_only={self._audio_only_mode}"
+        )
+
+    @staticmethod
+    def _is_avatar_identity(identity: str) -> bool:
+        """Return True if the identity belongs to the Anam avatar agent.
+
+        Centralised check so all event handlers use the same logic.
+        Matches the constant ``ANAM_AVATAR_IDENTITY`` ("anam-avatar-agent")
+        and any identity containing "avatar-agent" (handles suffixed variants).
+        """
+        if not identity:
+            return False
+        return identity == ANAM_AVATAR_IDENTITY or "avatar-agent" in identity
+
+    def _set_avatar_state(self, new_state: str, *, reason: Optional[str] = None):
+        """Transition avatar state with structured logging."""
+        old_state = self._avatar_state
+        self._avatar_state = new_state
+        if new_state == AVATAR_STATE_CONNECTED:
+            self._avatar_connected = True
+        elif new_state in (AVATAR_STATE_DISCONNECTED, AVATAR_STATE_FAILED):
+            self._avatar_connected = False
+        if reason:
+            self._avatar_disconnect_reason = reason
+        extra = f" reason={reason}" if reason else ""
+        logger.info(
+            f"AVATAR_LIFECYCLE state={new_state} prev={old_state}{extra} "
+            f"reconnect_attempts={self._avatar_reconnect_attempts} "
+            f"connected={self._avatar_connected}"
+        )
+
+    async def _survey_loop(self, initial_action: str):
+        """Iterative trampoline replacing recursive ask_next_question ↔ move_to_next_participant.
+
+        Each step method returns the next action string ("ask", "move") or None to stop.
+        This eliminates unbounded recursion depth that previously caused stack growth
+        proportional to (questions × participants).
+        """
+        action = initial_action
+        _iteration = 0
+        while action and not self._shutting_down:
+            _iteration += 1
+            logger.info(f"📋 SURVEY_LOOP: iteration={_iteration} action={action}")
+            try:
+                if action == "ask":
+                    action = await self._ask_next_question_impl()
+                elif action == "move":
+                    action = await self._move_to_next_participant_impl()
+                else:
+                    logger.error(f"📋 SURVEY_LOOP: unknown action '{action}' — stopping")
+                    break
+            except RuntimeError as e:
+                if "closing" in str(e).lower() or "closed" in str(e).lower():
+                    self._shutting_down = True
+                    logger.warning(f"🛑 SURVEY_LOOP caught session-closing RuntimeError: {e}")
+                    self._cancel_all_monitor_tasks()
+                    break
+                raise  # Re-raise non-session RuntimeErrors
+        if self._shutting_down:
+            logger.info(f"🛑 SURVEY_LOOP exiting: _shutting_down=True (after {_iteration} iterations)")
+            self._cancel_all_monitor_tasks()
+
     async def monitor_turn_duration(self, session: AgentSession):
         """
         Monitor the current turn duration with graceful time extension for surveys.
@@ -1775,6 +3220,7 @@ class CommunityModeratorAgent(Agent):
         grace_period_1 = self.max_turn_duration + self.first_interrupt_grace  # When to give warning
         grace_period_2 = grace_period_1 + self.second_interrupt_grace  # When to force end
 
+        import time as _time
         warning_start_time = None  # Timestamp when gentle warning TTS finished (for cooldown)
 
         logger.info(f"Started graceful turn monitoring for {participant_id}")
@@ -1786,6 +3232,11 @@ class CommunityModeratorAgent(Agent):
 
         try:
             while self.current_turn == turn_info:  # Still the same turn
+                # Shutdown guard
+                if self._shutting_down:
+                    logger.info(f"🛑 monitor_turn_duration exiting: _shutting_down=True ({participant_id})")
+                    return
+
                 # Check if survey was paused - stop monitoring
                 if self.survey_state == SurveyState.PAUSED:
                     logger.info(f"👁️ Survey paused - stopping turn monitoring for {participant_id}")
@@ -1862,17 +3313,12 @@ class CommunityModeratorAgent(Agent):
                         "timestamp": datetime.now().isoformat(),
                     })
 
-                    # Interrupt agent's own speech first
-                    await session.interrupt()
+                    # Interrupt agent's own speech first (may fail if current
+                    # speech was created with allow_interruptions=False).
+                    await self._safe_interrupt(session, context="gentle_warning")
 
-                    # FIXED: Use direct TTS for exact message (like timeout prompt fix)
-                    # participant_id IS the display name (participants is a list, not a dict)
-                    display_name = participant_id.capitalize()  # Capitalize first letter for proper display
-
-                    warning_text = (
-                        f"{display_name}, we're going to need to wrap it up so we can get to others. "
-                        f"Can you spend the next ten to fifteen seconds finishing your thoughts?"
-                    )
+                    display_name = participant_id.capitalize()
+                    warning_text = GENTLE_WARNING_TEMPLATE.format(name=display_name)
                     logger.critical(f"🔊 SENDING GENTLE WARNING VIA TTS: '{warning_text}'")
 
                     # CRITICAL FIX: Block the polling loop from capturing the response
@@ -1880,67 +3326,83 @@ class CommunityModeratorAgent(Agent):
                     # to listen to the warning and the polling loop grabs their partial
                     # response as the final answer.
                     self._gentle_warning_in_progress = True
+                    self._gentle_warning_started_at = _time.time()
 
-                    # Clear accumulated response NOW (before TTS starts) so neither
-                    # the polling loop nor _capture_user_response_immediately() can
-                    # grab stale pre-warning text while the warning plays.
-                    self.latest_user_response = None
-                    self.last_stt_fragment = ""
-                    self._first_fragment_time = None
-                    self.pending_stt_transcript = None
-                    self.response_captured = False
-                    self._first_vad_speaking_time = None
-                    self._stt_nudge_given = False
+                    try:
+                        # Clear accumulated response NOW (before TTS starts) so neither
+                        # the polling loop nor _capture_user_response_immediately() can
+                        # grab stale pre-warning text while the warning plays.
+                        self.latest_user_response = None
+                        self.last_stt_fragment = ""
+                        self._first_fragment_time = None
+                        self.pending_stt_transcript = None
+                        self.response_captured = False
+                        self._first_vad_speaking_time = None
+                        # Keep _stt_nudge_given = True to suppress echo-triggered nudges
+                        self._stt_nudge_given = True
 
-                    warning_start_time = datetime.now()
-                    await session.say(warning_text, allow_interruptions=False)
-                    warning_duration = (datetime.now() - warning_start_time).total_seconds()
+                        warning_start_time = datetime.now()
+                        await session.say(warning_text, allow_interruptions=False)
+                        warning_duration = (datetime.now() - warning_start_time).total_seconds()
 
-                    # Reset start_time to NOW so user gets a TRUE
-                    # second_interrupt_grace window from when warning finishes.
-                    old_start = turn_info.start_time
-                    old_elapsed = (datetime.now() - old_start).total_seconds()
-                    turn_info.start_time = datetime.now()
-                    new_elapsed = (datetime.now() - turn_info.start_time).total_seconds()
+                        # Reset start_time to NOW so user gets a TRUE
+                        # second_interrupt_grace window from when warning finishes.
+                        old_start = turn_info.start_time
+                        old_elapsed = (datetime.now() - old_start).total_seconds()
+                        turn_info.start_time = datetime.now()
+                        new_elapsed = (datetime.now() - turn_info.start_time).total_seconds()
 
-                    # Recalculate grace periods relative to the reset timer
-                    grace_period_2 = self.second_interrupt_grace
-                    grace_period_1 = max(self.second_interrupt_grace - 2.0, 3.0)
+                        # Recalculate grace periods relative to the reset timer
+                        grace_period_2 = self.second_interrupt_grace
+                        grace_period_1 = max(self.second_interrupt_grace - 2.0, 3.0)
 
-                    # Reset VAD accumulator so user gets a full wrap-up window of actual speaking time
-                    turn_info.actual_speaking_duration = 0.0
+                        # Reset VAD accumulator so user gets a full wrap-up window of actual speaking time
+                        turn_info.actual_speaking_duration = 0.0
 
-                    # Clear again after TTS — any STT that arrived while the
-                    # warning played is stale echo / cross-talk, not wrap-up speech.
-                    self.latest_user_response = None
-                    self.last_stt_fragment = ""
-                    self._first_fragment_time = None
-                    self.pending_stt_transcript = None
-                    self.response_captured = False
-                    self._first_vad_speaking_time = None
-                    self._stt_nudge_given = False
+                        # Clear again after TTS — any STT that arrived while the
+                        # warning played is stale echo / cross-talk, not wrap-up speech.
+                        self.latest_user_response = None
+                        self.last_stt_fragment = ""
+                        self._first_fragment_time = None
+                        self.pending_stt_transcript = None
+                        self.response_captured = False
+                        self._first_vad_speaking_time = None
+                        # NOTE: Do NOT reset _stt_nudge_given here.  The warning TTS
+                        # can bleed into the mic as echo, causing VAD to detect
+                        # "speech" without real STT transcripts.  If we reset the
+                        # nudge flag, the STT health-check fires "I didn't hear you"
+                        # immediately after the warning — confusing the participant.
+                        self._stt_nudge_given = True
 
-                    # Now unblock the polling loop
-                    self._gentle_warning_in_progress = False
+                        # CRITICAL FIX (Bug 2): Extend the polling deadline so the
+                        # polling loop does not timeout while the user is wrapping up.
+                        # Without this, the original deadline (set at question start)
+                        # fires immediately after the warning, discarding wrap-up speech.
+                        wrap_up_extension = self.second_interrupt_grace + 10  # wrap-up window + buffer
+                        new_deadline = _time.time() + wrap_up_extension
+                        if self._polling_deadline is None or new_deadline > self._polling_deadline:
+                            self._polling_deadline = new_deadline
+                        logger.info(f"⏱️  Polling deadline extended by {wrap_up_extension}s after gentle warning")
 
-                    # CRITICAL FIX (Bug 2): Extend the polling deadline so the
-                    # polling loop does not timeout while the user is wrapping up.
-                    # Without this, the original deadline (set at question start)
-                    # fires immediately after the warning, discarding wrap-up speech.
-                    import time as _time
-                    wrap_up_extension = self.second_interrupt_grace + 10  # wrap-up window + buffer
-                    new_deadline = _time.time() + wrap_up_extension
-                    if self._polling_deadline is None or new_deadline > self._polling_deadline:
-                        self._polling_deadline = new_deadline
-                    logger.info(f"⏱️  Polling deadline extended by {wrap_up_extension}s after gentle warning")
+                        logger.critical(
+                            f"✅ GENTLE WARNING SENT (took {warning_duration:.1f}s). "
+                            f"Timer RESET: old_elapsed={old_elapsed:.1f}s → new_elapsed={new_elapsed:.1f}s. "
+                            f"User gets full {self.second_interrupt_grace}s to wrap up (force-end at {grace_period_2}s). "
+                            f"Response buffer cleared — only new speech after warning will be captured."
+                        )
 
-                    logger.critical(
-                        f"✅ GENTLE WARNING SENT (took {warning_duration:.1f}s). "
-                        f"Timer RESET: old_elapsed={old_elapsed:.1f}s → new_elapsed={new_elapsed:.1f}s. "
-                        f"User gets full {self.second_interrupt_grace}s to wrap up (force-end at {grace_period_2}s). "
-                        f"Response buffer cleared — only new speech after warning will be captured."
-                    )
+                    finally:
+                        # ALWAYS reset the flag — a stuck True blocks the polling
+                        # loop indefinitely (e.g. if session.say() throws).
+                        self._gentle_warning_in_progress = False
+                        self._gentle_warning_started_at = None
 
+                        # Cancel response timeout — it's meaningless post-warning.
+                        # The user already spoke (that's how they hit 30s), and we've
+                        # cleared the response buffer for wrap-up speech.
+                        if self.response_timeout_task:
+                            self.response_timeout_task.cancel()
+                            self.response_timeout_task = None
 
                     # CRITICAL: Continue to next iteration so adjusted timer takes effect
                     # Otherwise force-end check runs with OLD elapsed value!
@@ -1972,19 +3434,13 @@ class CommunityModeratorAgent(Agent):
                         "timestamp": datetime.now().isoformat(),
                     })
 
-                    # Multiple interrupts to force agent to speak
-                    await session.interrupt()
-                    await asyncio.sleep(0.1)
-                    await session.interrupt()
-                    await asyncio.sleep(0.1)
+                    # Interrupt current speech, then deliver force-end message
+                    await self._safe_interrupt(session, context="force_end")
 
-                    # FIXED: Use direct TTS for polite but firm ending
-                    # participant_id IS the display name (participants is a list, not a dict)
-                    display_name = participant_id.capitalize()  # Capitalize first letter for proper display
-
-                    force_end_text = f"Thank you, {display_name}. We need to move on to ensure we complete all questions."
-                    await session.say(force_end_text, allow_interruptions=False)
-                    logger.info(f"🔊 Force ended turn with direct TTS: '{force_end_text}'")
+                    display_name = participant_id.capitalize()
+                    force_end_text = FORCE_END_TEMPLATE.format(name=display_name)
+                    await self._safe_say(force_end_text, allow_interruptions=False, context="force_end_tts")
+                    logger.info(f"Force ended turn with TTS: '{force_end_text}'")
 
                     # After force-end, stop monitoring this turn
                     logger.warning(f"Force-ended turn for {participant_id}. Stopping monitoring.")
@@ -2024,6 +3480,15 @@ class CommunityModeratorAgent(Agent):
             logger.info(f"Turn monitoring cancelled for {participant_id}")
         except Exception as e:
             logger.error(f"Error monitoring turn: {e}", exc_info=True)
+        finally:
+            # Emit per-turn interrupt-denied metric
+            if turn_info.interrupt_denied_count > 0:
+                logger.info(
+                    f"📊 METRIC: turn_interrupt_denied_count={turn_info.interrupt_denied_count} "
+                    f"participant={participant_id} "
+                    f"interruption_count={turn_info.interruption_count} "
+                    f"speaking={turn_info.actual_speaking_duration:.1f}s"
+                )
 
     async def monitor_off_topic(self, session: AgentSession):
         """
@@ -2102,12 +3567,23 @@ class CommunityModeratorAgent(Agent):
             logger.error(f"Error monitoring off-topic: {e}", exc_info=True)
 
     async def monitor_response_timeout(self, participant: str):
-        """Monitor for response timeout and prompt/move on if no response."""
+        """Monitor for response timeout and prompt/move on if no response.
+
+        Guards against overlapping the idle-no-VAD watchdog: if the agent
+        is currently speaking (``_tts_active`` property), the nudge is
+        suppressed because the watchdog is already re-prompting the question.
+        """
         try:
-            base_timeout = 10
+            nudge_timeout = 15
+            skip_timeout = 30
 
             # Wait for participant to start responding
-            await asyncio.sleep(base_timeout)
+            await asyncio.sleep(nudge_timeout)
+
+            # Shutdown guard
+            if self._shutting_down:
+                logger.info(f"🛑 monitor_response_timeout exiting: _shutting_down=True ({participant})")
+                return
 
             # Check if paused - don't prompt during pause
             if self.survey_state == SurveyState.PAUSED:
@@ -2116,16 +3592,33 @@ class CommunityModeratorAgent(Agent):
 
             # Check if they started speaking
             if self.last_speech_time is None and self.waiting_for_response:
-                logger.warning(f"No response from {participant} after {base_timeout} seconds, prompting...")
+                # ── Guard: suppress nudge while agent is speaking ──────
+                # The idle-no-VAD watchdog may be in the middle of
+                # repeating the question.  Speaking over it with "Please
+                # go ahead..." creates a confusing double-prompt.
+                if self._tts_active:
+                    logger.info(
+                        "monitor_response_timeout: suppressing nudge — "
+                        "agent TTS is active (likely idle watchdog re-prompt)"
+                    )
+                    # Wait for current speech to finish via SDK
+                    speech = self.agent_session.current_speech if self.agent_session else None
+                    if speech and not speech.done():
+                        try:
+                            await asyncio.wait_for(speech.wait_for_playout(), timeout=10.0)
+                        except asyncio.TimeoutError:
+                            pass
+                    # After the re-prompt finishes, the user may start
+                    # speaking.  Re-check before nudging.
+                    if self.last_speech_time is not None or not self.waiting_for_response:
+                        logger.info("monitor_response_timeout: user responded after re-prompt — skipping nudge")
+                        return
 
-                # FIXED: Use direct TTS instead of LLM generate_reply to ensure exact text
-                # The LLM was ignoring instructions and saying "Thank you" instead
-                display_name = self.participant_manager.get_display_name(participant)
-                prompt_text = f"{display_name}, please let me know what you think."
-                await self.agent_session.say(prompt_text, allow_interruptions=False)
-                logger.info(f"🔊 Prompted participant with direct TTS: '{prompt_text}'")
+                logger.warning(f"No response from {participant} after {nudge_timeout} seconds, prompting...")
+                await self._safe_say(TIMEOUT_NUDGE_TEXT, allow_interruptions=False, context="timeout_nudge")
+                logger.info(f"🔊 Prompted participant with direct TTS: '{TIMEOUT_NUDGE_TEXT}'")
 
-                await asyncio.sleep(base_timeout)
+                await asyncio.sleep(skip_timeout - nudge_timeout)
 
                 # Check if paused - don't timeout during pause
                 if self.survey_state == SurveyState.PAUSED:
@@ -2134,12 +3627,8 @@ class CommunityModeratorAgent(Agent):
 
                 # Still no response - move on
                 if self.last_speech_time is None and self.waiting_for_response:
-                    logger.warning(f"No response from {participant} after 20 seconds total, moving on...")
+                    logger.warning(f"No response from {participant} after {skip_timeout} seconds total, moving on...")
                     self.waiting_for_response = False
-
-                    # Mark as timeout - the polling loop will detect this and handle it
-                    # DON'T call move_to_next_participant here - it creates a race condition
-                    # The polling loop is already handling the timeout case
                     logger.info("Timeout detected - polling loop will handle moving to next participant")
 
         except asyncio.CancelledError:
@@ -2188,7 +3677,43 @@ class CommunityModeratorAgent(Agent):
             logger.warning(f"Error ending room: {e}")
 
     async def ask_next_question(self):
-        """Ask the next question to a random participant (if question-based mode is enabled)."""
+        """Public entry point — kicks off the iterative survey loop starting with 'ask'."""
+        await self._survey_loop("ask")
+
+    async def _route_audio_to_participant(self, participant: str, *,
+                                          context: str = "", skip_muting: bool = False) -> None:
+        """Centralized audio routing: set expected respondent, lock STT, manage muting, drain spillover."""
+        self.expected_respondent = participant
+        self.actual_respondent = None
+        self.turn_transition_time = datetime.now()
+        self._set_delivery_state(self.current_question_num, participant, "delivering", context=context)
+
+        logger.critical("=" * 80)
+        logger.critical(f"AUDIO ROUTING - Question #{self.current_question_num} to {participant}")
+
+        respondent_count = self._active_respondent_count()
+        is_multi = respondent_count > 1
+
+        if is_multi:
+            logger.critical(f"   {respondent_count} active respondents — STT lock + muting")
+            self._set_stt_participant(participant, context=f"{context}_stt_lock")
+            if not skip_muting:
+                asyncio.create_task(self.manage_participant_muting(participant))
+        else:
+            logger.critical(f"   {respondent_count} active respondent — solo mode")
+
+        if self.observer_mode_enabled:
+            self.pending_stt_transcript = None
+            observer_identity = self.participant_manager.get_observer_identity()
+            if observer_identity:
+                self._set_stt_participant(observer_identity, context=f"{context}_observer")
+
+        if is_multi:
+            logger.info(f"Waiting 0.5s for STT spillover drain before speaking to {participant}")
+            await asyncio.sleep(0.5)
+
+    async def _ask_next_question_impl(self) -> Optional[str]:
+        """Ask the next question. Returns next action ("move"/"ask") or None to stop."""
         if not self.question_loader or not self.participant_manager or not self.agent_session:
             logger.debug("Question-based moderation not enabled, skipping")
             return
@@ -2211,6 +3736,8 @@ class CommunityModeratorAgent(Agent):
         question = self.question_loader.get_next_question()
         if not question:
             logger.info("No more questions - survey complete!")
+            self._shutting_down = True
+            self._cancel_all_monitor_tasks()
 
             # Unmute all participants - survey is over
             await self.unmute_all_participants()
@@ -2225,14 +3752,36 @@ class CommunityModeratorAgent(Agent):
                 closing_text = "Thank you for completing the survey. Your feedback is valuable."
                 logger.info("Using default closing message")
 
-            # Use direct TTS for closing (no LLM)
+            # Use direct TTS for closing (no LLM) — avatar stays connected
+            # so the closing speech renders visually and audibly
             try:
                 logger.critical("🎤 CLOSING: Using direct TTS (no LLM)")
-                await self.agent_session.say(closing_text, allow_interruptions=False)
-                # Give time for speech to complete
+                import time as _time
+                _closing_tts_start = _time.time()
+                closing_handle = self.agent_session.say(closing_text, allow_interruptions=False)
+                await closing_handle
+                try:
+                    await asyncio.wait_for(closing_handle.wait_for_playout(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Closing TTS playout timed out after 60s")
+                # wait_for_playout() resolves when frames are queued (~0.5s), not when
+                # the client finishes playback. Sleep for estimated remaining duration
+                # so the closing message is fully heard before avatar cleanup.
+                _closing_elapsed = _time.time() - _closing_tts_start
+                _closing_estimated = _estimate_tts_duration(closing_text)
+                _closing_remaining = max(_closing_estimated - _closing_elapsed, 0.0)
+                if _closing_remaining > 0:
+                    logger.info(
+                        f"Waiting {_closing_remaining:.1f}s for estimated closing TTS playback "
+                        f"({len(closing_text)} chars)"
+                    )
+                    await asyncio.sleep(_closing_remaining)
                 await asyncio.sleep(2)
             except RuntimeError as e:
                 logger.warning(f"Could not speak completion message, session may be closing: {e}")
+
+            # Clean up avatar AFTER closing TTS is confirmed complete
+            await self._cleanup_avatar()
 
             # Record closing in survey transcript (debug) and data export (CSV)
             self.survey_transcript.add_closing(closing_text)
@@ -2320,8 +3869,7 @@ class CommunityModeratorAgent(Agent):
                     logger.error(f"Error delivering info statement: {e}")
 
                 # Move to next question immediately (no response to collect)
-                await self.ask_next_question()
-                return
+                return "ask"
         else:
             # LEGACY FORMAT (string)
             self.current_question = question
@@ -2382,8 +3930,7 @@ class CommunityModeratorAgent(Agent):
                 break
             if self.participant_manager.all_participants_answered(self.current_question_num):
                 logger.info("All participants answered, moving to next question")
-                await self.ask_next_question()
-                return
+                return "ask"
             await asyncio.sleep(0.1)
         if not participant:
             logger.warning("No deliverable participant currently available; will retry selection later.")
@@ -2412,22 +3959,38 @@ class CommunityModeratorAgent(Agent):
                 announcement_text=category_announcement
             )
 
-            # Use direct TTS for category announcement - no LLM
-            await self.agent_session.say(category_announcement, allow_interruptions=False)
-            await asyncio.sleep(1.0)  # Brief pause after category announcement
+            # Use direct say + playout wait to ensure audio fully plays on client
+            # before question delivery begins (avoids overlap/truncation)
+            if not self._shutting_down and self.agent_session:
+                try:
+                    cat_handle = self.agent_session.say(category_announcement, allow_interruptions=False)
+                    await cat_handle
+                    # Ensure audio fully plays out on client before proceeding
+                    try:
+                        await asyncio.wait_for(cat_handle.wait_for_playout(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.warning("Category announcement playout timed out")
+                except (asyncio.CancelledError, RuntimeError) as e:
+                    logger.warning(f"Category announcement TTS failed: {e}")
+                await asyncio.sleep(0.5)  # Brief natural conversational pause
 
-        # DYNAMIC VAD CONFIGURATION: Adjust silence threshold based on question type
-        # Reduced for faster response times while still allowing natural pauses
+        # DYNAMIC VAD CONFIGURATION: Adjust silence threshold based on question type.
+        # Values are tuned to avoid echo-barge-in (agent's TTS interpreted as
+        # user speech) while remaining responsive to real participant answers.
+        # Quantitative raised from 0.4→0.6 to prevent echo-triggered false turns.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=0.8)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.8s (qualitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=1.2)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
             elif self.current_question_object.is_quantitative():
-                self.agent_session.vad.update_options(min_silence_duration=0.4)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.4s (quantitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.6)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
             else:
-                self.agent_session.vad.update_options(min_silence_duration=0.5)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.5s (default)")
+                self.agent_session.vad.update_options(min_silence_duration=0.7)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.7s (default)")
+
+        # Clear TTS dedupe for new question delivery
+        self._tts_dedupe_spoken.clear()
 
         # Now ask the actual question (using participant's display name)
         exact_text_to_say = f"{participant_display_name}, {self.current_question}"
@@ -2485,74 +4048,44 @@ class CommunityModeratorAgent(Agent):
         # (Participant gets fresh time when question is re-asked after pause)
         self.accumulated_pause_duration = 0.0
 
-        # MULTI-PARTICIPANT FIX: Set who we're expecting to respond
-        self.expected_respondent = participant
-        self.actual_respondent = None  # Will be set when we detect audio activity
-        self.turn_transition_time = datetime.now()  # For spillover detection
-        self._set_delivery_state(self.current_question_num, participant, "delivering", context="ask_next_question")
-
-        logger.critical("=" * 80)
-        logger.critical(f"🔧 AUDIO ROUTING TRACE - Question #{self.current_question_num} to {participant}")
-
-        _respondent_count = self._active_respondent_count()
-        if _respondent_count > 1:
-            # MULTI-PARTICIPANT: Lock STT + mute others to prevent cross-talk
-            logger.critical(f"   {_respondent_count} active respondents — enabling STT lock + muting")
-            if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                room_io = self.agent_session._room_io
-                if hasattr(room_io, '_audio_input') and room_io._audio_input:
-                    audio_input = room_io._audio_input
-                    logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
-                    try:
-                        audio_input.set_participant(participant)
-                        logger.critical(f"✅ STT set_participant('{participant}') — immediate")
-                    except Exception as e:
-                        logger.error(f"❌ EXCEPTION during set_participant: {e}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                else:
-                    logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
-            else:
-                logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
-
-            asyncio.create_task(self.manage_participant_muting(participant))
-        else:
-            logger.critical(f"   {_respondent_count} active respondent — skipping STT lock + muting (solo mode)")
-
-        # In observer mode: Keep STT on observer while speaking (to hear pause command)
-        if self.observer_mode_enabled:
-            # CRITICAL: Clear any pending STT transcripts from previous participant
-            # (Response is already saved to transcript/export, so this won't lose data)
-            self.pending_stt_transcript = None
-
-            observer_identity = self.participant_manager.get_observer_identity()
-            if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                try:
-                    audio_input = self.agent_session._room_io._audio_input
-                    if audio_input:
-                        audio_input.set_participant(observer_identity)
-                        logger.critical(f"👁️ STT set to observer while asking question (can hear pause)")
-                except Exception as e:
-                    logger.warning(f"Could not set STT to observer: {e}")
-
-        # In multi-participant mode, add a brief delay to let STT spillover
-        # from the previous participant's answer drain before speaking.
-        # Kept short (0.5s) because delivery-state guards already block stale transcripts.
-        _is_multi = self._active_respondent_count() > 1
-        if _is_multi:
-            logger.info(f"⏳ Waiting 0.5s for STT spillover to drain before speaking to {participant}")
-            await asyncio.sleep(0.5)
+        # MULTI-PARTICIPANT: Centralized audio routing (STT lock, muting, spillover drain)
+        await self._route_audio_to_participant(participant, context="ask_next_question")
 
         # DIRECT TTS - Speak the question with truncation detection + retry.
-        # In multi-participant mode, disable interruptions on the first attempt
-        # because STT spillover from the previous participant could truncate
-        # the question before this participant has heard it.
-        await self._speak_question_safely(
+        # Change 1: retry_text omits participant name to avoid repeated name playback.
+        # Change 2: dedupe_key prevents re-speaking the same prompt on redelivery.
+        # Change 4: _speak_question_safely now has 2 retries with backoff internally.
+        _dedupe = f"ask_Q{self.current_question_num}_{participant}"
+        tts_fully_spoken = await self._speak_question_safely(
             exact_text_to_say,
-            context=f"ask_Q{self.current_question_num}_{participant}",
-            allow_interruptions_first=not _is_multi,
+            retry_text=self.current_question,  # question body only, no name prefix
+            context=_dedupe,
+            allow_interruptions_first=not (self._active_respondent_count() > 1),
+            dedupe_key=_dedupe,
         )
-        self._set_delivery_state(self.current_question_num, participant, "delivered", context="ask_next_question")
+
+        # Change 3: Use explicit delivery states instead of a single "delivered"
+        if tts_fully_spoken:
+            self._set_delivery_state(self.current_question_num, participant, "delivered_full", context="ask_next_question")
+        else:
+            self._set_delivery_state(self.current_question_num, participant, "delivered_partial", context="ask_next_question_partial_tts")
+            logger.warning(f"⚠️ Delivery partial — polling will proceed but timeout is suppressed")
+
+        # Adaptive post-TTS gate: wait for VAD to confirm silence (user not
+        # speaking) before the polling loop starts.  This avoids capturing
+        # echo / noise artifacts from the agent's own TTS playback as the
+        # "first response".  Falls back to 1.5s max if VAD doesn't settle.
+        _gate_start = asyncio.get_event_loop().time()
+        _gate_max = 1.5
+        while (asyncio.get_event_loop().time() - _gate_start) < _gate_max:
+            if not self.user_currently_speaking:
+                break
+            await asyncio.sleep(0.05)
+        _gate_elapsed = asyncio.get_event_loop().time() - _gate_start
+        if _gate_elapsed < _gate_max:
+            # VAD confirmed silence early — add a brief buffer for audio pipeline
+            await asyncio.sleep(0.3)
+        logger.debug(f"⏳ Post-TTS gate complete ({_gate_elapsed:.2f}s VAD wait) — ready for response capture")
 
         if self._last_user_state == "away":
             logger.warning(
@@ -2563,1036 +4096,105 @@ class CommunityModeratorAgent(Agent):
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
-            logger.info("👁️ Survey paused during question - waiting for resume")
+            logger.info("Survey paused during question - waiting for resume")
             while self.survey_state == SurveyState.PAUSED:
                 await asyncio.sleep(0.5)
-            logger.info("👁️ Survey resumed - continuing with response collection")
+            logger.info("Survey resumed - continuing with response collection")
 
-        logger.critical("=" * 80)
-        logger.critical(f"✅ Question spoken via DIRECT TTS (0% LLM involvement)")
+        logger.critical(f"Question #{self.current_question_num} spoken via DIRECT TTS")
 
-        # Calculate max polling time: Must be longer than max turn duration to allow graceful time management
-        # Max turn duration = base + first_grace + second_grace + buffer
+        # ── Phase 1: Event-driven response capture ──
         max_turn_time = self.max_turn_duration + self.first_interrupt_grace + self.second_interrupt_grace
-        polling_timeout = max_turn_time + 10  # Add 10s buffer for silence detection and processing
-        max_checks = int(polling_timeout / 0.1)  # Convert to number of 0.1s checks
+        polling_timeout = max_turn_time + 10
 
-        logger.critical(f"⏳ SMART POLLING: Waiting for user response (max {polling_timeout}s)...")
-        logger.critical(f"   - Max turn duration: {max_turn_time}s (base={self.max_turn_duration}s + graces={self.first_interrupt_grace + self.second_interrupt_grace}s)")
-        logger.critical(f"   - Polling timeout: {polling_timeout}s (turn + 10s buffer)")
-        logger.critical(f"   - Will break immediately once response captured (VAD-trusted)")
+        # Clean up turn monitoring from previous question
+        if self.turn_monitor_task:
+            self.turn_monitor_task.cancel()
+            self.turn_monitor_task = None
 
-        # Reset the response variables before waiting (including fragments for multi-part answers)
-        self.latest_user_response = None
-        self.pending_stt_transcript = None  # Prevent stale transcripts from previous turn
-        self.response_fragments = []
-        self.last_fragment_time = None
-        self.last_stt_fragment = ""  # Reset fragment tracking for new question
-        self._first_fragment_time = None  # Reset stabilization timer for new question
-        self._user_stopped_speaking_at = None  # Reset pause-cooldown timer for new question
-        self._gentle_warning_in_progress = False  # Ensure clean state for new question
-        self._stt_nudge_given = False  # Reset STT health-check nudge for new question
-        self._first_vad_speaking_time = None  # When VAD first detected speech for this question
-        self.encouragement_given = False  # Reset encouragement flag for new participant
-        self.question_repeated = False  # Reset repeat flag for new participant
-        self.relevance_prompt_given = False  # Reset relevance flag for new participant
-        self.partial_repeat_handled = False  # Reset partial repeat flag for new question
-        self.already_answered_prompt_given = False  # Reset already-answered flag for new question
-        self.accumulated_partial_answer = ""  # Clear any accumulated partial answers
-        self.turn_time_exceeded = False  # Reset turn time exceeded flag for new question
-        self._ack_already_spoken = False  # Reset ack flag for new question
-        self._prewarmed_ack_text = None  # Clear pre-warmed ack text
-        logger.critical(f"🔄 [{question_id}] RESET encouragement/repeat/relevance/partial_repeat/already_answered/turn_time flags (new question)")
-
-        # Initialize timeout monitoring variables
-        self.waiting_for_response = True
-        self.last_speech_time = None
-
-        # Start timeout monitoring task (will prompt after 10s, move on after 20s)
-        if self.response_timeout_task:
-            self.response_timeout_task.cancel()
-        self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+        # Start turn monitoring
+        self.current_turn = TurnInfo(
+            participant_identity=participant,
+            start_time=datetime.now(),
         )
-        logger.info(f"⏱️  Started timeout monitoring for {participant} (prompt at 10s, skip at 20s)")
+        self.turn_monitor_task = asyncio.create_task(
+            self.monitor_turn_duration(self.agent_session)
+        )
 
-        # SMART POLLING: Check if event handler stored a response in our variable
-        # BUT: Wait for user to finish speaking before processing!
+        # Reset accumulated pause duration for this new question/turn
+        self.accumulated_pause_duration = 0.0
+
+        question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
+        question_context = f"Q#{self.current_question_num} ({question_id})"
+
+        response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
+
+        if response_text == "PAUSED":
+            # After resume, question will be re-asked via handle_observer_command
+            return
+
         user_responded = False
-        initial_user_msg_count = len([item for item in self.agent_session._chat_ctx.items
-                                       if hasattr(item, 'role') and item.role == 'user'])
+        if response_text:
+            logger.critical(f"[{question_context}] Response CAPTURED: {len(response_text)} chars")
 
-        import time as _time
-        self._polling_deadline = _time.time() + polling_timeout
+            # Process in retry loop
+            while response_text:
+                result = await self._process_captured_response(
+                    participant, response_text, question_context)
 
-        for check_num in range(max_checks * 3):  # generous upper bound; deadline is the real limiter
-            await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
-
-            if _time.time() > self._polling_deadline:
-                # Safety: never timeout while user is speaking or gentle warning is active
-                if self.user_currently_speaking or self._gentle_warning_in_progress:
-                    self._polling_deadline = _time.time() + 5  # extend 5s and re-check
-                    logger.debug(f"⏱️  Deadline reached but user still speaking/warning active — extending 5s")
-                    continue
-                # Safety: if we have captured STT fragments, don't throw them away
-                if self.latest_user_response is not None:
-                    logger.info(f"⏱️  Deadline reached but STT fragments exist — processing instead of timing out")
+                if result == "accepted" or result == "move_on":
+                    self._record_response_to_exports(participant, response_text, question_id)
+                    user_responded = True
+                    break
+                elif result == "retry":
+                    # Wait for new response
+                    response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
+                    if response_text == "PAUSED":
+                        return
+                    if response_text is None:
+                        break
+                    logger.critical(f"[{question_context}] Retry response: {len(response_text)} chars")
                 else:
-                    logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
                     break
 
-            # TIMEOUT MONITOR SIGNAL: monitor_response_timeout sets this to False
-            # after 20s of total silence — break immediately so we don't wait
-            # for the full polling_timeout (~45s).
-            if not self.waiting_for_response:
-                logger.warning(f"⏱️  Timeout monitor signaled no-response — exiting poll early")
-                break
-
-            # OBSERVER COMMAND CHECK: Periodically switch STT to observer to hear pause/resume commands
-            # This allows observer to say "pause" at any time during response collection
-            if self.observer_mode_enabled and check_num % 20 == 10:  # Every ~2 seconds
-                observer_identity = self.participant_manager.get_observer_identity()
-                if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                    try:
-                        audio_input = self.agent_session._room_io._audio_input
-                        if audio_input:
-                            # Briefly switch to observer to check for commands
-                            audio_input.set_participant(observer_identity)
-                            logger.debug(f"👁️ STT briefly switched to observer for command check")
-                            await asyncio.sleep(0.3)  # Brief listen window for observer
-
-                            # Switch back to participant (unless paused)
-                            if self.survey_state != SurveyState.PAUSED:
-                                audio_input.set_participant(participant)
-                                logger.debug(f"👁️ STT switched back to participant: {participant}")
-                    except Exception as e:
-                        logger.warning(f"Observer command check failed: {e}")
-
-            # CRITICAL: Check if survey was paused by observer - wait until resumed
-            if self.survey_state == SurveyState.PAUSED:
-                logger.info(f"👁️ Survey PAUSED during response polling - waiting for resume")
-                # Keep STT on observer while paused so we can hear resume
-                observer_identity = self.participant_manager.get_observer_identity()
-                if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                    try:
-                        audio_input = self.agent_session._room_io._audio_input
-                        if audio_input:
-                            audio_input.set_participant(observer_identity)
-                            logger.info(f"👁️ STT set to observer for 'resume' command")
-                    except Exception as e:
-                        logger.warning(f"Could not set STT to observer: {e}")
-                while self.survey_state == SurveyState.PAUSED:
-                    await asyncio.sleep(0.5)
-                logger.info(f"👁️ Survey RESUMED - continuing response polling")
-                # After resume, the question will be re-asked via handle_observer_command
-                # Exit this polling loop to avoid duplicate processing
-                return
-
-            # GENTLE WARNING GUARD: While the turn monitor is speaking the wrap-up
-            # warning, do NOT capture or process responses. The user naturally pauses
-            # to listen, and we must not mistake that for "finished speaking."
-            if self._gentle_warning_in_progress:
-                if check_num % 20 == 0:
-                    logger.info(f"⏳ Gentle warning in progress — holding response capture (check {check_num})")
-                continue
-
-            # CRITICAL: If user is currently speaking, don't process yet - wait for them to finish!
-            # EXCEPTION: If turn_time_exceeded is True, process anyway - user has exceeded time limit
-            if self.user_currently_speaking and not self.turn_time_exceeded:
-                if check_num % 20 == 0:  # Log every ~2 seconds while waiting
-                    logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
-                continue  # Skip to next check, don't process response yet
-
-            # If turn time exceeded but user is still speaking, force processing
-            if self.turn_time_exceeded and self.user_currently_speaking:
-                logger.warning(f"⚡ FORCE PROCESSING: Turn time exceeded but user still speaking - proceeding with accumulated response")
-
-            # STT HEALTH CHECK: If VAD has detected speech but no STT
-            # transcripts have arrived, the STT pipeline may have silently
-            # failed (audio quality, Deepgram glitch, etc.).  Nudge once.
-            if (self.latest_user_response is None
-                and not self.response_captured
-                and not self._stt_nudge_given
-                and self._first_vad_speaking_time is not None
-                and not self.user_currently_speaking):
-                since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
-                if since_first_vad > 15:
-                    self._stt_nudge_given = True
-                    display_name = self.participant_manager.get_display_name(participant)
-                    nudge_text = (
-                        f"I'm sorry {display_name}, I couldn't quite hear you. "
-                        f"Could you please repeat that a bit louder?"
-                    )
-                    logger.warning(
-                        f"⚠️ STT HEALTH CHECK: VAD detected speech "
-                        f"{since_first_vad:.0f}s ago but no STT transcripts "
-                        f"received for {participant}! Nudging participant."
-                    )
-                    await self.agent_session.say(nudge_text, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(nudge_text)
-
-            # STABILIZATION DELAY: Prevent capturing a tiny first fragment (e.g. "How")
-            # before VAD has even detected the user as speaking.  STT events can
-            # arrive 200-400ms ahead of the user_state_changed → speaking event.
-            # If the first fragment arrived very recently, give the VAD time to catch up.
-            if (self.latest_user_response is not None
-                and self._first_fragment_time is not None
-                and not self.user_currently_speaking
-                and not self.turn_time_exceeded):
-                since_first_frag = (datetime.now() - self._first_fragment_time).total_seconds()
-                if since_first_frag < 2.0:
-                    # Too soon since first fragment — VAD may not have fired yet
-                    continue
-
-            # PAUSE COOLDOWN: When user pauses mid-thought (e.g. "uhh...", "umm..."),
-            # VAD fires speaking→listening but the user intends to continue. Wait a
-            # cooldown period after the last speaking→listening transition before
-            # treating the response as final. Qualitative questions get more slack.
-            if (self.latest_user_response is not None
-                and not self.user_currently_speaking
-                and not self.turn_time_exceeded
-                and self._user_stopped_speaking_at is not None):
-                pause_cooldown = 1.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
-                since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
-                if since_stopped < pause_cooldown:
-                    continue
-
-            # Trust VAD + STT events: proceed immediately once response is
-            # captured and the user has stopped speaking (or turn time exceeded).
-            if self.latest_user_response is not None and (not self.user_currently_speaking or self.turn_time_exceeded):
-                self._silence_confirmed_time = datetime.now()
-
-                # FOUND USER RESPONSE VIA EVENT!
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                elapsed_time = (check_num + 1) * 0.1
-
-                # ── Delivery-state double-check at acceptance ──
-                if not self._is_delivery_confirmed(self.current_question_num, participant):
-                    _ds_key = self._delivery_key(self.current_question_num, participant)
-                    _ds = self.question_delivery_state.get(_ds_key, "unknown")
-                    logger.warning(
-                        f"🛡️ DELIVERY GUARD (polling-accept): Discarding response — "
-                        f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
-                    )
-                    # #region agent log
-                    import json as _json
-                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                        _f.write(_json.dumps({"location": "moderator_agent.py:ask_next_q:polling_accept_guard", "message": "Polling acceptance blocked by delivery guard", "data": {"delivery_state": _ds, "participant": participant, "question_num": self.current_question_num, "response": str(self.latest_user_response)[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_POLL_GUARD"}) + "\n")
-                    # #endregion
-                    self.latest_user_response = None
-                    self.pending_stt_transcript = None
-                    self.response_captured = False
-                    continue
-
-                # LATENCY TRACKING: Record when response processing starts
-                response_processing_start = datetime.now()
-                self._response_processing_start = response_processing_start  # Store for later tracking
-                logger.critical(f"⏱️  [{question_context}] LATENCY TRACKING: Response processing started at {response_processing_start.isoformat()}")
-
-                # Snapshot the captured response into a local so that a concurrent
-                # gentle-warning reset (which clears self.latest_user_response)
-                # cannot cause a NoneType crash downstream.
-                _captured_response_text: str = self.latest_user_response
-
-                logger.critical(f"✅ [{question_context}] Response CAPTURED via EVENT (elapsed: {elapsed_time}s from question)")
-                logger.critical(f"📝 [{question_context}] Final response: {len(_captured_response_text)} chars")
-                logger.critical(f"   Text: '{_captured_response_text}'")
-
-                # CHECK FOR "I DON'T KNOW" RESPONSES - Encourage participant to try again
-                logger.critical(f"🔍 [{question_context}] CHECKING FOR UNCERTAIN RESPONSE...")
-                logger.critical(f"   Response text: '{_captured_response_text}'")
-                logger.critical(f"   encouragement_given flag: {self.encouragement_given}")
-                is_uncertain = is_uncertain_response(_captured_response_text)
-                logger.critical(f"   is_uncertain_response() returned: {is_uncertain}")
-
-                if is_uncertain:
-                    if not self.encouragement_given:
-                        # First "I don't know" - encourage them to try
-                        self.encouragement_given = True
-                        logger.info(f"🤔 [{question_context}] Detected uncertain response, encouraging participant to try again")
-
-                        # IMPORTANT: Log the initial uncertain response BEFORE encouragement
-                        responder = self.actual_respondent if self.actual_respondent else participant
-                        self.survey_transcript.add_response(
-                            question_number=self.current_question_num,
-                            participant=responder,
-                            response_text=f"[Initial uncertain response before encouragement] {_captured_response_text}"
-                        )
-                        logger.info(f"📝 Logged uncertain response before encouragement: '{_captured_response_text[:100]}...'")
-
-                        # Get participant name for personalized encouragement
-                        speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-
-                        # Encouraging message - varies based on question type
-                        if self.current_question_object and self.current_question_object.is_qualitative():
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"There's no right or wrong answer here. "
-                                f"Feel free to share whatever comes to mind, even if it's just a quick thought."
-                            )
-                        else:
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"Take a moment to think about it. "
-                                f"Any answer you give is valuable."
-                            )
-
-                        # Say encouragement via TTS
-                        await self.agent_session.say(encouragement, allow_interruptions=False)
-                        self.survey_transcript.add_acknowledgment(encouragement)
-                        logger.info(f"🔊 Encouraged participant: '{encouragement}'")
-
-                        # Reset response capture to wait for new response
-                        self.latest_user_response = None
-                        self.response_captured = False
-                        self.last_stt_fragment = ""
-
-                        # CRITICAL FIX: Reset turn duration monitoring to prevent time warning after encouragement
-                        if self.turn_monitor_task:
-                            self.turn_monitor_task.cancel()
-                            self.turn_monitor_task = None
-
-                        # Reset speech timing
-                        self.user_currently_speaking = False
-                        self.turn_time_exceeded = False
-
-                        # Restart turn monitor for the new response
-                        self.current_turn = TurnInfo(
-                            participant_identity=participant,
-                            start_time=datetime.now(),
-                        )
-                        self.turn_monitor_task = asyncio.create_task(
-                            self.monitor_turn_duration(self.agent_session)
-                        )
-                        logger.info(f"🔄 Reset turn monitoring after encouragement")
-                        logger.info(f"⏱️  Restarted turn monitor for {participant}")
-
-                        # Continue polling for their new response
-                        logger.info(f"⏳ Waiting for new response after encouragement...")
-                        continue
-                    else:
-                        # Already encouraged once - accept the "I don't know" response
-                        logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement, accepting response")
-
-                # ============================================================
-                # DETERMINISTIC REPEAT PRE-CHECK (before LLM)
-                # Catches "didn't hear the last part", "say that again", etc.
-                # instantly — no LLM round-trip needed.
-                # ============================================================
-                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                if is_repeat_request(_captured_response_text):
-                    self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected — repeating question (repeat #{self.question_repeated})")
-
-                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
-                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
-                    await self.agent_session.say(self.current_question, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated question (heuristic): '{self.current_question[:100]}...'")
-
-                    self._reset_for_repeat(participant, context="heuristic_repeat_1st_loop")
-                    continue
-
-                # ============================================================
-                # UNIFIED RESPONSE ANALYSIS (LLM-based)
-                # Checks: repeat request, partial answer, already-answered claim, relevance
-                # ============================================================
-                question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                response_to_analyze = _captured_response_text
-
-                # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
-                # with the new response BEFORE analysis. This ensures relevance check sees the full combined answer.
-                if self.partial_repeat_handled and self.accumulated_partial_answer:
-                    response_to_analyze = f"{self.accumulated_partial_answer} {_captured_response_text}"
-                    logger.info(f"📝 [{question_context}] Combined partial + new response for analysis: '{response_to_analyze[:100]}...'")
-
-                logger.info(f"🔍 [{question_context}] Running unified response analysis...")
-                survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-
-                # IMMEDIATE ACK: Fire acknowledgment NOW so the user hears
-                # feedback within ~1s.  The LLM analysis runs concurrently;
-                # if it discovers an issue the correction follows naturally.
-                _ack_speaker = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
-                _ack_handle = self.agent_session.say(self._prewarmed_ack_text, allow_interruptions=False)
-                self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
-                self._ack_already_spoken = True
-                self._transition_filler_said = True  # ack replaces the "One moment…" filler
-                logger.info(f"🗣️ Immediate ack fired (async): '{self._prewarmed_ack_text}'")
-
-                if hasattr(self, '_response_processing_start') and self._response_processing_start:
-                    _latency = (datetime.now() - self._response_processing_start).total_seconds()
-                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {_latency:.2f}s")
-                    logger.info(f"📊 METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
-
-                # LLM analysis runs while the ack TTS is playing
-                analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
-
-                # Ensure ack finishes before any follow-up correction
-                await _ack_handle
-
-                logger.info(f"📊 [{question_context}] Analysis result: relevant={analysis.is_relevant}, repeat_request={analysis.is_repeat_request}, already_answered={analysis.is_already_answered_claim}, partial_status={analysis.partial_repeat_status}")
-
-                # --- CHECK 1: PARTIAL ANSWER + REPEAT REQUEST ---
-                if analysis.partial_repeat_status == "PARTIAL" and not self.partial_repeat_handled:
-                    self.partial_repeat_handled = True
-                    logger.info(f"📝 [{question_context}] Partial answer detected with repeat request")
-
-                    # Store partial answer for later combination with final response
-                    self.accumulated_partial_answer = analysis.partial_answer
-                    logger.info(f"💾 Stored partial answer: '{self.accumulated_partial_answer[:100]}...'")
-
-                    # Acknowledge and repeat ONLY unanswered parts
-                    partial_intro = f"Got it, {speaker_name}. Let me repeat the rest of the question."
-                    await self.agent_session.say(partial_intro, allow_interruptions=False)
-
-                    # Speak only the unanswered sub-questions verbatim
-                    await self.agent_session.say(analysis.unanswered_questions, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated unanswered parts: '{analysis.unanswered_questions[:100]}...'")
-
-                    # Reset for new response (but keep accumulated_partial_answer)
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.encouragement_given = False
-
-                    # Reset timeout/turn monitoring
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset timing after partial repeat, waiting for remaining answer...")
-                    continue
-
-                # --- CHECK 2: "ALREADY ANSWERED" CLAIM ---
-                if analysis.is_already_answered_claim and not self.already_answered_prompt_given:
-                    self.already_answered_prompt_given = True
-                    logger.info(f"📢 [{question_context}] 'Already answered' claim detected, asking to rephrase")
-
-                    # IMPORTANT: Log the original response BEFORE asking for rephrase
-                    # This ensures we capture what participant said even if they just claim "already answered"
-                    # Use self.actual_respondent if available, otherwise fall back to expected participant
-                    responder = self.actual_respondent if self.actual_respondent else participant
-                    self.survey_transcript.add_response(
-                        question_number=self.current_question_num,
-                        participant=responder,
-                        response_text=f"[Initial response before rephrase request] {_captured_response_text}"
-                    )
-                    logger.info(f"📝 Logged initial response before rephrase: '{_captured_response_text[:100]}...'")
-
-                    rephrase_prompt = (
-                        f"I appreciate that, {speaker_name}, but I may not have captured your response correctly. "
-                        f"Could you please rephrase or elaborate on your answer? "
-                        f"This helps ensure we have your thoughts recorded accurately."
-                    )
-
-                    await self.agent_session.say(rephrase_prompt, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(rephrase_prompt)
-                    logger.info(f"🔊 Asked to rephrase: '{rephrase_prompt}'")
-
-                    # Reset for new response
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-
-                    # Reset timeout/turn monitoring
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset timing after already-answered prompt, waiting for new response...")
-                    continue
-
-                # --- CHECK 3: FULL REPEAT REQUEST (no partial answer) ---
-                # A pure repeat request is a control utterance, not an answer.
-                # Always honour it regardless of how many times the user asks.
-                is_full_repeat = analysis.is_repeat_request or (analysis.partial_repeat_status == "REPEAT_ONLY")
-                if is_full_repeat:
-                    self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (LLM-confirmed)")
-
-                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
-                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
-
-                    await self.agent_session.say(self.current_question, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
-
-                    self._reset_for_repeat(participant, context="llm_repeat_1st_loop")
-                    continue
-
-                # --- CHECK 4: OFF-TOPIC/IRRELEVANT RESPONSE ---
-                if not analysis.is_relevant and not self.relevance_prompt_given:
-                    self.relevance_prompt_given = True
-                    logger.info(f"📢 [{question_context}] Off-topic response detected, asking for relevant answer")
-
-                    # IMPORTANT: Log the off-topic response BEFORE asking for relevant answer
-                    responder = self.actual_respondent if self.actual_respondent else participant
-                    self.survey_transcript.add_response(
-                        question_number=self.current_question_num,
-                        participant=responder,
-                        response_text=f"[Initial off-topic response] {_captured_response_text}"
-                    )
-                    logger.info(f"📝 Logged off-topic response: '{_captured_response_text[:100]}...'")
-
-                    relevance_prompt = (
-                        f"Thank you {speaker_name}, but I don't think you quite answered the question. "
-                        f"I may be wrong, but I'm going to repeat the question and would you mind answering again after I'm done repeating it?"
-                    )
-
-                    await self.agent_session.say(relevance_prompt, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(relevance_prompt)
-                    logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
-
-                    question_text = self.current_question_object.question if self.current_question_object else ""
-                    if question_text:
-                        await self.agent_session.say(question_text, allow_interruptions=False)
-                        logger.info(f"🔊 Repeated question after off-topic: '{question_text[:60]}...'")
-
-                    # RESET ALL TIMING AND MONITORING
-                    logger.critical(f"🔄 OFF-TOPIC RESET START for {participant}")
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.pending_stt_transcript = None
-                    self.actual_respondent = None
-                    self.encouragement_given = False
-                    self.question_repeated = False
-                    self._first_vad_speaking_time = None
-                    self._stt_nudge_given = False
-
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.current_speaking_duration = 0.0
-                    self.accumulated_pause_duration = 0.0
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.critical(f"🔄 OFF-TOPIC RESET COMPLETE - participant gets full {self.max_turn_duration}s again")
-                    logger.critical(f"⏳ Continuing polling loop - waiting for relevant response from {participant}...")
-                    continue
-
-                # ============================================================
-                # COMBINE PARTIAL ANSWERS (if any) WITH FINAL RESPONSE
-                # ============================================================
-                if self.accumulated_partial_answer:
-                    combined_response = f"{self.accumulated_partial_answer} {_captured_response_text}"
-                    logger.info(f"📝 [{question_context}] Combined partial + final response: '{combined_response[:100]}...'")
-                    _captured_response_text = combined_response
-                    self.latest_user_response = combined_response
-                    self.accumulated_partial_answer = ""  # Clear after combining
-
-                # MULTI-PARTICIPANT FIX: Determine WHO actually spoke
-                actual_speaker = self.actual_respondent if self.actual_respondent else participant
-
-                # Validation: Check if the right person responded
-                if self.actual_respondent and self.actual_respondent != participant:
-                    logger.warning(f"⚠️  MISMATCH: Expected {participant} to respond, but {self.actual_respondent} spoke!")
-                    logger.info(f"✅ ACCEPTING response from {self.actual_respondent} (being permissive, not kicking)")
-
-                logger.critical(f"👤 Response from: {actual_speaker} (expected: {participant})")
-
-                # Apply STT correction - handle multi-option questions differently
-                corrected_response = _captured_response_text
-                if self.current_question_object and self.current_question_object.response_options:
-                    max_sel = self.current_question_object.max_selections or 1
-                    if max_sel > 1:
-                        corrected_response = parse_multi_option_response(
-                            _captured_response_text,
-                            self.current_question_object.response_options,
-                            max_sel
-                        )
-                    else:
-                        corrected_response = correct_transcription(
-                            _captured_response_text,
-                            self.current_question_object.response_options
-                        )
-                    if corrected_response != _captured_response_text:
-                        logger.info(f"Response corrected: '{_captured_response_text[:50]}' → '{corrected_response[:50]}'")
-
-                # Get question details for logging
-                question_text = self.current_question_object.question if self.current_question_object else ""
-
-                # Log RAW STT vs corrected response for debugging
-                self.stt_debug_logger.log_question_response(
-                    question_num=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    participant=actual_speaker,
-                    raw_transcript=_captured_response_text,
-                    corrected_response=corrected_response,
-                    response_options=self.current_question_object.response_options if self.current_question_object else None,
-                    expected_respondent=participant
-                )
-
-                # Record in survey transcript (JSON) with ACTUAL speaker
-                self.survey_transcript.add_response(
-                    question_number=self.current_question_num,
-                    participant=actual_speaker,
-                    response_text=corrected_response
-                )
-                logger.critical(f"✅ Response logged to JSON: Q#{self.current_question_num}, {actual_speaker}")
-
-                # Add to CSV DataFrame for analysis with ACTUAL speaker
-                question_text = self.current_question_object.question if self.current_question_object else ""
-                response_options = self.current_question_object.response_options if self.current_question_object else []
-
-                self.survey_data_export.add_response(
-                    participant=actual_speaker,
-                    question_number=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    response_options=response_options,
-                    response_text=corrected_response
-                )
-                logger.critical(f"✅ Response added to CSV DataFrame: Q#{self.current_question_num}")
-
-                # Mark ACTUAL participant as answered (not the expected one)
-                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="response_received")
-                logger.info(f"✅ Marked {actual_speaker} as answered for question #{self.current_question_num}")
-
-                # Record turn result for acknowledgment (immutable snapshot)
-                self._record_turn_result(expected=participant, actual=actual_speaker)
-
-                # Cancel timeout monitoring since we got a response
-                self.waiting_for_response = False
-                if self.response_timeout_task:
-                    self.response_timeout_task.cancel()
-                    self.response_timeout_task = None
-
-                # Clear the variable
-                self.latest_user_response = None
-
-                user_responded = True
-                break
-
-            # METHOD 2: Check conversation context directly (fallback if events fail)
-            current_user_msgs = [item for item in self.agent_session._chat_ctx.items
-                                  if hasattr(item, 'role') and item.role == 'user']
-
-            if check_num % 10 == 0:  # Log every 5 seconds
-                logger.debug(f"Polling check {check_num}: user_msgs={len(current_user_msgs)}, initial={initial_user_msg_count}, waiting_for_response={self.waiting_for_response}")
-
-            if len(current_user_msgs) > initial_user_msg_count:
-                # NEW USER MESSAGE FOUND IN CONTEXT!
-                latest_msg = current_user_msgs[-1]
-
-                # Extract transcript
-                transcript = ""
-                if hasattr(latest_msg, 'content'):
-                    if isinstance(latest_msg.content, list):
-                        transcript = " ".join(str(c) for c in latest_msg.content)
-                    else:
-                        transcript = str(latest_msg.content)
-                else:
-                    transcript = str(latest_msg)
-
-                logger.critical(f"✅ Response detected in CONTEXT DIRECTLY (after {(check_num + 1) * 0.5}s)")
-                logger.critical(f"📝 Captured response: '{transcript[:50]}...'")
-
-                # CHECK FOR "I DON'T KNOW" RESPONSES - Encourage participant to try again (METHOD 2)
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                logger.critical(f"🔍 [{question_context}] CHECKING FOR UNCERTAIN RESPONSE (METHOD 2)...")
-                logger.critical(f"   Response text: '{transcript}'")
-                logger.critical(f"   encouragement_given flag: {self.encouragement_given}")
-                is_uncertain = is_uncertain_response(transcript)
-                logger.critical(f"   is_uncertain_response() returned: {is_uncertain}")
-
-                if is_uncertain:
-                    if not self.encouragement_given:
-                        # First "I don't know" - encourage them to try
-                        self.encouragement_given = True
-                        question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                        logger.info(f"🤔 [{question_context}] Detected uncertain response (METHOD 2), encouraging participant to try again")
-
-                        # IMPORTANT: Log the initial uncertain response BEFORE encouragement
-                        self.survey_transcript.add_response(
-                            question_number=self.current_question_num,
-                            participant=participant,
-                            response_text=f"[Initial uncertain response before encouragement] {transcript}"
-                        )
-                        logger.info(f"📝 Logged uncertain response before encouragement (METHOD 2): '{transcript[:100] if transcript else 'N/A'}...'")
-
-                        # Get participant name for personalized encouragement
-                        speaker_name = participant.capitalize()
-
-                        # Encouraging message - varies based on question type
-                        if self.current_question_object and self.current_question_object.is_qualitative():
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"There's no right or wrong answer here. "
-                                f"Feel free to share whatever comes to mind, even if it's just a quick thought."
-                            )
-                        else:
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"Take a moment to think about it. "
-                                f"Any answer you give is valuable."
-                            )
-
-                        # Say encouragement via TTS
-                        await self.agent_session.say(encouragement, allow_interruptions=False)
-                        self.survey_transcript.add_acknowledgment(encouragement)
-                        logger.info(f"🔊 Encouraged participant: '{encouragement}'")
-
-                        # CRITICAL FIX: Reset turn duration monitoring to prevent time warning after encouragement
-                        if self.turn_monitor_task:
-                            self.turn_monitor_task.cancel()
-                            self.turn_monitor_task = None
-
-                        # Reset speech timing
-                        self.user_currently_speaking = False
-                        self.turn_time_exceeded = False
-
-                        # Restart turn monitor for the new response
-                        self.current_turn = TurnInfo(
-                            participant_identity=participant,
-                            start_time=datetime.now(),
-                        )
-                        self.turn_monitor_task = asyncio.create_task(
-                            self.monitor_turn_duration(self.agent_session)
-                        )
-                        logger.info(f"🔄 Reset turn monitoring after encouragement (METHOD 2)")
-                        logger.info(f"⏱️  Restarted turn monitor for {participant}")
-
-                        # Continue polling for their new response
-                        logger.info(f"⏳ Waiting for new response after encouragement...")
-                        initial_user_msg_count = len(current_user_msgs)  # Reset baseline for context check
-                        continue
-                    else:
-                        # Already encouraged once - accept the "I don't know" response
-                        question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                        logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement (METHOD 2), accepting response")
-
-                # CHECK FOR REPEAT QUESTION REQUESTS (METHOD 2)
-                # Deterministic heuristic first, then fall back to LLM
-                is_method2_repeat = is_repeat_request(transcript)
-                if not is_method2_repeat:
-                    question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                    survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-                    method2_analysis = await analyze_response(question_for_analysis, transcript, survey_desc)
-                    is_method2_repeat = method2_analysis.is_repeat_request or (method2_analysis.partial_repeat_status == "REPEAT_ONLY")
-
-                if is_method2_repeat:
-                    # A pure repeat request is a control utterance, not an answer.
-                    # Always honour it regardless of how many times the user asks.
-                    self.question_repeated = True
-                    question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (METHOD 2)")
-
-                    repeat_intro = f"Of course, {participant.capitalize()}. I'll repeat the question."
-                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
-
-                    await self.agent_session.say(self.current_question, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
-
-                    self._reset_for_repeat(participant, context="method2_repeat")
-
-                    initial_user_msg_count = len(current_user_msgs)
-                    continue
-
-                # CHECK FOR OFF-TOPIC/IRRELEVANT RESPONSES (only on first attempt) - METHOD 2
-                if not self.relevance_prompt_given:
-                    # Get the question text for relevance check
-                    question_for_check = self.current_question_object.question if self.current_question_object else self.current_question
-
-                    # Check relevance via LLM
-                    survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-                    is_relevant = await check_response_relevance(question_for_check, transcript, survey_desc)
-
-                    if not is_relevant:
-                        # Response is off-topic - ask for relevant response
-                        self.relevance_prompt_given = True
-                        question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                        logger.info(f"📢 [{question_context}] Off-topic response detected (METHOD 2), asking for relevant answer")
-
-                        # IMPORTANT: Log the off-topic response BEFORE asking for relevant answer
-                        self.survey_transcript.add_response(
-                            question_number=self.current_question_num,
-                            participant=participant,
-                            response_text=f"[Initial off-topic response] {transcript}"
-                        )
-                        logger.info(f"📝 Logged off-topic response (METHOD 2): '{transcript[:100] if transcript else 'N/A'}...'")
-
-                        # Polite request for relevant response
-                        relevance_prompt = (
-                            f"Thank you {participant.capitalize()}, but I don't think you quite answered the question. "
-                            f"I may be wrong, but I'm going to repeat the question and would you mind answering again after I'm done repeating it?"
-                        )
-
-                        # Say the prompt via TTS
-                        await self.agent_session.say(relevance_prompt, allow_interruptions=False)
-                        self.survey_transcript.add_acknowledgment(relevance_prompt)
-                        logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
-
-                        question_text = self.current_question_object.question if self.current_question_object else ""
-                        if question_text:
-                            await self.agent_session.say(question_text, allow_interruptions=False)
-                            logger.info(f"🔊 Repeated question after off-topic: '{question_text[:60]}...'")
-
-                        # RESET ALL TIMING AND MONITORING - treat as fresh question
-                        self.encouragement_given = False
-                        self.question_repeated = False
-
-                        # Reset timeout monitoring
-                        self.waiting_for_response = True
-                        self.last_speech_time = None
-                        if self.response_timeout_task:
-                            self.response_timeout_task.cancel()
-                        self.response_timeout_task = asyncio.create_task(
-                            self.monitor_response_timeout(participant)
-                        )
-
-                        # Reset turn duration monitoring
-                        if self.turn_monitor_task:
-                            self.turn_monitor_task.cancel()
-                            self.turn_monitor_task = None
-
-                        # Reset speech timing
-                        self.user_currently_speaking = False
-                        self.current_speaking_duration = 0.0
-                        self.accumulated_pause_duration = 0.0
-                        self.turn_time_exceeded = False
-
-                        # CRITICAL: Restart turn monitor for the new response
-                        self.current_turn = TurnInfo(
-                            participant_identity=participant,
-                            start_time=datetime.now(),
-                        )
-                        self.turn_monitor_task = asyncio.create_task(
-                            self.monitor_turn_duration(self.agent_session)
-                        )
-                        logger.info(f"🔄 Reset all timing/monitoring after relevance prompt (METHOD 2)")
-                        logger.info(f"⏱️  Restarted turn monitor for {participant}")
-
-                        # Continue polling for their relevant response
-                        logger.info(f"⏳ Waiting for relevant response...")
-                        initial_user_msg_count = len(current_user_msgs)  # Reset baseline for context check
-                        continue
-
-                # Apply STT correction - handle multi-option questions differently
-                corrected_text = transcript
-                if self.current_question_object and self.current_question_object.response_options:
-                    max_sel = self.current_question_object.max_selections or 1
-                    if max_sel > 1:
-                        # Multi-option question - parse and match multiple responses
-                        corrected_text = parse_multi_option_response(
-                            transcript,
-                            self.current_question_object.response_options,
-                            max_sel
-                        )
-                    else:
-                        # Single option question - use standard correction
-                        corrected_text = correct_transcription(transcript, self.current_question_object.response_options)
-                    if corrected_text != transcript:
-                        logger.info(f"Response corrected: '{transcript}' → '{corrected_text}'")
-
-                # Get question details for logging
-                question_text = self.current_question_object.question if self.current_question_object else ""
-
-                # Log RAW STT vs corrected response for debugging
-                self.stt_debug_logger.log_question_response(
-                    question_num=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    participant=participant,
-                    raw_transcript=transcript,
-                    corrected_response=corrected_text,
-                    response_options=self.current_question_object.response_options if self.current_question_object else None,
-                    expected_respondent=participant
-                )
-
-                # Record in survey transcript (JSON)
-                self.survey_transcript.add_response(
-                    question_number=self.current_question_num,
-                    participant=participant,
-                    response_text=corrected_text
-                )
-                logger.critical(f"✅ Response logged to JSON: Q#{self.current_question_num}, {participant}")
-
-                # Add to CSV DataFrame for analysis
-                question_text = self.current_question_object.question if self.current_question_object else ""
-                response_options = self.current_question_object.response_options if self.current_question_object else []
-
-                self.survey_data_export.add_response(
-                    participant=participant,
-                    question_number=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    response_options=response_options,
-                    response_text=corrected_text
-                )
-                logger.critical(f"✅ Response added to CSV DataFrame: Q#{self.current_question_num}")
-
-                user_responded = True
-                break
-
-        # Last-resort rescue: if polling exited but we have captured STT
-        # fragments (e.g. user spoke after a gentle warning), treat them as
-        # the response instead of recording a timeout.
-        if not user_responded and self.latest_user_response:
-            _rescued = self.latest_user_response.strip()
-            if _rescued:
-                logger.info(f"🛟 Rescuing captured STT fragments as response (bypassed normal capture): '{_rescued[:100]}...'")
-                question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
-                actual_speaker = self.actual_respondent if self.actual_respondent else participant
-                self.survey_transcript.add_response(
-                    question_number=self.current_question_num,
-                    participant=actual_speaker,
-                    response_text=_rescued,
-                )
-                logger.critical(f"✅ Response logged to JSON (rescued): Q#{self.current_question_num}, {actual_speaker}")
-                question_text = self.current_question_object.question if self.current_question_object else ""
-                response_options = self.current_question_object.response_options if self.current_question_object else []
-                self.survey_data_export.add_response(
-                    participant=actual_speaker,
-                    question_number=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    response_options=response_options,
-                    response_text=_rescued,
-                )
-                logger.critical(f"✅ Response added to CSV DataFrame (rescued): Q#{self.current_question_num}")
-                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="rescued_after_deadline")
-                self._record_turn_result(expected=participant, actual=actual_speaker)
-                self.latest_user_response = None
-                user_responded = True
-
         if not user_responded:
-            logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected via EVENT or CONTEXT")
+            logger.warning(f"Max wait time reached ({polling_timeout}s), no response detected")
 
-            # Audible acknowledgment so the user knows the system is still alive
+            # Audible timeout message
             try:
                 display_name = self.participant_manager.get_display_name(participant) if self.participant_manager else ""
-                timeout_msg = f"I didn't catch a response, {display_name}. Let me move on." if display_name else "I didn't catch a response. Let me move on."
+                timeout_msg = f"I didn\'t catch a response, {display_name}. Let me move on." if display_name else "I didn\'t catch a response. Let me move on."
                 await self.agent_session.say(timeout_msg, allow_interruptions=False)
                 self.survey_transcript.add_acknowledgment(timeout_msg)
             except Exception as e:
                 logger.warning(f"Could not speak timeout message: {e}")
 
-            # Record timeout/no-response in ALL outputs so question is not lost
-            question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
-            question_text = self.current_question_object.question if self.current_question_object else ""
-            response_options = self.current_question_object.response_options if self.current_question_object else []
-            timeout_marker = "[NO RESPONSE - TIMEOUT]"
+            self._record_timeout_to_exports(participant, question_id)
 
-            # Log to STT debug logger (for comparison report)
-            self.stt_debug_logger.log_question_response(
-                question_num=self.current_question_num,
-                question_id=question_id,
-                question_text=question_text,
-                participant=participant,
-                raw_transcript=timeout_marker,
-                corrected_response=timeout_marker,
-                response_options=response_options,
-                expected_respondent=participant
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in STT debug log")
-
-            # Record in survey transcript (JSON) with timeout marker
-            self.survey_transcript.add_response(
-                question_number=self.current_question_num,
-                participant=participant,
-                response_text=timeout_marker
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in JSON transcript")
-
-            # Add to CSV DataFrame with timeout marker
-            self.survey_data_export.add_response(
-                participant=participant,
-                question_number=self.current_question_num,
-                question_id=question_id,
-                question_text=question_text,
-                response_options=response_options,
-                response_text=timeout_marker
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in CSV DataFrame")
-
-            # Only count timeout as answered if question delivery was confirmed.
-            if self._is_delivery_confirmed(self.current_question_num, participant):
-                self.participant_manager.mark_participant_answered(participant, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, participant, "timeout", context="timeout_after_delivery")
-            else:
-                logger.warning(
-                    f"Skipping answered-mark on timeout for {participant}: delivery was not confirmed; requeueing."
-                )
-                self._register_missing_participant_for_retry(participant, context="timeout_without_delivery")
-
-            # Record turn result for timeout — expected == actual since no one else spoke
-            self._record_turn_result(expected=participant, actual=participant, was_timeout=True)
-
-        # End audit for this question (save to JSON)
+        # End audit for this question
         self.audit_logger.end_question()
 
-        # NOTE: last_respondent is set inside the response capture blocks above
-        # (using actual_speaker, not the expected participant)
-
-        # Stop turn duration monitoring (response captured)
+        # Stop turn duration monitoring
         if self.turn_monitor_task:
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
         self.current_turn = None
-        logger.info("✅ Stopped turn duration monitoring (response captured)")
 
         # Move to next participant/question
-        await self.move_to_next_participant()
+        return "move"
 
     async def move_to_next_participant(self):
-        """
-        After receiving a response, acknowledge it briefly and move to next participant or next question.
-        FIXED: Checks participant count BEFORE speaking, prevents loops.
-        """
+        """Public entry point — kicks off the iterative survey loop starting with 'move'."""
+        await self._survey_loop("move")
+
+    async def _move_to_next_participant_impl(self) -> Optional[str]:
+        """Move to next participant or question. Returns next action or None to stop."""
         if not self.question_loader or not self.participant_manager or not self.agent_session:
             return
 
         if not self.current_question:
             logger.warning("No current question, starting with first question")
-            await self.ask_next_question()
-            return
+            return "ask"
 
         # CRITICAL FIX: Cancel any pending timeout tasks to prevent double-prompting
         if self.response_timeout_task:
@@ -3631,7 +4233,7 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
                         self._response_processing_start = None  # Reset for next response
 
-                    await self.agent_session.say(ack_text, allow_interruptions=False)
+                    await self._safe_say(ack_text, allow_interruptions=False, context="ack_all_answered")
                     self.survey_transcript.add_acknowledgment(ack_text)
                 except RuntimeError as e:
                     logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
@@ -3639,8 +4241,7 @@ class CommunityModeratorAgent(Agent):
             # Inter-question breathing room so the session doesn't feel rushed
             await asyncio.sleep(1)
 
-            await self.ask_next_question()
-            return
+            return "ask"
 
         participant = None
         for _ in range(3):
@@ -3697,7 +4298,7 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
                         self._response_processing_start = None  # Reset for next response
 
-                    await self.agent_session.say(ack_text, allow_interruptions=False)
+                    await self._safe_say(ack_text, allow_interruptions=False, context="ack_no_more_participants")
                     self.survey_transcript.add_acknowledgment(ack_text)
                 except RuntimeError as e:
                     logger.warning(f"Could not say acknowledgment, session may be closing: {e}")
@@ -3705,8 +4306,7 @@ class CommunityModeratorAgent(Agent):
             # Inter-question breathing room so the session doesn't feel rushed
             await asyncio.sleep(1)
 
-            await self.ask_next_question()
-            return
+            return "ask"
 
         # FIXED: There ARE more participants - acknowledge current and move to next
         logger.info(f"Moving to next participant '{participant}' for same question")
@@ -3744,13 +4344,12 @@ class CommunityModeratorAgent(Agent):
 
                 # #region agent log
                 import json as _json
-                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"location": "moderator_agent.py:move_to_next_participant", "message": "Transition latency", "data": {"response_end_to_next_tts_ms": round(latency * 1000), "question_num": self.current_question_num, "next_participant": participant, "filler_spoken": self._transition_filler_said}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}) + "\n")
+                _debug_log_write(_json.dumps({"location": "moderator_agent.py:move_to_next_participant", "message": "Transition latency", "data": {"response_end_to_next_tts_ms": round(latency * 1000), "question_num": self.current_question_num, "next_participant": participant, "filler_spoken": self._transition_filler_said}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
                 # #endregion
 
                 self._response_processing_start = None  # Reset for next response
 
-            await self.agent_session.say(ack_text, allow_interruptions=False)
+            await self._safe_say(ack_text, allow_interruptions=False, context="ack_multi_participant")
             self.survey_transcript.add_acknowledgment(ack_text)
 
         # Get participant's display name (from LiveKit token) for natural TTS
@@ -3768,26 +4367,9 @@ class CommunityModeratorAgent(Agent):
         # This ensures consistent behavior and includes polling loop
         logger.critical("🚀 Using DIRECT TTS for consistency with first participant")
 
-        # Reset response flags and fragments before asking question
+        # Reset response flags (remaining resets handled by _await_response -> _reset_response_flags)
+        self._tts_dedupe_spoken.clear()
         self.response_captured = False
-        self._transition_filler_said = False
-        self.latest_user_response = None
-        self.pending_stt_transcript = None  # Prevent stale transcripts from previous turn
-        self.response_fragments = []
-        self.last_fragment_time = None
-        self.last_stt_fragment = ""  # Reset fragment tracking for new question
-        self._user_stopped_speaking_at = None  # Reset pause-cooldown timer
-        self._stt_nudge_given = False  # Reset STT health-check nudge
-        self._first_vad_speaking_time = None  # Reset first-VAD tracker
-        self.encouragement_given = False  # Reset encouragement flag for new participant
-        self.question_repeated = False  # Reset repeat flag for new participant
-        self.relevance_prompt_given = False  # Reset relevance flag for new participant
-        self.partial_repeat_handled = False  # Reset partial repeat flag for new participant
-        self.already_answered_prompt_given = False  # Reset already-answered flag for new participant
-        self.accumulated_partial_answer = ""  # Clear any accumulated partial answers
-        self.turn_time_exceeded = False  # Reset turn time exceeded flag for new participant
-        self._ack_already_spoken = False  # Reset ack flag for new participant
-        self._prewarmed_ack_text = None  # Clear pre-warmed ack text
 
         # Clean up any existing turn monitoring from previous participant
         if self.turn_monitor_task:
@@ -3795,82 +4377,53 @@ class CommunityModeratorAgent(Agent):
             self.turn_monitor_task = None
         self.current_turn = None
 
-        # DYNAMIC VAD CONFIGURATION: Adjust silence threshold based on question type
-        # Reduced for faster response times while still allowing natural pauses
+        # DYNAMIC VAD CONFIGURATION: Same echo-hardened thresholds as first loop.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=0.8)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.8s (qualitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=1.2)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
             elif self.current_question_object.is_quantitative():
-                self.agent_session.vad.update_options(min_silence_duration=0.4)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.4s (quantitative question)")
+                self.agent_session.vad.update_options(min_silence_duration=0.6)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
             else:
-                self.agent_session.vad.update_options(min_silence_duration=0.5)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=0.5s (default)")
+                self.agent_session.vad.update_options(min_silence_duration=0.7)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.7s (default)")
 
-        # MULTI-PARTICIPANT FIX: Set who we're expecting to respond
-        self.expected_respondent = participant
-        self.actual_respondent = None  # Will be set when we detect audio activity
-        self.turn_transition_time = datetime.now()  # For spillover detection
-        self._set_delivery_state(self.current_question_num, participant, "delivering", context="move_to_next_participant")
-
-        logger.critical("=" * 80)
-        logger.critical(f"🔧 AUDIO ROUTING TRACE - Question #{self.current_question_num} to {participant}")
-
-        _respondent_count_move = self._active_respondent_count()
-        if _respondent_count_move > 1:
-            # MULTI-PARTICIPANT: Lock STT + mute others to prevent cross-talk
-            logger.critical(f"   {_respondent_count_move} active respondents — enabling STT lock")
-            if self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                room_io = self.agent_session._room_io
-                if hasattr(room_io, '_audio_input') and room_io._audio_input:
-                    audio_input = room_io._audio_input
-                    logger.critical(f"🎙️  EXECUTING set_participant('{participant}')...")
-                    try:
-                        audio_input.set_participant(participant)
-                        logger.critical(f"✅ STT set_participant('{participant}') — immediate")
-                    except Exception as e:
-                        logger.error(f"❌ EXCEPTION during set_participant: {e}")
-                        import traceback
-                        logger.error(traceback.format_exc())
-                else:
-                    logger.error(f"❌ audio_input not available! Cannot switch STT to {participant}")
-            else:
-                logger.error(f"❌ room_io not available! Cannot switch STT to {participant}")
-        else:
-            logger.critical(f"   {_respondent_count_move} active respondent — skipping STT lock (solo mode)")
-
-        # In observer mode: Keep STT on observer while speaking (to hear pause command)
-        if self.observer_mode_enabled:
-            # CRITICAL: Clear any pending STT transcripts from previous participant
-            # (Response is already saved to transcript/export, so this won't lose data)
-            self.pending_stt_transcript = None
-
-            observer_identity = self.participant_manager.get_observer_identity()
-            if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                try:
-                    audio_input = self.agent_session._room_io._audio_input
-                    if audio_input:
-                        audio_input.set_participant(observer_identity)
-                        logger.critical(f"👁️ STT set to observer while asking question (can hear pause)")
-                except Exception as e:
-                    logger.warning(f"Could not set STT to observer: {e}")
-
-        # Brief delay to let STT spillover from previous participant drain.
-        # Kept short (0.5s) because delivery-state guards already block stale transcripts.
-        if self._active_respondent_count() > 1:
-            logger.info(f"⏳ Waiting 0.5s for STT spillover to drain before speaking to {participant}")
-            await asyncio.sleep(0.5)
+        # MULTI-PARTICIPANT: Centralized audio routing (STT lock, spillover drain)
+        # skip_muting=True because muting is already kicked off earlier in this method
+        await self._route_audio_to_participant(participant, context="move_to_next_participant", skip_muting=True)
 
         # DIRECT TTS - Speak the question with truncation detection + retry.
-        # allow_interruptions_first=False because the new participant hasn't
-        # heard the question yet — no valid reason to allow interruptions.
-        await self._speak_question_safely(
+        # Change 1: retry_text omits participant name to avoid repeated name playback.
+        # Change 2: dedupe_key prevents re-speaking the same prompt.
+        # Change 4: _speak_question_safely now has 2 retries with backoff internally.
+        _dedupe = f"move_Q{self.current_question_num}_{participant}"
+        tts_fully_spoken = await self._speak_question_safely(
             exact_text_to_say,
-            context=f"move_Q{self.current_question_num}_{participant}",
+            retry_text=self.current_question,  # question body only, no name prefix
+            context=_dedupe,
             allow_interruptions_first=False,
+            dedupe_key=_dedupe,
         )
-        self._set_delivery_state(self.current_question_num, participant, "delivered", context="move_to_next_participant")
+
+        # Change 3: Use explicit delivery states
+        if tts_fully_spoken:
+            self._set_delivery_state(self.current_question_num, participant, "delivered_full", context="move_to_next_participant")
+        else:
+            self._set_delivery_state(self.current_question_num, participant, "delivered_partial", context="move_to_next_participant_partial_tts")
+            logger.warning(f"⚠️ Delivery partial — polling will proceed but timeout is suppressed")
+
+        # Adaptive post-TTS gate (same as ask_next_question)
+        _gate_start = asyncio.get_event_loop().time()
+        _gate_max = 1.5
+        while (asyncio.get_event_loop().time() - _gate_start) < _gate_max:
+            if not self.user_currently_speaking:
+                break
+            await asyncio.sleep(0.05)
+        _gate_elapsed = asyncio.get_event_loop().time() - _gate_start
+        if _gate_elapsed < _gate_max:
+            await asyncio.sleep(0.3)
+        logger.debug(f"⏳ Post-TTS gate complete ({_gate_elapsed:.2f}s VAD wait) — ready for response capture")
 
         if self._last_user_state == "away":
             logger.warning(
@@ -3881,654 +4434,76 @@ class CommunityModeratorAgent(Agent):
 
         # Check if paused during the question
         if self.survey_state == SurveyState.PAUSED:
-            logger.info("👁️ Survey paused during question - waiting for resume")
+            logger.info("Survey paused during question (2nd) - waiting for resume")
             while self.survey_state == SurveyState.PAUSED:
                 await asyncio.sleep(0.5)
-            logger.info("👁️ Survey resumed - continuing with response collection")
+            logger.info("Survey resumed - continuing with response collection")
 
-        logger.critical("=" * 80)
-        logger.critical(f"✅ Question spoken via DIRECT TTS (0% LLM involvement)")
+        logger.critical(f"Question #{self.current_question_num} spoken for next participant via DIRECT TTS")
 
-        # Calculate max polling time: Must be longer than max turn duration to allow graceful time management
-        # Max turn duration = base + first_grace + second_grace + buffer
+        # ── Phase 1: Event-driven response capture (2nd method) ──
         max_turn_time = self.max_turn_duration + self.first_interrupt_grace + self.second_interrupt_grace
-        polling_timeout = max_turn_time + 10  # Add 10s buffer for silence detection and processing
-        max_checks = int(polling_timeout / 0.1)  # Convert to number of 0.1s checks
+        polling_timeout = max_turn_time + 10
 
-        logger.critical(f"⏳ SMART POLLING: Waiting for user response (max {polling_timeout}s)...")
-        logger.critical(f"   - Max turn duration: {max_turn_time}s (base={self.max_turn_duration}s + graces={self.first_interrupt_grace + self.second_interrupt_grace}s)")
-        logger.critical(f"   - Polling timeout: {polling_timeout}s (turn + 10s buffer)")
-
-        # Initialize timeout monitoring variables
-        self.waiting_for_response = True
-        self.last_speech_time = None
-
-        # Start timeout monitoring task (will prompt after 10s, move on after 20s)
-        if self.response_timeout_task:
-            self.response_timeout_task.cancel()
-        self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+        # Start turn monitoring
+        self.current_turn = TurnInfo(
+            participant_identity=participant,
+            start_time=datetime.now(),
         )
-        logger.info(f"⏱️  Started timeout monitoring for {participant} (prompt at 10s, skip at 20s)")
+        self.turn_monitor_task = asyncio.create_task(
+            self.monitor_turn_duration(self.agent_session)
+        )
 
-        # SMART POLLING: Same as in ask_next_question()
+        question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
+        question_context = f"Q#{self.current_question_num} ({question_id})"
+
+        response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
+
+        if response_text == "PAUSED":
+            return
+
         user_responded = False
-        initial_user_msg_count = len([item for item in self.agent_session._chat_ctx.items
-                                       if hasattr(item, 'role') and item.role == 'user'])
+        if response_text:
+            logger.critical(f"[{question_context}] Response CAPTURED (2nd): {len(response_text)} chars")
 
-        import time as _time
-        self._polling_deadline = _time.time() + polling_timeout
+            while response_text:
+                result = await self._process_captured_response(
+                    participant, response_text, question_context)
 
-        for check_num in range(max_checks * 3):  # generous upper bound; deadline is the real limiter
-            await asyncio.sleep(0.1)  # Fast 100ms polling — trust VAD for silence
-
-            if _time.time() > self._polling_deadline:
-                # Safety: never timeout while user is speaking or gentle warning is active
-                if self.user_currently_speaking or self._gentle_warning_in_progress:
-                    self._polling_deadline = _time.time() + 5
-                    logger.debug(f"⏱️  Deadline reached but user still speaking/warning active — extending 5s (2nd loop)")
-                    continue
-                if self.latest_user_response is not None:
-                    logger.info(f"⏱️  Deadline reached but STT fragments exist — processing instead of timing out (2nd loop)")
+                if result == "accepted" or result == "move_on":
+                    self._record_response_to_exports(participant, response_text, question_id)
+                    user_responded = True
+                    break
+                elif result == "retry":
+                    response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
+                    if response_text == "PAUSED":
+                        return
+                    if response_text is None:
+                        break
                 else:
-                    logger.warning(f"⏱️  Polling deadline reached ({polling_timeout}s effective)")
                     break
 
-            # TIMEOUT MONITOR SIGNAL: break early when monitor confirms no-response
-            if not self.waiting_for_response:
-                logger.warning(f"⏱️  Timeout monitor signaled no-response — exiting poll early (2nd loop)")
-                break
-
-            # OBSERVER COMMAND CHECK: Periodically switch STT to observer to hear pause/resume commands
-            if self.observer_mode_enabled and check_num % 20 == 10:  # Every ~2 seconds
-                observer_identity = self.participant_manager.get_observer_identity()
-                if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                    try:
-                        audio_input = self.agent_session._room_io._audio_input
-                        if audio_input:
-                            audio_input.set_participant(observer_identity)
-                            logger.debug(f"👁️ STT briefly switched to observer for command check")
-                            await asyncio.sleep(0.3)
-                            if self.survey_state != SurveyState.PAUSED:
-                                audio_input.set_participant(participant)
-                    except Exception as e:
-                        logger.warning(f"Observer command check failed: {e}")
-
-            # CRITICAL: Check if survey was paused by observer - wait until resumed
-            if self.survey_state == SurveyState.PAUSED:
-                logger.info(f"👁️ Survey PAUSED during response polling - waiting for resume")
-                observer_identity = self.participant_manager.get_observer_identity()
-                if observer_identity and self.agent_session and hasattr(self.agent_session, '_room_io') and self.agent_session._room_io:
-                    try:
-                        audio_input = self.agent_session._room_io._audio_input
-                        if audio_input:
-                            audio_input.set_participant(observer_identity)
-                            logger.info(f"👁️ STT set to observer for 'resume' command")
-                    except Exception as e:
-                        logger.warning(f"Could not set STT to observer: {e}")
-                while self.survey_state == SurveyState.PAUSED:
-                    await asyncio.sleep(0.5)
-                logger.info(f"👁️ Survey RESUMED - continuing response polling")
-                # After resume, the question will be re-asked via handle_observer_command
-                # Exit this polling loop to avoid duplicate processing
-                return
-
-            # GENTLE WARNING GUARD (2nd loop): While the turn monitor is speaking
-            # the wrap-up warning, do NOT capture or process responses.
-            if self._gentle_warning_in_progress:
-                if check_num % 20 == 0:
-                    logger.info(f"⏳ Gentle warning in progress — holding response capture (check {check_num}, 2nd loop)")
-                continue
-
-            # CRITICAL: If user is currently speaking, don't process yet - wait for them to finish!
-            if self.user_currently_speaking:
-                if check_num % 20 == 0:  # Log every ~2 seconds while waiting
-                    logger.info(f"⏳ User is speaking... waiting for them to finish (check {check_num})")
-                continue  # Skip to next check, don't process response yet
-
-            # STT HEALTH CHECK (2nd loop): same logic as first loop
-            if (self.latest_user_response is None
-                and not self.response_captured
-                and not self._stt_nudge_given
-                and self._first_vad_speaking_time is not None
-                and not self.user_currently_speaking):
-                since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
-                if since_first_vad > 15:
-                    self._stt_nudge_given = True
-                    display_name = self.participant_manager.get_display_name(participant)
-                    nudge_text = (
-                        f"I'm sorry {display_name}, I couldn't quite hear you. "
-                        f"Could you please repeat that a bit louder?"
-                    )
-                    logger.warning(
-                        f"⚠️ STT HEALTH CHECK (2nd loop): VAD detected speech "
-                        f"{since_first_vad:.0f}s ago but no STT transcripts "
-                        f"received for {participant}! Nudging participant."
-                    )
-                    await self.agent_session.say(nudge_text, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(nudge_text)
-
-            # PAUSE COOLDOWN (2nd loop): Same as first loop — wait after the user
-            # stops speaking to tolerate "uhh" / "umm" mid-thought pauses.
-            if (self.latest_user_response is not None
-                and not self.user_currently_speaking
-                and not self.turn_time_exceeded
-                and self._user_stopped_speaking_at is not None):
-                pause_cooldown = 1.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
-                since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
-                if since_stopped < pause_cooldown:
-                    continue
-
-            # Trust VAD + STT events: proceed immediately once response is
-            # captured and the user has stopped speaking.
-            if self.latest_user_response is not None and not self.user_currently_speaking:
-                self._silence_confirmed_time = datetime.now()
-
-                # FOUND USER RESPONSE VIA EVENT!
-                question_context = f"Q#{self.current_question_num} ({self.current_question_object.id if self.current_question_object else 'N/A'})"
-                elapsed_time = (check_num + 1) * 0.1
-
-                # ── Delivery-state double-check at acceptance ──
-                if not self._is_delivery_confirmed(self.current_question_num, participant):
-                    _ds_key = self._delivery_key(self.current_question_num, participant)
-                    _ds = self.question_delivery_state.get(_ds_key, "unknown")
-                    logger.warning(
-                        f"🛡️ DELIVERY GUARD (polling-accept-2nd): Discarding response — "
-                        f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
-                    )
-                    # #region agent log
-                    import json as _json
-                    with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                        _f.write(_json.dumps({"location": "moderator_agent.py:move_to_next:polling_accept_guard", "message": "Polling acceptance blocked by delivery guard (2nd loop)", "data": {"delivery_state": _ds, "participant": participant, "question_num": self.current_question_num, "response": str(self.latest_user_response)[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_POLL_GUARD"}) + "\n")
-                    # #endregion
-                    self.latest_user_response = None
-                    self.pending_stt_transcript = None
-                    self.response_captured = False
-                    continue
-
-                # Snapshot the captured response into a local so that a concurrent
-                # gentle-warning reset (which clears self.latest_user_response)
-                # cannot cause a NoneType crash downstream.
-                _captured_response_text: str = self.latest_user_response
-
-                logger.critical(f"✅ [{question_context}] Response CAPTURED via EVENT (elapsed: {elapsed_time}s from question)")
-                logger.critical(f"📝 [{question_context}] Final response: {len(_captured_response_text)} chars")
-                logger.critical(f"   Text: '{_captured_response_text}'")
-
-                # CHECK FOR "I DON'T KNOW" RESPONSES - Encourage participant to try again (2nd polling loop)
-                logger.critical(f"🔍 [{question_context}] CHECKING FOR UNCERTAIN RESPONSE (2nd loop)...")
-                logger.critical(f"   Response text: '{_captured_response_text}'")
-                logger.critical(f"   encouragement_given flag: {self.encouragement_given}")
-                is_uncertain = is_uncertain_response(_captured_response_text)
-                logger.critical(f"   is_uncertain_response() returned: {is_uncertain}")
-
-                if is_uncertain:
-                    if not self.encouragement_given:
-                        # First "I don't know" - encourage them to try
-                        self.encouragement_given = True
-                        logger.info(f"🤔 [{question_context}] Detected uncertain response (2nd loop), encouraging participant to try again")
-
-                        # IMPORTANT: Log the initial uncertain response BEFORE encouragement
-                        responder = self.actual_respondent if self.actual_respondent else participant
-                        self.survey_transcript.add_response(
-                            question_number=self.current_question_num,
-                            participant=responder,
-                            response_text=f"[Initial uncertain response before encouragement] {_captured_response_text}"
-                        )
-                        logger.info(f"📝 Logged uncertain response before encouragement (2nd loop): '{_captured_response_text[:100]}...'")
-
-                        # Get participant name for personalized encouragement
-                        speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-
-                        # Encouraging message - varies based on question type
-                        if self.current_question_object and self.current_question_object.is_qualitative():
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"There's no right or wrong answer here. "
-                                f"Feel free to share whatever comes to mind, even if it's just a quick thought."
-                            )
-                        else:
-                            encouragement = (
-                                f"Are you sure, {speaker_name}? "
-                                f"Take a moment to think about it. "
-                                f"Any answer you give is valuable."
-                            )
-
-                        # Say encouragement via TTS
-                        await self.agent_session.say(encouragement, allow_interruptions=False)
-                        self.survey_transcript.add_acknowledgment(encouragement)
-                        logger.info(f"🔊 Encouraged participant: '{encouragement}'")
-
-                        # Reset response capture to wait for new response
-                        self.latest_user_response = None
-                        self.response_captured = False
-                        self.last_stt_fragment = ""
-
-                        # CRITICAL FIX: Reset turn duration monitoring to prevent time warning after encouragement
-                        if self.turn_monitor_task:
-                            self.turn_monitor_task.cancel()
-                            self.turn_monitor_task = None
-
-                        # Reset speech timing
-                        self.user_currently_speaking = False
-                        self.turn_time_exceeded = False
-
-                        # Restart turn monitor for the new response
-                        self.current_turn = TurnInfo(
-                            participant_identity=participant,
-                            start_time=datetime.now(),
-                        )
-                        self.turn_monitor_task = asyncio.create_task(
-                            self.monitor_turn_duration(self.agent_session)
-                        )
-                        logger.info(f"🔄 Reset turn monitoring after encouragement (2nd loop)")
-                        logger.info(f"⏱️  Restarted turn monitor for {participant}")
-
-                        # Continue polling for their new response
-                        logger.info(f"⏳ Waiting for new response after encouragement...")
-                        continue
-                    else:
-                        # Already encouraged once - accept the "I don't know" response
-                        logger.info(f"🤷 [{question_context}] Participant still uncertain after encouragement (2nd loop), accepting response")
-
-                # ============================================================
-                # DETERMINISTIC REPEAT PRE-CHECK (before LLM) - 2nd polling loop
-                # ============================================================
-                speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                if is_repeat_request(_captured_response_text) and not self.question_repeated:
-                    self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] HEURISTIC repeat detected (2nd loop) — skipping LLM, repeating question")
-
-                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
-                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
-                    await self.agent_session.say(self.current_question, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated question (heuristic, 2nd loop): '{self.current_question[:100]}...'")
-
-                    self._reset_for_repeat(participant, context="heuristic_repeat_2nd_loop")
-                    continue
-
-                # ============================================================
-                # UNIFIED RESPONSE ANALYSIS (LLM-based) - 2nd polling loop
-                # Checks: repeat request, partial answer, already-answered claim, relevance
-                # ============================================================
-                question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
-                response_to_analyze = _captured_response_text
-
-                # PARTIAL REPEAT FIX: If we already handled a partial repeat, combine the earlier partial answer
-                # with the new response BEFORE analysis. This ensures relevance check sees the full combined answer.
-                if self.partial_repeat_handled and self.accumulated_partial_answer:
-                    response_to_analyze = f"{self.accumulated_partial_answer} {_captured_response_text}"
-                    logger.info(f"📝 [{question_context}] Combined partial + new response for analysis (2nd loop): '{response_to_analyze[:100]}...'")
-
-                logger.info(f"🔍 [{question_context}] Running unified response analysis (2nd loop)...")
-                survey_desc = self.question_loader.survey_meta.description if self.question_loader and self.question_loader.survey_meta else ""
-
-                # IMMEDIATE ACK: Fire acknowledgment NOW so the user hears
-                # feedback within ~1s.  The LLM analysis runs concurrently;
-                # if it discovers an issue the correction follows naturally.
-                _ack_speaker = (self.actual_respondent if self.actual_respondent else participant).capitalize()
-                self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
-                _ack_handle = self.agent_session.say(self._prewarmed_ack_text, allow_interruptions=False)
-                self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
-                self._ack_already_spoken = True
-                self._transition_filler_said = True  # ack replaces the "One moment…" filler
-                logger.info(f"🗣️ Immediate ack fired (async, 2nd loop): '{self._prewarmed_ack_text}'")
-
-                if hasattr(self, '_response_processing_start') and self._response_processing_start:
-                    _latency = (datetime.now() - self._response_processing_start).total_seconds()
-                    logger.critical(f"⏱️  LATENCY TRACKING: Response-to-Speech latency = {_latency:.2f}s")
-                    logger.info(f"📊 METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
-
-                # LLM analysis runs while the ack TTS is playing
-                analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
-
-                # Ensure ack finishes before any follow-up correction
-                await _ack_handle
-
-                logger.info(f"📊 [{question_context}] Analysis result: relevant={analysis.is_relevant}, repeat_request={analysis.is_repeat_request}, already_answered={analysis.is_already_answered_claim}, partial_status={analysis.partial_repeat_status}")
-
-                # --- CHECK 1: PARTIAL ANSWER + REPEAT REQUEST ---
-                if analysis.partial_repeat_status == "PARTIAL" and not self.partial_repeat_handled:
-                    self.partial_repeat_handled = True
-                    logger.info(f"📝 [{question_context}] Partial answer detected with repeat request (2nd loop)")
-
-                    # Store partial answer for later combination with final response
-                    self.accumulated_partial_answer = analysis.partial_answer
-                    logger.info(f"💾 Stored partial answer: '{self.accumulated_partial_answer[:100]}...'")
-
-                    # Acknowledge and repeat ONLY unanswered parts
-                    partial_intro = f"Got it, {speaker_name}. Let me repeat the rest of the question."
-                    await self.agent_session.say(partial_intro, allow_interruptions=False)
-
-                    # Speak only the unanswered sub-questions verbatim
-                    await self.agent_session.say(analysis.unanswered_questions, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated unanswered parts: '{analysis.unanswered_questions[:100]}...'")
-
-                    # Reset for new response (but keep accumulated_partial_answer)
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.encouragement_given = False
-
-                    # Reset timeout/turn monitoring
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset timing after partial repeat (2nd loop), waiting for remaining answer...")
-                    continue
-
-                # --- CHECK 2: "ALREADY ANSWERED" CLAIM ---
-                if analysis.is_already_answered_claim and not self.already_answered_prompt_given:
-                    self.already_answered_prompt_given = True
-                    logger.info(f"📢 [{question_context}] 'Already answered' claim detected (2nd loop), asking to rephrase")
-
-                    # IMPORTANT: Log the original response BEFORE asking for rephrase
-                    # This ensures we capture what participant said even if they just claim "already answered"
-                    self.survey_transcript.add_response(
-                        question_number=self.current_question_num,
-                        participant=participant,
-                        response_text=f"[Initial response before rephrase request] {_captured_response_text}"
-                    )
-                    logger.info(f"📝 Logged initial response before rephrase (2nd loop): '{_captured_response_text[:100]}...'")
-
-                    rephrase_prompt = (
-                        f"I appreciate that, {speaker_name}, but I may not have captured your response correctly. "
-                        f"Could you please rephrase or elaborate on your answer? "
-                        f"This helps ensure we have your thoughts recorded accurately."
-                    )
-
-                    await self.agent_session.say(rephrase_prompt, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(rephrase_prompt)
-                    logger.info(f"🔊 Asked to rephrase: '{rephrase_prompt}'")
-
-                    # Reset for new response
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-
-                    # Reset timeout/turn monitoring
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset timing after already-answered prompt (2nd loop), waiting for new response...")
-                    continue
-
-                # --- CHECK 3: FULL REPEAT REQUEST (no partial answer) ---
-                # A pure repeat request is a control utterance, not an answer.
-                # Always honour it regardless of how many times the user asks.
-                is_full_repeat = analysis.is_repeat_request or (analysis.partial_repeat_status == "REPEAT_ONLY")
-                if is_full_repeat:
-                    self.question_repeated = True
-                    logger.info(f"🔁 [{question_context}] Participant requested to repeat the question (2nd loop, LLM-confirmed)")
-
-                    repeat_intro = f"Of course, {speaker_name}. I'll repeat the question."
-                    await self.agent_session.say(repeat_intro, allow_interruptions=False)
-
-                    await self.agent_session.say(self.current_question, allow_interruptions=True)
-                    logger.info(f"🔊 Repeated question: '{self.current_question[:100]}...'")
-
-                    self._reset_for_repeat(participant, context="llm_repeat_2nd_loop")
-                    continue
-
-                # --- CHECK 4: OFF-TOPIC/IRRELEVANT RESPONSE ---
-                if not analysis.is_relevant and not self.relevance_prompt_given:
-                    self.relevance_prompt_given = True
-                    logger.info(f"📢 [{question_context}] Off-topic response detected (2nd loop), asking for relevant answer")
-
-                    # IMPORTANT: Log the off-topic response BEFORE asking for relevant answer
-                    responder = self.actual_respondent if self.actual_respondent else participant
-                    self.survey_transcript.add_response(
-                        question_number=self.current_question_num,
-                        participant=responder,
-                        response_text=f"[Initial off-topic response] {_captured_response_text}"
-                    )
-                    logger.info(f"📝 Logged off-topic response (2nd loop): '{_captured_response_text[:100]}...'")
-
-                    relevance_prompt = (
-                        f"Thank you {speaker_name}, but I don't think you quite answered the question. "
-                        f"I may be wrong, but I'm going to repeat the question and would you mind answering again after I'm done repeating it?"
-                    )
-
-                    await self.agent_session.say(relevance_prompt, allow_interruptions=False)
-                    self.survey_transcript.add_acknowledgment(relevance_prompt)
-                    logger.info(f"🔊 Asked for relevant response: '{relevance_prompt}'")
-
-                    question_text = self.current_question_object.question if self.current_question_object else ""
-                    if question_text:
-                        await self.agent_session.say(question_text, allow_interruptions=False)
-                        logger.info(f"🔊 Repeated question after off-topic: '{question_text[:60]}...'")
-
-                    # RESET ALL TIMING AND MONITORING
-                    self.latest_user_response = None
-                    self.response_captured = False
-                    self.last_stt_fragment = ""
-                    self.encouragement_given = False
-                    self.question_repeated = False
-
-                    self.waiting_for_response = True
-                    self.last_speech_time = None
-                    if self.response_timeout_task:
-                        self.response_timeout_task.cancel()
-                    self.response_timeout_task = asyncio.create_task(
-                        self.monitor_response_timeout(participant)
-                    )
-                    if self.turn_monitor_task:
-                        self.turn_monitor_task.cancel()
-                        self.turn_monitor_task = None
-                    self.user_currently_speaking = False
-                    self.current_speaking_duration = 0.0
-                    self.accumulated_pause_duration = 0.0
-                    self.turn_time_exceeded = False
-                    self.current_turn = TurnInfo(
-                        participant_identity=participant,
-                        start_time=datetime.now(),
-                    )
-                    self.turn_monitor_task = asyncio.create_task(
-                        self.monitor_turn_duration(self.agent_session)
-                    )
-                    logger.info(f"🔄 Reset all timing/monitoring after relevance prompt (2nd loop)")
-                    logger.info(f"⏳ Waiting for relevant response...")
-                    continue
-
-                # ============================================================
-                # COMBINE PARTIAL ANSWERS (if any) WITH FINAL RESPONSE - 2nd loop
-                # ============================================================
-                if self.accumulated_partial_answer:
-                    combined_response = f"{self.accumulated_partial_answer} {_captured_response_text}"
-                    logger.info(f"📝 [{question_context}] Combined partial + final response (2nd loop): '{combined_response[:100]}...'")
-                    _captured_response_text = combined_response
-                    self.latest_user_response = combined_response
-                    self.accumulated_partial_answer = ""  # Clear after combining
-
-                # Get question details
-                question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
-                question_text = self.current_question_object.question if self.current_question_object else ""
-                response_options = self.current_question_object.response_options if self.current_question_object else []
-
-                # MULTI-PARTICIPANT FIX: Determine WHO actually spoke
-                actual_speaker = self.actual_respondent if self.actual_respondent else participant
-
-                # Validation: Check if the right person responded
-                if self.actual_respondent and self.actual_respondent != participant:
-                    logger.warning(f"⚠️  MISMATCH: Expected {participant} to respond, but {self.actual_respondent} spoke!")
-                    logger.info(f"✅ ACCEPTING response from {self.actual_respondent} (being permissive, not kicking)")
-
-                logger.critical(f"👤 Response from: {actual_speaker} (expected: {participant})")
-
-                # Record in survey transcript (JSON) with ACTUAL speaker
-                self.survey_transcript.add_response(
-                    question_number=self.current_question_num,
-                    participant=actual_speaker,
-                    response_text=_captured_response_text
-                )
-                logger.critical(f"✅ Response logged to JSON: Q#{self.current_question_num}, {actual_speaker}")
-
-                # Add to CSV DataFrame for analysis with ACTUAL speaker
-                self.survey_data_export.add_response(
-                    participant=actual_speaker,
-                    question_number=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    response_options=response_options,
-                    response_text=_captured_response_text
-                )
-                logger.critical(f"✅ Response added to CSV DataFrame: Q#{self.current_question_num}")
-
-                # Mark ACTUAL participant as answered (not the expected one)
-                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="response_received")
-                logger.info(f"✅ Marked {actual_speaker} as answered for question #{self.current_question_num}")
-
-                # Record turn result for acknowledgment (immutable snapshot)
-                self._record_turn_result(expected=participant, actual=actual_speaker)
-
-                # Cancel timeout monitoring since we got a response
-                self.waiting_for_response = False
-                if self.response_timeout_task:
-                    self.response_timeout_task.cancel()
-                    self.response_timeout_task = None
-
-                # Clear the variable
-                self.latest_user_response = None
-
-                user_responded = True
-                break
-
-        # Last-resort rescue (2nd loop): if polling exited but we have STT
-        # fragments, treat them as the response instead of recording a timeout.
-        if not user_responded and self.latest_user_response:
-            _rescued = self.latest_user_response.strip()
-            if _rescued:
-                logger.info(f"🛟 Rescuing captured STT fragments as response (2nd loop): '{_rescued[:100]}...'")
-                question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
-                actual_speaker = self.actual_respondent if self.actual_respondent else participant
-                self.survey_transcript.add_response(
-                    question_number=self.current_question_num,
-                    participant=actual_speaker,
-                    response_text=_rescued,
-                )
-                logger.critical(f"✅ Response logged to JSON (rescued, 2nd loop): Q#{self.current_question_num}, {actual_speaker}")
-                question_text = self.current_question_object.question if self.current_question_object else ""
-                response_options = self.current_question_object.response_options if self.current_question_object else []
-                self.survey_data_export.add_response(
-                    participant=actual_speaker,
-                    question_number=self.current_question_num,
-                    question_id=question_id,
-                    question_text=question_text,
-                    response_options=response_options,
-                    response_text=_rescued,
-                )
-                logger.critical(f"✅ Response added to CSV DataFrame (rescued, 2nd loop): Q#{self.current_question_num}")
-                self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, actual_speaker, "answered", context="rescued_after_deadline_2nd")
-                self._record_turn_result(expected=participant, actual=actual_speaker)
-                self.latest_user_response = None
-                user_responded = True
-
         if not user_responded:
-            logger.warning(f"⏱️  Max wait time reached ({polling_timeout}s), no response detected (2nd loop)")
+            logger.warning(f"Max wait time reached ({polling_timeout}s), no response detected (2nd)")
 
-            # Audible acknowledgment so the user knows the system is still alive
             try:
                 display_name = self.participant_manager.get_display_name(participant) if self.participant_manager else ""
-                timeout_msg = f"I didn't catch a response, {display_name}. Let me move on." if display_name else "I didn't catch a response. Let me move on."
+                timeout_msg = f"I didn\'t catch a response, {display_name}. Let me move on." if display_name else "I didn\'t catch a response. Let me move on."
                 await self.agent_session.say(timeout_msg, allow_interruptions=False)
                 self.survey_transcript.add_acknowledgment(timeout_msg)
             except Exception as e:
                 logger.warning(f"Could not speak timeout message: {e}")
 
-            # Record timeout/no-response in ALL outputs so question is not lost
-            question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
-            question_text = self.current_question_object.question if self.current_question_object else ""
-            response_options = self.current_question_object.response_options if self.current_question_object else []
-            timeout_marker = "[NO RESPONSE - TIMEOUT]"
+            self._record_timeout_to_exports(participant, question_id)
 
-            # Log to STT debug logger (for comparison report)
-            self.stt_debug_logger.log_question_response(
-                question_num=self.current_question_num,
-                question_id=question_id,
-                question_text=question_text,
-                participant=participant,
-                raw_transcript=timeout_marker,
-                corrected_response=timeout_marker,
-                response_options=response_options,
-                expected_respondent=participant
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in STT debug log")
-
-            # Record in survey transcript (JSON) with timeout marker
-            self.survey_transcript.add_response(
-                question_number=self.current_question_num,
-                participant=participant,
-                response_text=timeout_marker
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in JSON transcript")
-
-            # Add to CSV DataFrame with timeout marker
-            self.survey_data_export.add_response(
-                participant=participant,
-                question_number=self.current_question_num,
-                question_id=question_id,
-                question_text=question_text,
-                response_options=response_options,
-                response_text=timeout_marker
-            )
-            logger.info(f"📝 Recorded timeout for Q#{self.current_question_num} in CSV DataFrame")
-
-            # Only count timeout as answered if question delivery was confirmed.
-            if self._is_delivery_confirmed(self.current_question_num, participant):
-                self.participant_manager.mark_participant_answered(participant, self.current_question_num)
-                self._set_delivery_state(self.current_question_num, participant, "timeout", context="timeout_after_delivery")
-            else:
-                logger.warning(
-                    f"Skipping answered-mark on timeout for {participant}: delivery was not confirmed; requeueing."
-                )
-                self._register_missing_participant_for_retry(participant, context="timeout_without_delivery")
-
-            # FIX: Record turn result for timeout (was MISSING — caused stale-name acks)
-            self._record_turn_result(expected=participant, actual=participant, was_timeout=True)
-
-        # Stop turn duration monitoring (response captured or timeout)
+        # Stop turn duration monitoring
         if self.turn_monitor_task:
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
         self.current_turn = None
-        logger.info("✅ Stopped turn duration monitoring (response captured or timeout)")
 
-        # After response (or timeout), call move_to_next_participant to continue flow
-        await self.move_to_next_participant()
+        # After response (or timeout), continue the survey loop
+        return "move"
 
     def get_moderation_report(self) -> Dict[str, Any]:
         """
@@ -4746,6 +4721,7 @@ async def create_moderator_session(
             "language": "en-US",  # Explicit language for better accuracy
             "punctuate": True,  # Add punctuation - helps with sentence structure
             "smart_format": True,  # Format numbers, dates, currency for readability
+            "endpointing_ms": 500,  # Wait 500ms of silence before finalizing transcript (default 25ms is too aggressive)
         }
 
         # Add keyterms if available (supported by Nova-3 AND Flux)
@@ -4853,18 +4829,38 @@ async def create_moderator_session(
             voice=tts_voice,
         )
 
-    # Configure VAD with:
-    # - Lower activation_threshold (0.35) for better detection of speech during TTS playback
-    #   (helps detect observer "pause" commands even with echo cancellation)
-    # - Middle-ground silence duration (1.5s) - will be dynamically adjusted per question:
-    #   - Quantitative: 0.8s (fast response for short answers)
-    #   - Qualitative: 2.5s (allow natural pauses for long explanations)
+    # Configure VAD with echo-barge-in prevention:
+    #
+    # activation_threshold=0.5 (Silero default)
+    #   Previous value 0.35 was too sensitive — the agent's own TTS leaked
+    #   through BVC echo cancellation and was classified as user speech,
+    #   causing the moderator to stutter or stop mid-sentence.  0.5 requires
+    #   higher confidence before firing, filtering out residual echo while
+    #   still detecting normal-volume speech reliably.
+    #
+    # min_speech_duration=0.15s
+    #   Raised from 0.1s.  Brief echo spikes from TTS playback are typically
+    #   50-120ms; requiring 150ms of sustained speech avoids false triggers
+    #   from echo remnants while still being responsive to real speech.
+    #
+    # prefix_padding_duration=0.6s
+    #   Slightly above default 0.5s.  Gives BVC an extra 100ms to suppress
+    #   echo before the buffered audio reaches the VAD decision window.
+    #
+    # min_silence_duration=0.55s (Silero default)
+    #   Base value; dynamically adjusted per question type before each turn.
+    #   Previous 0.4s was too aggressive during agent TTS — brief pauses
+    #   between words fired end-of-speech prematurely.
     vad_instance = silero.VAD.load(
-        min_silence_duration=0.4,      # VAD-level silence threshold; polling trusts this directly
-        min_speech_duration=0.1,       # Minimum speech duration to trigger (default: 0.05s)
-        activation_threshold=0.35,     # Lower than default 0.5 for better sensitivity to soft speech/observer commands
+        min_silence_duration=0.55,
+        min_speech_duration=0.15,
+        prefix_padding_duration=0.6,
+        activation_threshold=0.5,
     )
-    logger.info("VAD configured: min_silence_duration=0.4s, activation_threshold=0.35 (sensitive for observer commands)")
+    logger.info(
+        "VAD configured: min_silence=0.55s, min_speech=0.15s, "
+        "prefix_pad=0.6s, activation=0.5 (echo-barge-in hardened)"
+    )
 
     session = AgentSession(
         stt=stt_instance,
@@ -4875,6 +4871,9 @@ async def create_moderator_session(
         tts=tts_instance,
         vad=vad_instance,
         turn_detection="server_vad",  # Enable turn detection for event handling (FIXED: was "manual")
+        allow_interruptions=True,               # Session default; per-call overrides for warnings/acks
+        min_interruption_duration=0.5,          # Min user speech to trigger interrupt
+        discard_audio_if_uninterruptible=True,  # Drop user audio during non-interruptible TTS
     )
 
     # Set up room event handlers for participant management BEFORE starting session
@@ -4895,6 +4894,11 @@ async def create_moderator_session(
             logger.info(f"Skipping agent participant (by identity): {participant.identity}")
             return
 
+        # Skip avatar — it is not a survey participant
+        if moderator._is_avatar_identity(participant.identity):
+            logger.info(f"AVATAR_LIFECYCLE participant_connected skipped for avatar: {participant.identity}")
+            return
+
         logger.info(f"Participant connected: {participant.identity} (name: {participant.name})")
         if moderator.participant_manager:
             # Pass both identity and display name from LiveKit token
@@ -4905,8 +4909,15 @@ async def create_moderator_session(
 
     @ctx.room.on("track_published")
     def on_track_published(publication, participant):
-        """Subscribe to audio tracks from all participants (including late joiners)."""
+        """Subscribe to audio tracks from all participants (including late joiners).
+        Skip avatar tracks — we do not want STT/moderation logic on avatar audio."""
         from livekit.rtc import TrackKind
+
+        # Never subscribe STT to avatar audio tracks
+        if moderator._is_avatar_identity(participant.identity):
+            logger.info(f"AVATAR_LIFECYCLE track_published skipped for avatar: {participant.identity} (kind={publication.kind})")
+            return
+
         logger.critical(f"🔥 TRACK_PUBLISHED EVENT: {participant.identity}, kind={publication.kind}, sid={publication.sid}")
         if publication.kind == TrackKind.KIND_AUDIO:
             logger.critical(f"🎤 Audio track published by {participant.identity}, subscribing...")
@@ -4917,52 +4928,49 @@ async def create_moderator_session(
 
     @ctx.room.on("track_unmuted")
     def on_track_unmuted(publication, participant):
-        """Track when a participant starts speaking (unmutes their audio)."""
+        """Track when a participant starts speaking (unmutes their audio).
+        Skip avatar — must never be treated as actual_respondent."""
         from livekit.rtc import TrackKind
+
+        identity = getattr(participant, 'identity', None)
+        if identity is None:
+            identity = getattr(getattr(publication, 'participant', None), 'identity', None)
+        if identity is None:
+            logger.debug(f"track_unmuted: could not resolve participant identity, skipping")
+            return
+
+        if moderator._is_avatar_identity(identity):
+            return  # Avatar unmute is irrelevant to survey logic
+
         if publication.kind == TrackKind.KIND_AUDIO:
-            logger.critical(f"🎙️  AUDIO ACTIVE: {participant.identity} unmuted (track: {publication.sid})")
-            moderator.participant_audio_activity[participant.identity] = datetime.now()
-            moderator.actual_respondent = participant.identity
+            logger.critical(f"🎙️  AUDIO ACTIVE: {identity} unmuted (track: {publication.sid})")
+            moderator.participant_audio_activity[identity] = datetime.now()
+            moderator.actual_respondent = identity
             moderator.active_speaker_track_sid = publication.sid
 
     @ctx.room.on("track_muted")
     def on_track_muted(publication, participant):
         """Track when a participant stops speaking (mutes their audio)."""
         from livekit.rtc import TrackKind
+
+        identity = getattr(participant, 'identity', None)
+        if identity is None:
+            identity = getattr(getattr(publication, 'participant', None), 'identity', None)
+        if identity is None:
+            logger.debug(f"track_muted: could not resolve participant identity, skipping")
+            return
+
+        if moderator._is_avatar_identity(identity):
+            return  # Avatar mute is irrelevant to survey logic
+
         if publication.kind == TrackKind.KIND_AUDIO:
-            logger.info(f"🔇 Audio muted: {participant.identity} (track: {publication.sid})")
+            logger.info(f"🔇 Audio muted: {identity} (track: {publication.sid})")
             # Don't clear actual_respondent yet - we might still get STT results
 
-    # Anam AI Avatar integration
-    anam_avatar_id = os.environ.get("ANAM_AVATAR_ID")
-    if ANAM_AVAILABLE and anam_avatar_id:
-        logger.info(f"Initializing Anam AI avatar with ID: {anam_avatar_id}")
-        try:
-            avatar = anam.AvatarSession(
-                persona_config=anam.PersonaConfig(
-                    name="Survey Moderator Avatar",
-                    avatarId=anam_avatar_id,
-                ),
-            )
-            await avatar.start(session, room=ctx.room)
-            logger.info("Anam AI avatar started successfully")
-        except Exception as e:
-            logger.warning(
-                "Anam avatar failed to start (agent will run without avatar): %s",
-                e,
-                exc_info=False,
-            )
-            logger.warning(
-                "Check that ANAM_AVATAR_ID exists in your Anam Lab account and matches the API key. "
-                "See https://lab.anam.ai/avatars or the Anam avatar gallery for valid IDs."
-            )
-    else:
-        if not ANAM_AVAILABLE:
-            logger.info("Anam plugin not installed, running without avatar")
-        elif not anam_avatar_id:
-            logger.info("ANAM_AVATAR_ID not set, running without avatar")
-
-    # Start the session with the agent
+    # ── Step 1: Start the moderator session FIRST ─────────────────────────
+    # The session must be fully started before the avatar can bind to it.
+    # Previous ordering (avatar first) caused the avatar to start against an
+    # un-started session, leading to playback sync errors and mid-session crashes.
     await session.start(
         room=ctx.room,
         agent=moderator,
@@ -4974,15 +4982,175 @@ async def create_moderator_session(
 
     # Store session reference in agent for question-based moderation
     moderator.agent_session = session
+    logger.info("AVATAR_LIFECYCLE session.start() completed — session is ready")
+
+    # ── Step 2: Start Anam avatar AFTER session is ready ─────────────────
+    anam_avatar_id = os.environ.get("ANAM_AVATAR_ID")
+
+    if moderator._audio_only_mode:
+        logger.info("AVATAR_LIFECYCLE AUDIO_ONLY_MODE enabled — skipping avatar entirely")
+        moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="audio_only_mode")
+    elif ANAM_AVAILABLE and anam_avatar_id:
+        logger.info(f"AVATAR_LIFECYCLE starting avatar_id={anam_avatar_id} (session already started)")
+        moderator._set_avatar_state(AVATAR_STATE_STARTING)
+        try:
+            avatar = anam.AvatarSession(
+                persona_config=anam.PersonaConfig(
+                    name="Survey Moderator Avatar",
+                    avatarId=anam_avatar_id,
+                ),
+            )
+            await avatar.start(session, room=ctx.room)
+            moderator._avatar_session_ref = avatar
+            moderator._avatar_enabled = True
+            moderator._avatar_connected = True
+            moderator._set_avatar_state(AVATAR_STATE_CONNECTED)
+        except Exception as e:
+            moderator._set_avatar_state(AVATAR_STATE_FAILED, reason=str(e))
+            moderator._avatar_enabled = False
+            moderator._avatar_connected = False
+            # Downgrade to audio-only mode on startup failure
+            moderator._audio_only_mode = True
+            logger.warning(
+                "Anam avatar failed to start — downgrading to audio-only mode: %s",
+                e,
+                exc_info=False,
+            )
+            logger.warning(
+                "Check that ANAM_AVATAR_ID exists in your Anam Lab account and matches the API key. "
+                "See https://lab.anam.ai/avatars or the Anam avatar gallery for valid IDs."
+            )
+    else:
+        if not ANAM_AVAILABLE:
+            logger.info("AVATAR_LIFECYCLE plugin not installed — running without avatar")
+        elif not anam_avatar_id:
+            logger.info("AVATAR_LIFECYCLE ANAM_AVATAR_ID not set — running without avatar")
+        moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="not_configured")
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
         """Handle participant disconnection with grace period."""
         # The Anam avatar is not a survey participant — log but skip roster management
-        if "avatar-agent" in participant.identity:
-            logger.warning(
-                f"⚠️  Avatar disconnected: {participant.identity} "
-                f"(not a survey participant — survey continues without avatar)"
+        if moderator._is_avatar_identity(participant.identity):
+            moderator._avatar_disconnect_time = _time_mod.time()
+            moderator._set_avatar_state(
+                AVATAR_STATE_DISCONNECTED,
+                reason=f"participant_disconnected:{participant.identity}",
+            )
+
+            # ── Optional single-flight reconnect ────────────────────────────
+            if (
+                moderator._avatar_reconnect_enabled
+                and not moderator._shutting_down
+                and not moderator._audio_only_mode
+                and ANAM_AVAILABLE
+                and anam_avatar_id
+                and (moderator._avatar_reconnect_task is None
+                     or moderator._avatar_reconnect_task.done())
+            ):
+                async def _attempt_avatar_reconnect():
+                    _MAX_RECONNECT_ATTEMPTS = 2
+                    _RECONNECT_BACKOFF = 5.0  # seconds between attempts
+                    while moderator._avatar_reconnect_attempts < _MAX_RECONNECT_ATTEMPTS:
+                        if moderator._shutting_down:
+                            logger.info("AVATAR_LIFECYCLE reconnect aborted — shutting down")
+                            return
+                        moderator._avatar_reconnect_attempts += 1
+                        moderator._set_avatar_state(AVATAR_STATE_RECONNECTING)
+                        logger.info(
+                            f"AVATAR_LIFECYCLE reconnect attempt "
+                            f"{moderator._avatar_reconnect_attempts}/{_MAX_RECONNECT_ATTEMPTS}"
+                        )
+                        try:
+                            new_avatar = anam.AvatarSession(
+                                persona_config=anam.PersonaConfig(
+                                    name="Survey Moderator Avatar",
+                                    avatarId=anam_avatar_id,
+                                ),
+                            )
+                            await new_avatar.start(session, room=ctx.room)
+                            moderator._avatar_session_ref = new_avatar
+                            moderator._set_avatar_state(AVATAR_STATE_CONNECTED, reason="reconnected")
+                            # Notify participants of successful reconnect
+                            if not moderator._shutting_down:
+                                await moderator._safe_say(
+                                    AVATAR_RECONNECT_TEXT,
+                                    allow_interruptions=False,
+                                    context="avatar_reconnect_success",
+                                )
+                            return
+                        except Exception as exc:
+                            logger.warning(f"AVATAR_LIFECYCLE reconnect failed: {exc}")
+                            await asyncio.sleep(_RECONNECT_BACKOFF)
+
+                    # Exhausted retries — downgrade to audio-only mode
+                    moderator._set_avatar_state(
+                        AVATAR_STATE_FAILED,
+                        reason=f"reconnect_exhausted_after_{moderator._avatar_reconnect_attempts}_attempts",
+                    )
+                    moderator._audio_only_mode = True
+                    logger.info("AVATAR_LIFECYCLE downgraded to audio-only mode after reconnect exhaustion")
+
+                moderator._avatar_reconnect_task = asyncio.create_task(
+                    _attempt_avatar_reconnect()
+                )
+
+            # ── Deferred disconnect notice ──────────────────────────────────
+            # Dedupe cooldown — at most one notice every 60s
+            _AVATAR_NOTICE_COOLDOWN = 60
+            _last = moderator._last_avatar_disconnect_notice
+            if (_time_mod.time() - _last) < _AVATAR_NOTICE_COOLDOWN:
+                logger.info(
+                    f"AVATAR_LIFECYCLE disconnect notice suppressed — "
+                    f"last notice {_time_mod.time() - _last:.0f}s ago (cooldown={_AVATAR_NOTICE_COOLDOWN}s)"
+                )
+                return
+
+            # Cancel any existing notice task before creating a new one
+            moderator._cancel_avatar_tasks()
+
+            async def _notify_avatar_disconnect_deferred():
+                _MAX_WAIT = 15  # seconds — don't hold the notice forever
+                _POLL = 0.25
+                _waited = 0.0
+
+                # Wait for a safe window
+                while _waited < _MAX_WAIT:
+                    # Abort if survey is completing, shut down, or avatar reconnected
+                    if moderator._shutting_down or moderator.survey_state in (SurveyState.COMPLETED,):
+                        logger.info("AVATAR_LIFECYCLE disconnect notice skipped — session ending")
+                        return
+                    if moderator._avatar_state == AVATAR_STATE_CONNECTED:
+                        logger.info("AVATAR_LIFECYCLE disconnect notice skipped — avatar reconnected")
+                        return
+
+                    # Safe when: not speaking, no warning TTS, no question TTS in flight
+                    if (not moderator.user_currently_speaking
+                            and not moderator._gentle_warning_in_progress
+                            and not moderator._tts_active):
+                        break
+
+                    await asyncio.sleep(_POLL)
+                    _waited += _POLL
+
+                # Final checks
+                if moderator._shutting_down or moderator.survey_state in (SurveyState.COMPLETED,):
+                    logger.info("AVATAR_LIFECYCLE disconnect notice skipped — session ending")
+                    return
+                if moderator._avatar_state == AVATAR_STATE_CONNECTED:
+                    logger.info("AVATAR_LIFECYCLE disconnect notice skipped — avatar reconnected")
+                    return
+
+                moderator._last_avatar_disconnect_notice = _time_mod.time()
+                await moderator._safe_say(
+                    AVATAR_DISCONNECT_TEXT,
+                    allow_interruptions=False,
+                    context="avatar_disconnect_notice",
+                )
+                logger.info(f"AVATAR_LIFECYCLE disconnect notice delivered after {_waited:.1f}s wait")
+
+            moderator._avatar_notice_task = asyncio.create_task(
+                _notify_avatar_disconnect_deferred()
             )
             return
 
@@ -5076,6 +5244,13 @@ async def create_moderator_session(
             logger.info("⏳ Gentle warning in progress — skipping immediate capture")
             return
 
+        # ANALYSIS FREEZE GUARD: While LLM analysis is running on a snapshot,
+        # do not overwrite latest_user_response — the polling loop is working
+        # with the snapshot and will reset state itself when done.
+        if moderator._analysis_in_progress:
+            logger.info("🔒 Analysis in progress — skipping immediate capture to preserve snapshot")
+            return
+
         # Check if already captured (avoid duplicates)
         if moderator.response_captured:
             logger.info("Response already captured, skipping duplicate check")
@@ -5098,8 +5273,7 @@ async def create_moderator_session(
                 )
                 # #region agent log
                 import json as _json
-                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"location": "moderator_agent.py:immediate_capture:delivery_guard", "message": "Delivery guard blocked capture", "data": {"delivery_state": current_ds, "expected": expected, "question_num": moderator.current_question_num, "pending_transcript": str(moderator.pending_stt_transcript)[:100] if moderator.pending_stt_transcript else None}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_CAPTURE_GUARD"}) + "\n")
+                _debug_log_write(_json.dumps({"location": "moderator_agent.py:immediate_capture:delivery_guard", "message": "Delivery guard blocked capture", "data": {"delivery_state": current_ds, "expected": expected, "question_num": moderator.current_question_num, "pending_transcript": str(moderator.pending_stt_transcript)[:100] if moderator.pending_stt_transcript else None}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_CAPTURE_GUARD"}))
                 # #endregion
                 moderator.pending_stt_transcript = None
                 return
@@ -5232,34 +5406,27 @@ async def create_moderator_session(
             )
             # #region agent log
             import json as _json
-            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"location": "moderator_agent.py:user_input_transcribed:welcome_guard", "message": "WELCOME guard fired — discarding transcript", "data": {"transcript": str(_raw)[:200], "survey_state": moderator.survey_state.value}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "A"}) + "\n")
+            _debug_log_write(_json.dumps({"location": "moderator_agent.py:user_input_transcribed:welcome_guard", "message": "WELCOME guard fired — discarding transcript", "data": {"transcript": str(_raw)[:200], "survey_state": moderator.survey_state.value}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "A"}))
             # #endregion
             return
         # ─────────────────────────────────────────────────────────────────
 
         # AUDIO ROUTING TRACE: Show which participant's audio was transcribed
         logger.critical("🔍 STT EVENT TRACE:")
-        if moderator.agent_session and hasattr(moderator.agent_session, '_room_io') and moderator.agent_session._room_io:
-            if hasattr(moderator.agent_session._room_io, '_audio_input') and moderator.agent_session._room_io._audio_input:
-                audio_input = moderator.agent_session._room_io._audio_input
-                current_stt_participant = getattr(audio_input, '_participant_identity', 'UNKNOWN')
-                logger.critical(f"   STT was listening to: {current_stt_participant}")
-                logger.critical(f"   Expected respondent: {moderator.expected_respondent}")
-                logger.critical(f"   Actual respondent (from track_unmuted): {moderator.actual_respondent}")
+        current_stt_participant = moderator._current_stt_participant or 'UNKNOWN'
+        logger.critical(f"   STT was listening to: {current_stt_participant}")
+        logger.critical(f"   Expected respondent: {moderator.expected_respondent}")
+        logger.critical(f"   Actual respondent (from track_unmuted): {moderator.actual_respondent}")
 
-                if current_stt_participant != moderator.expected_respondent:
-                    logger.error(f"⚠️  STT MISMATCH: Listening to {current_stt_participant} but expecting {moderator.expected_respondent}")
-                    # Use STT source as actual respondent — this is more reliable than
-                    # track_unmuted events (which don't fire for server-initiated unmutes)
-                    if current_stt_participant and current_stt_participant != 'UNKNOWN':
-                        moderator.actual_respondent = current_stt_participant
-                        logger.warning(f"🔄 Setting actual_respondent to STT source: {current_stt_participant}")
-                else:
-                    # STT source matches expected — still set actual_respondent explicitly
-                    # so it's never None (track_unmuted events don't reliably fire)
-                    if current_stt_participant and current_stt_participant != 'UNKNOWN':
-                        moderator.actual_respondent = current_stt_participant
+        # Never assign avatar identity as actual_respondent
+        if moderator._is_avatar_identity(current_stt_participant):
+            logger.info(f"AVATAR_LIFECYCLE ignoring STT from avatar identity: {current_stt_participant}")
+            return
+
+        if current_stt_participant and current_stt_participant != 'UNKNOWN':
+            moderator.actual_respondent = current_stt_participant
+            if current_stt_participant != moderator.expected_respondent:
+                logger.warning(f"STT MISMATCH: Listening to {current_stt_participant} but expecting {moderator.expected_respondent}")
 
         # Extract transcript from UserInputTranscribedEvent
         transcript = ""
@@ -5335,14 +5502,7 @@ async def create_moderator_session(
                         return  # Don't process as regular response
 
                 # Check if STT is currently set to observer (means any transcript is from observer)
-                current_stt_participant = None
-                try:
-                    if moderator.agent_session and hasattr(moderator.agent_session, '_room_io') and moderator.agent_session._room_io:
-                        audio_input = moderator.agent_session._room_io._audio_input
-                        if audio_input:
-                            current_stt_participant = getattr(audio_input, '_participant_identity', None)
-                except Exception:
-                    pass
+                current_stt_participant = moderator._current_stt_participant
 
                 # If STT is listening to observer, accept the command (we set it that way while asking questions)
                 if current_stt_participant and observer_identity and current_stt_participant == observer_identity:
@@ -5361,202 +5521,125 @@ async def create_moderator_session(
                     logger.critical(f"❌ IGNORING command - speaker '{speaker_identity}' is NOT the observer '{observer_identity}'")
                     # Continue processing as a normal participant response
 
-        # ── GENTLE-WARNING GUARD ─────────────────────────────────────
-        # While the wrap-up warning TTS is playing, discard incoming
-        # transcripts.  They are either the user's pre-warning tail or
-        # echo from the agent's own speech.  Fresh wrap-up speech will
-        # arrive after the flag is cleared.
-        if moderator._gentle_warning_in_progress:
-            logger.info(
-                f"🛡️ GENTLE-WARNING GUARD (user_input_transcribed): Discarding "
-                f"transcript during warning TTS: '{transcript[:60]}'"
-            )
-            return
-        # ─────────────────────────────────────────────────────────────
+        # ── Simplified fragment tracking (Phase 1) ─────────────────────
+        # The primary response capture is now in on_user_speech_committed.
+        # This handler only updates latest_user_response as a legacy fallback
+        # and maintains tracking variables.
+        import time as _time_mod
 
-        # ── DELIVERY-STATE GUARD ─────────────────────────────────────
-        # Reject transcripts that arrive while the question is still being
-        # spoken (delivery_state != "delivered").  These are stale spillover
-        # from the previous turn and would pollute the current response.
-        _expected = moderator.expected_respondent
-        if _expected and moderator.current_question_num:
-            if not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
-                _ds_key = moderator._delivery_key(moderator.current_question_num, _expected)
-                _current_ds = moderator.question_delivery_state.get(_ds_key, "unknown")
-                logger.warning(
-                    f"🛡️ DELIVERY GUARD (user_input_transcribed): Discarding transcript — "
-                    f"delivery_state={_current_ds} for Q#{moderator.current_question_num}/{_expected} "
-                    f"(need 'delivered'): '{transcript[:60]}'"
-                )
-                # #region agent log
-                import json as _json
-                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                    _f.write(_json.dumps({"location": "moderator_agent.py:user_input_transcribed:delivery_guard", "message": "Delivery guard blocked transcript", "data": {"delivery_state": _current_ds, "expected": _expected, "question_num": moderator.current_question_num, "transcript": transcript[:100]}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_EVENT_GUARD"}) + "\n")
-                # #endregion
-                return
-        # ─────────────────────────────────────────────────────────────
-
-        # CRITICAL FIX: STT sends BOTH cumulative updates AND new fragments
-        # - Cumulative: "Hello" → "Hello world" (extends previous)
-        # - New fragment: "Hello world" → "Goodbye" (different text after pause)
-        # We need to APPEND new fragments but REPLACE cumulative updates
-
-        # Store in pending STT transcript for immediate capture function
-        moderator.pending_stt_transcript = transcript
-
-        question_context = f"Q#{moderator.current_question_num} ({moderator.current_question_object.id if moderator.current_question_object else 'N/A'})"
-
-        # Track the last individual fragment (not the accumulated response)
-        prev_fragment = moderator.last_stt_fragment.strip()
         new_fragment = transcript.strip()
+        if not new_fragment:
+            return
 
-        # SMARTER APPROACH: Check if new fragment actually extends previous
-        # - If new STARTS WITH previous → cumulative update (REPLACE)
-        # - If previous is CONTAINED in new → cumulative update (REPLACE)
-        # - If significant word overlap (>60%) → take the longer one (REPLACE)
-        # - Otherwise → new fragment after pause (APPEND)
-        if prev_fragment:
-            # Check if this is truly a cumulative update
-            is_cumulative = (
-                new_fragment.startswith(prev_fragment) or  # Direct extension
-                prev_fragment in new_fragment  # Previous contained in new
-            )
-
-            # If not obvious cumulative, check for significant word overlap
-            if not is_cumulative and len(prev_fragment) > 10:
-                # Calculate word overlap
-                prev_words = set(prev_fragment.lower().split())
-                new_words = set(new_fragment.lower().split())
-                if prev_words and new_words:
-                    overlap = len(prev_words & new_words)
-                    smaller_set_size = min(len(prev_words), len(new_words))
-                    overlap_ratio = overlap / smaller_set_size if smaller_set_size > 0 else 0
-
-                    # If >60% word overlap, treat as cumulative and keep the longer one
-                    if overlap_ratio > 0.6:
-                        is_cumulative = True
-                        logger.debug(f"Detected {overlap_ratio:.0%} word overlap - treating as cumulative")
-
-            if is_cumulative:
-                # Cumulative update - replace the previous fragment with the new one
-                # BUT: Keep the LONGER version to avoid losing content (like "Yes.")
-                if moderator.latest_user_response:
-                    acc_stripped = moderator.latest_user_response.rstrip()
-
-                    # Try to find and replace the previous fragment at the end
-                    if acc_stripped.endswith(prev_fragment):
-                        # Clean replacement
-                        prefix = acc_stripped[:-len(prev_fragment)].rstrip()
-                        if prefix:
-                            # Keep prefix + new fragment
-                            moderator.latest_user_response = prefix + " " + new_fragment
-                        else:
-                            # No prefix - use whichever is longer
-                            moderator.latest_user_response = new_fragment if len(new_fragment) >= len(prev_fragment) else prev_fragment
-                    else:
-                        # Previous fragment not at the end - try to find it anywhere
-                        # This handles cases where STT drops beginning words
-                        if prev_fragment in acc_stripped:
-                            # Replace only the last occurrence
-                            parts = acc_stripped.rsplit(prev_fragment, 1)
-                            moderator.latest_user_response = parts[0].rstrip() + " " + new_fragment if parts[0].strip() else new_fragment
-                        else:
-                            # Can't find prev in accumulated - check if accumulated has unique beginning
-                            # (This handles "Yes. It is..." vs "It is..." - we want to keep "Yes.")
-
-                            # Check if accumulated starts with something new doesn't have
-                            acc_start_words = acc_stripped.split()[:3]  # First 3 words
-                            new_start_words = new_fragment.split()[:3]
-
-                            has_unique_prefix = False
-                            if acc_start_words and new_start_words:
-                                # Check if accumulated has unique words at the beginning
-                                acc_start_set = set(w.lower() for w in acc_start_words)
-                                new_start_set = set(w.lower() for w in new_start_words)
-                                unique_start_words = acc_start_set - new_start_set
-                                has_unique_prefix = len(unique_start_words) > 0
-
-                            if has_unique_prefix:
-                                # Keep accumulated - it has important beginning content (like "Yes")
-                                logger.warning(f"⚠️  Keeping accumulated - has unique prefix: {' '.join(acc_start_words)}")
-                                # Don't change response
-                            elif len(new_fragment) > len(acc_stripped):
-                                # New is longer and no unique prefix - use new
-                                moderator.latest_user_response = new_fragment
-                                logger.warning(f"⚠️  Using new fragment (longer: {len(new_fragment)} vs {len(acc_stripped)} chars)")
-                            else:
-                                # Keep accumulated (longer or same)
-                                logger.warning(f"⚠️  Keeping accumulated (longer: {len(acc_stripped)} vs {len(new_fragment)} chars)")
-                else:
-                    moderator.latest_user_response = new_fragment
-
-                moderator.last_stt_fragment = new_fragment
-                logger.critical(f"💾 [{question_context}] REPLACED cumulative ({len(moderator.latest_user_response)} chars): '{moderator.latest_user_response[:120]}'...")
+        # Detect utterance boundary: when fragment length drops significantly,
+        # STT has started a new utterance rather than extending the previous one.
+        # Accumulate the previous utterance so multi-utterance answers aren't lost.
+        _prev = moderator.last_stt_fragment or ""
+        if _prev and len(new_fragment) < len(_prev) * 0.6 and len(_prev) > 5:
+            # Previous utterance complete — accumulate it
+            if moderator._turn_accumulated_text:
+                moderator._turn_accumulated_text += " " + _prev
             else:
-                # New fragment - pause occurred, append
-                if moderator.latest_user_response:
-                    moderator.latest_user_response = moderator.latest_user_response.strip() + " " + new_fragment
-                else:
-                    moderator.latest_user_response = new_fragment
+                moderator._turn_accumulated_text = _prev
 
-                moderator.last_stt_fragment = new_fragment
-                logger.critical(f"💾 [{question_context}] APPENDED new fragment ({len(moderator.latest_user_response)} chars): '{moderator.latest_user_response[:120]}'...")
+        # Full turn response = accumulated previous utterances + current fragment
+        if moderator._turn_accumulated_text:
+            moderator.latest_user_response = moderator._turn_accumulated_text + " " + new_fragment
         else:
-            # First fragment for this question
             moderator.latest_user_response = new_fragment
-            moderator.last_stt_fragment = new_fragment
-            moderator._first_fragment_time = datetime.now()
-            logger.critical(f"💾 [{question_context}] FIRST FRAGMENT ({len(new_fragment)} chars): '{new_fragment[:120]}'...")
 
-        # Update timestamp for silence detection
+        moderator.pending_stt_transcript = transcript
+        moderator.last_stt_fragment = new_fragment
         moderator.last_fragment_time = datetime.now()
+        if moderator._first_fragment_time is None:
+            moderator._first_fragment_time = datetime.now()
 
-    # BACKUP EVENTS: Try these too in case SDK version is different
+        # Update silence watchdog progress tracker
+        moderator._last_transcript_progress_time = _time_mod.time()
+        moderator._had_stt_transcript_this_turn = True
+        logger.info(f"STT fragment ({len(new_fragment)} chars): '{new_fragment[:80]}'")
+
+    # PRIMARY EVENT: user_speech_committed — fires after VAD silence under server_vad
     @session.on("user_speech_committed")
     def on_user_speech_committed(message):
-        """Backup event handler - may not fire"""
-        logger.critical(f"🔥 EVENT FIRED: user_speech_committed (backup)")
+        """Primary handler: fires when VAD confirms the user finished speaking.
 
+        Single write to captured_response + _response_ready.set() drives
+        the _await_response() loop.
+        """
+        import time as _time_mod
+
+        logger.critical(f"EVENT FIRED: user_speech_committed")
+
+        # Extract transcript text
         transcript = ""
         if hasattr(message, 'alternatives') and len(message.alternatives) > 0:
             transcript = message.alternatives[0].text
         elif hasattr(message, 'text'):
             transcript = message.text
+        elif hasattr(message, 'transcript'):
+            transcript = message.transcript
         else:
             transcript = str(message)
 
-        if transcript:
-            _expected = moderator.expected_respondent
-            if _expected and moderator.current_question_num and not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
-                logger.warning(f"🛡️ DELIVERY GUARD (user_speech_committed): Discarding — not delivered yet")
+        if not transcript or not transcript.strip():
+            return
+
+        transcript = transcript.strip()
+
+        # ── Welcome-phase guard ──
+        if moderator.survey_state == SurveyState.WELCOME:
+            logger.info(f"WELCOME guard (committed): discarding '{transcript[:80]}'")
+            return
+
+        # ── TTS echo guard ──
+        if moderator._tts_active:
+            logger.info(f"ECHO guard (committed): discarding during TTS: '{transcript[:60]}'")
+            return
+
+        # ── Delivery-state guard ──
+        _expected = moderator.expected_respondent
+        if _expected and moderator.current_question_num:
+            if not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
+                _ds_key = moderator._delivery_key(moderator.current_question_num, _expected)
+                _ds = moderator.question_delivery_state.get(_ds_key, "unknown")
+                logger.warning(
+                    f"DELIVERY GUARD (committed): Discarding — "
+                    f"delivery_state={_ds} for Q#{moderator.current_question_num}/{_expected}"
+                )
                 return
-            logger.critical(f"📝 USER TRANSCRIPT CAPTURED via user_speech_committed: {transcript[:100]}")
-            moderator.pending_stt_transcript = transcript
-            moderator.latest_user_response = transcript
 
-    @session.on("transcript_received")
-    def on_transcript_received(event):
-        """Backup event handler - may not fire"""
-        logger.critical(f"🔥 EVENT FIRED: transcript_received (backup)")
+        # ── Apply STT correction if response options exist ──
+        corrected = transcript
+        if moderator.current_question_object and moderator.current_question_object.response_options:
+            corrected = correct_transcription(
+                transcript, moderator.current_question_object.response_options)
+            if corrected != transcript:
+                logger.info(f"STT correction (committed): '{transcript[:50]}' -> '{corrected[:50]}'")
 
-        transcript = ""
-        if hasattr(event, 'alternatives') and len(event.alternatives) > 0:
-            transcript = event.alternatives[0].text
-        elif hasattr(event, 'text'):
-            transcript = event.text
-        elif hasattr(event, 'transcript'):
-            transcript = event.transcript
-        else:
-            transcript = str(event)
+        # ── Include accumulated text from earlier utterances in this turn ──
+        if moderator._turn_accumulated_text:
+            corrected = f"{moderator._turn_accumulated_text} {corrected}"
+            moderator._turn_accumulated_text = ""  # Reset after incorporation
+        # ── Single write ──
+        moderator.captured_response = corrected
+        moderator._response_ready.set()
 
-        if transcript:
-            _expected = moderator.expected_respondent
-            if _expected and moderator.current_question_num and not moderator._is_delivery_confirmed(moderator.current_question_num, _expected):
-                logger.warning(f"🛡️ DELIVERY GUARD (transcript_received): Discarding — not delivered yet")
-                return
-            logger.critical(f"📝 USER TRANSCRIPT CAPTURED via transcript_received: {transcript[:100]}")
-            moderator.pending_stt_transcript = transcript
-            moderator.latest_user_response = transcript
+        # Also update legacy variables for compatibility
+        moderator.latest_user_response = corrected
+        moderator.pending_stt_transcript = corrected
+        moderator.response_captured = True
+
+        # Update tracking
+        moderator._last_transcript_progress_time = _time_mod.time()
+        moderator._had_stt_transcript_this_turn = True
+        if moderator._first_fragment_time is None:
+            moderator._first_fragment_time = datetime.now()
+
+        logger.critical(f"COMMITTED response ({len(corrected)} chars): '{corrected[:120]}'")
+
+        # Audit logging
+        moderator.audit_logger.log_stt_text(transcript)
 
     @session.on("user_state_changed")
     def on_user_state_changed(event):
@@ -5564,6 +5647,20 @@ async def create_moderator_session(
         logger.critical(f"🔥 EVENT FIRED: user_state_changed - {event.old_state} -> {event.new_state}")
         print(f"🔥 EVENT FIRED: user_state_changed - {event.old_state} -> {event.new_state}")
         moderator._last_user_state = event.new_state
+
+        # ── ECHO BARGE-IN GUARD ──────────────────────────────────────────
+        # While the agent's TTS is actively playing (_tts_active or
+        # _gentle_warning_in_progress), a VAD "speaking" transition is
+        # almost certainly the microphone picking up the agent's own audio
+        # (echo) rather than the participant.  Suppress the state change to
+        # prevent the agent from interrupting itself.
+        if event.new_state == "speaking" and (moderator._tts_active or moderator._gentle_warning_in_progress):
+            logger.info(
+                f"🔇 ECHO GUARD: suppressing VAD speaking event — "
+                f"tts_in_flight={moderator._tts_active}, "
+                f"gentle_warning={moderator._gentle_warning_in_progress}"
+            )
+            return  # Discard this event entirely
 
         # Track speaking state for polling
         if event.new_state == "speaking":
@@ -5783,8 +5880,7 @@ async def create_moderator_session(
             )
             # #region agent log
             import json as _json
-            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"location": "moderator_agent.py:conversation_item_added:unconfirmed_delivery", "message": "Skipped mark_answered due to unconfirmed delivery", "data": {"participant_id": participant_id, "question_num": moderator.current_question_num, "expected_respondent": moderator.expected_respondent}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_ANSWERED_GATE"}) + "\n")
+            _debug_log_write(_json.dumps({"location": "moderator_agent.py:conversation_item_added:unconfirmed_delivery", "message": "Skipped mark_answered due to unconfirmed delivery", "data": {"participant_id": participant_id, "question_num": moderator.current_question_num, "expected_respondent": moderator.expected_respondent}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "H_ANSWERED_GATE"}))
             # #endregion
             return
 

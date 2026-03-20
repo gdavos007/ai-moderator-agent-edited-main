@@ -21,8 +21,7 @@
             </div>
             <div class="header-right">
                 <span class="connection-status" id="connection-status">
-                    <span class="status-dot connecting"></span>
-                    Connecting...
+                    <span class="status-dot connecting"></span><span class="status-text">Connecting...</span>
                 </span>
             </div>
         </header>
@@ -234,6 +233,25 @@
         let surveyState = 'waiting'; // waiting, running, paused
         let avatarParticipantIdentity = null;
 
+        // ── Audio track deduplication ─────────────────────────────────────
+        // Maps track SID → attached <audio> element.  Prevents the same
+        // remote audio track from being attached more than once, which
+        // causes stuttering/looping when multiple <audio> elements play
+        // the same MediaStream out of phase.
+        const attachedAudioTrackSids = new Map();
+
+        // ── Speaking-state debounce ────────────────────────────────────────
+        // ActiveSpeakersChanged fires many times per second.  Rapid
+        // add/remove of the .speaking CSS class restarts the pulse
+        // animation and causes a visible "reset" flash.  We debounce
+        // removals: when a speaker stops, wait a short grace period
+        // before removing the class, so brief gaps don't cause flicker.
+        let _agentSpeakingDebounceTimer = null;
+        let _participantSpeakingDebounceTimer = null;
+        let _lastAgentSpeaking = false;
+        let _lastParticipantSpeaking = false;
+        const SPEAKING_DEBOUNCE_MS = 300; // ms to hold speaking state after last active event
+
         // Audio context for visualization
         let audioContext = null;
         let analyser = null;
@@ -433,6 +451,14 @@
             room.on(LivekitClient.RoomEvent.Disconnected, () => {
                 console.log('Disconnected from room');
                 updateConnectionStatus('disconnected', 'Disconnected');
+
+                // Clean up all attached audio elements to prevent zombie playback
+                attachedAudioTrackSids.forEach((el, sid) => {
+                    el.pause();
+                    el.remove();
+                    console.log('Cleaned up audio track on disconnect:', sid);
+                });
+                attachedAudioTrackSids.clear();
             });
 
             room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
@@ -450,9 +476,25 @@
 
             room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
                 if (track.kind === LivekitClient.Track.Kind.Audio) {
-                    // Attach audio to DOM for playback
+                    const trackSid = publication.trackSid || track.sid || publication.sid;
+
+                    // ── Dedupe: skip if this track SID is already playing ──
+                    if (attachedAudioTrackSids.has(trackSid)) {
+                        console.log('Audio track already attached, skipping:', trackSid, participant.identity);
+                        return;
+                    }
+
+                    // Attach audio to DOM for playback (single element per track)
                     const audioElement = track.attach();
+                    audioElement.dataset.trackSid = trackSid;
                     document.body.appendChild(audioElement);
+                    attachedAudioTrackSids.set(trackSid, audioElement);
+                    console.log('Attached audio track:', trackSid, 'for', participant.identity);
+
+                    // Apply current speaker mute state
+                    if (isSpeakerMuted) {
+                        audioElement.muted = true;
+                    }
 
                     // Check if this is the agent
                     if (participant.identity.includes('agent') || participant.kind === LivekitClient.ParticipantKind.AGENT) {
@@ -492,6 +534,18 @@
             });
 
             room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+                // ── Clean up audio elements on unsubscribe ──
+                if (track.kind === LivekitClient.Track.Kind.Audio) {
+                    const trackSid = publication.trackSid || track.sid || publication.sid;
+                    const existingEl = attachedAudioTrackSids.get(trackSid);
+                    if (existingEl) {
+                        track.detach(existingEl);
+                        existingEl.remove();
+                        attachedAudioTrackSids.delete(trackSid);
+                        console.log('Detached and removed audio track:', trackSid, participant.identity);
+                    }
+                }
+
                 if (track.kind === LivekitClient.Track.Kind.Video) {
                     if (participant.identity === avatarParticipantIdentity) {
                         const agentVideo = document.getElementById('agent-avatar-video');
@@ -615,30 +669,70 @@
         }
 
         function updateSpeakingIndicators(agentSpeaking, participantSpeaking) {
-            const agentRing = document.getElementById('agent-speaking-ring');
-            const agentStatus = document.getElementById('agent-status');
-            const speakingLabel = document.getElementById('speaking-label');
-            const micIndicator = document.getElementById('mic-indicator');
-
+            // ── Agent speaking state (debounced removal) ─────────────
+            // When the agent IS speaking, apply the class immediately
+            // (instant visual feedback).  When it stops, delay removal
+            // so rapid speaking→silent→speaking transitions don't
+            // restart the CSS animation and cause a visible flash.
             if (agentSpeaking) {
-                agentRing.classList.add('speaking');
-                agentStatus.textContent = 'Speaking';
-            } else {
-                agentRing.classList.remove('speaking');
-                // Only change to "Listening" if agent was previously connected
-                if (agentStatus.textContent !== 'Connecting...') {
-                    agentStatus.textContent = 'Listening';
+                // Cancel any pending "stop speaking" timer
+                if (_agentSpeakingDebounceTimer) {
+                    clearTimeout(_agentSpeakingDebounceTimer);
+                    _agentSpeakingDebounceTimer = null;
+                }
+                if (!_lastAgentSpeaking) {
+                    const agentRing = document.getElementById('agent-speaking-ring');
+                    const agentTile = document.getElementById('agent-tile');
+                    const agentStatus = document.getElementById('agent-status');
+                    agentRing.classList.add('speaking');
+                    agentTile.classList.add('speaking');
+                    agentStatus.textContent = 'Speaking';
+                    _lastAgentSpeaking = true;
+                }
+            } else if (_lastAgentSpeaking) {
+                // Debounce: wait before removing speaking state
+                if (!_agentSpeakingDebounceTimer) {
+                    _agentSpeakingDebounceTimer = setTimeout(() => {
+                        _agentSpeakingDebounceTimer = null;
+                        _lastAgentSpeaking = false;
+                        const agentRing = document.getElementById('agent-speaking-ring');
+                        const agentTile = document.getElementById('agent-tile');
+                        const agentStatus = document.getElementById('agent-status');
+                        agentRing.classList.remove('speaking');
+                        agentTile.classList.remove('speaking');
+                        if (agentStatus.textContent !== 'Connecting...') {
+                            agentStatus.textContent = 'Listening';
+                        }
+                    }, SPEAKING_DEBOUNCE_MS);
                 }
             }
 
+            // ── Participant speaking state (debounced removal) ────────
             if (participantSpeaking) {
-                speakingLabel.textContent = 'Speaking';
-                speakingLabel.classList.add('active');
-                micIndicator.classList.add('active');
-            } else {
-                speakingLabel.textContent = isMuted ? 'Muted' : 'Ready';
-                speakingLabel.classList.remove('active');
-                micIndicator.classList.remove('active');
+                if (_participantSpeakingDebounceTimer) {
+                    clearTimeout(_participantSpeakingDebounceTimer);
+                    _participantSpeakingDebounceTimer = null;
+                }
+                if (!_lastParticipantSpeaking) {
+                    const speakingLabel = document.getElementById('speaking-label');
+                    const micIndicator = document.getElementById('mic-indicator');
+                    speakingLabel.textContent = 'Speaking';
+                    speakingLabel.classList.add('active');
+                    micIndicator.classList.add('active');
+                    _lastParticipantSpeaking = true;
+                }
+            } else if (_lastParticipantSpeaking) {
+                if (!_participantSpeakingDebounceTimer) {
+                    _participantSpeakingDebounceTimer = setTimeout(() => {
+                        _participantSpeakingDebounceTimer = null;
+                        _lastParticipantSpeaking = false;
+                        const speakingLabel = document.getElementById('speaking-label');
+                        const micIndicator = document.getElementById('mic-indicator');
+                        speakingLabel.textContent = isMuted ? 'Muted' : 'Ready';
+                        speakingLabel.classList.remove('active');
+                        micIndicator.classList.remove('active');
+                    }, SPEAKING_DEBOUNCE_MS);
+                }
             }
         }
 
@@ -729,7 +823,11 @@
                 const stream = localAudioTrack?.mediaStreamTrack;
                 if (!stream) return;
 
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                // Reuse existing AudioContext — creating multiples causes
+                // interference and resource leaks.
+                if (!audioContext || audioContext.state === 'closed') {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                }
                 analyser = audioContext.createAnalyser();
                 const source = audioContext.createMediaStreamSource(new MediaStream([stream]));
                 source.connect(analyser);
@@ -765,9 +863,14 @@
         function updateConnectionStatus(status, text) {
             const statusElement = document.getElementById('connection-status');
             const dot = statusElement.querySelector('.status-dot');
+            const statusText = statusElement.querySelector('.status-text');
+            if (!dot || !statusText) return;
 
+            // Update class on existing dot and text on existing span —
+            // no innerHTML replacement that would destroy/recreate elements
+            // and cause a visible flash.
             dot.className = 'status-dot ' + status;
-            statusElement.innerHTML = `<span class="status-dot ${status}"></span>${text}`;
+            statusText.textContent = text;
         }
 
         function startSessionTimer() {
@@ -1020,6 +1123,18 @@
         }
 
         async function confirmLeave() {
+            // Clean up all attached audio elements
+            attachedAudioTrackSids.forEach((el, sid) => {
+                el.pause();
+                el.remove();
+            });
+            attachedAudioTrackSids.clear();
+
+            // Close AudioContext
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close().catch(() => {});
+            }
+
             if (room) {
                 await room.disconnect();
             }

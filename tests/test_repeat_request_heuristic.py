@@ -6,6 +6,12 @@ Before this fix, phrases like "I didn't hear the last part" relied entirely
 on the LLM analysis, which could mis-classify them.  The deterministic
 heuristic now catches these instantly.
 
+The heuristic has a LENGTH GATE (60 chars max) so that long responses
+containing substantive content alongside a trigger phrase are deferred to
+LLM analysis.  This prevents false positives like:
+  - "I'm an engineer. I live in Dallas. And what's the last part?"
+  - "you're asking me to repeat / speak up and I'm like, I am talking"
+
 NOTE: This duplicates the core matching logic from is_repeat_request() in
 src/moderator_agent.py rather than importing it (the module has heavy livekit
 dependencies).  If you change the phrase list in the source, update it here too.
@@ -82,11 +88,18 @@ REPEAT_PATTERNS = [
 SHORT_REPEAT = {"what", "what?", "huh", "huh?", "sorry", "sorry?", "come again", "come again?"}
 
 
+HEURISTIC_MAX_LENGTH = 60
+
+
 def is_repeat_request(text: str) -> bool:
     """Standalone copy of the heuristic for testing without livekit imports."""
     if not text:
         return False
     text_lower = text.lower().strip()
+
+    # Length gate: long responses likely contain substantive content — defer to LLM.
+    if len(text_lower) > HEURISTIC_MAX_LENGTH:
+        return False
 
     for phrase in REPEAT_PHRASES:
         if phrase in text_lower:
@@ -158,6 +171,22 @@ NEGATIVE_CASES = [
     "Well, in my experience the government needs to invest more",
 ]
 
+# ── Length-gate regression cases (from real sessions) ────────────────────────
+# These contain trigger phrases but are long substantive responses that should
+# be deferred to LLM analysis, NOT caught by the heuristic.
+LENGTH_GATE_NEGATIVE_CASES = [
+    # Q1 (W1) bug: partial answer + clarification — "the last part" triggered false positive
+    "I'm an engineer. I live in Dallas. And what's the last part of the question?",
+    # Q6 (T2) bug: meta-feedback about moderator — "repeat" triggered false positive
+    "Sometimes I I feel like you didn't I feel like you didn't hear me, and you're asking me to repeat a speak up and I'm like, I am talking. So I don't know what's going on there. But overall, it's okay.",
+    # Q5 (T1) bug: substantive feedback containing "didn't hear"
+    "I don't know why you didn't hear me. Because A couple of times. I was just a little confused about that. I didn't feel like I was getting cut off. But, you know, like, I could've sworn I spoke.",
+    # Q5 (T1) bug: substantive feedback containing "repeat"
+    "You cut me off. More than once. I tried to I try to yeah. Just yeah. I just I felt like yeah. It was, like, a little bit disturbed this time. And repeating the last question, you never repeated the last question. So",
+    # Another partial answer variant
+    "I'm not retired. I live in Dallas. And what's the first part of the question?",
+]
+
 
 class TestPositiveCases:
     """Every phrase that should trigger a repeat must return True."""
@@ -202,6 +231,35 @@ class TestEdgeCases:
 
     def test_short_sorry(self):
         assert is_repeat_request("sorry?") is True
+
+
+class TestLengthGate:
+    """Long responses with trigger phrases must NOT be caught by the heuristic."""
+
+    def test_all_length_gate_negative_cases(self):
+        for phrase in LENGTH_GATE_NEGATIVE_CASES:
+            result = is_repeat_request(phrase)
+            assert result is False, (
+                f"FALSE POSITIVE (length gate should have blocked): '{phrase}'"
+            )
+
+    def test_short_repeat_still_works(self):
+        """Short genuine repeat requests must still be caught."""
+        assert is_repeat_request("Can you repeat that?") is True
+        assert is_repeat_request("What was the last part?") is True
+        assert is_repeat_request("Say that again") is True
+
+    def test_boundary_length(self):
+        """Responses right at the boundary."""
+        # 60 chars or fewer should still be checked
+        short = "x" * 50 + " repeat"
+        assert len(short) <= HEURISTIC_MAX_LENGTH
+        assert is_repeat_request(short) is True
+
+        # Over 60 chars should be skipped
+        long = "x" * 55 + " repeat"
+        assert len(long) > HEURISTIC_MAX_LENGTH
+        assert is_repeat_request(long) is False
 
 
 class TestRegexPatterns:
