@@ -4103,20 +4103,14 @@ class CommunityModeratorAgent(Agent):
                 announcement_text=category_announcement
             )
 
-            # Use direct say + playout wait to ensure audio fully plays on client
-            # before question delivery begins (avoids overlap/truncation)
-            if not self._shutting_down and self.agent_session:
-                try:
-                    cat_handle = self.agent_session.say(category_announcement, allow_interruptions=False)
-                    await cat_handle
-                    # Ensure audio fully plays out on client before proceeding
-                    try:
-                        await asyncio.wait_for(cat_handle.wait_for_playout(), timeout=15.0)
-                    except asyncio.TimeoutError:
-                        logger.warning("Category announcement playout timed out")
-                except (asyncio.CancelledError, RuntimeError) as e:
-                    logger.warning(f"Category announcement TTS failed: {e}")
-                await asyncio.sleep(0.5)  # Brief natural conversational pause
+            # Wait for the announcement to finish playing on the client before
+            # proceeding to the next question (avoids overlap/truncation).
+            await self._say_and_wait_for_playback(
+                category_announcement,
+                context="category_announcement",
+                playout_timeout=15.0,
+            )
+            await asyncio.sleep(0.5)  # Brief natural conversational pause
 
         # DYNAMIC VAD CONFIGURATION: Adjust silence threshold based on question type.
         # Values are tuned to avoid echo-barge-in (agent's TTS interpreted as
