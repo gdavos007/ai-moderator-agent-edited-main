@@ -3161,6 +3161,55 @@ class CommunityModeratorAgent(Agent):
                 self._shutting_down = True
             return False
 
+    async def _say_and_wait_for_playback(
+        self,
+        text: str,
+        *,
+        allow_interruptions: bool = False,
+        context: str = "",
+        playout_timeout: float = 30.0,
+    ) -> bool:
+        """Speak text and wait until the client has finished playing it.
+
+        Unlike _safe_say() (fire-and-forget with shutdown guard) or
+        _speak_question_safely() (question-specific dedup/delivery-state),
+        this is a minimal "non-directed TTS that must finish audibly before
+        proceeding" primitive.  It compensates for the SDK's
+        wait_for_playout() resolving when frames are queued (~0.5s) rather
+        than when the client finishes playback, by sleeping for the
+        estimated remaining duration.
+
+        Returns True on success, False on shutdown/error.
+        """
+        if self._shutting_down or not self.agent_session:
+            return False
+        try:
+            import time as _time
+            _dispatch_time = _time.time()
+            handle = self.agent_session.say(text, allow_interruptions=allow_interruptions)
+            await handle
+            try:
+                await asyncio.wait_for(handle.wait_for_playout(), timeout=playout_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Playout timed out after {playout_timeout}s ({context})")
+            _elapsed = _time.time() - _dispatch_time
+            _estimated = _estimate_tts_duration(text)
+            _remaining = max(_estimated - _elapsed, 0.0)
+            if _remaining > 0:
+                logger.info(
+                    f"Waiting {_remaining:.1f}s for estimated TTS playback "
+                    f"({len(text)} chars, est={_estimated:.1f}s, elapsed={_elapsed:.1f}s) [{context}]"
+                )
+                await asyncio.sleep(_remaining)
+            return True
+        except asyncio.CancelledError:
+            return False
+        except RuntimeError as e:
+            if "closing" in str(e).lower() or "closed" in str(e).lower():
+                self._shutting_down = True
+            logger.warning(f"_say_and_wait_for_playback failed ({context}): {e}")
+            return False
+
     def _cancel_all_monitor_tasks(self):
         """Central cleanup: cancel response_timeout_task, turn_monitor_task, and avatar tasks."""
         if self.response_timeout_task:
