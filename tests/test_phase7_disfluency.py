@@ -19,6 +19,7 @@ _DISFLUENT_STARTER_TOKENS = frozenset({
     "you", "know", "yeah", "yes", "no", "okay", "ok",
     "right", "and", "but", "just", "that", "the", "a",
     "it", "its", "is", "was", "not", "really",
+    "hi", "hello", "hey",
 })
 
 DISFLUENCY_EXTENSION_BUDGET = 10.0
@@ -55,6 +56,21 @@ class TestDisfluencyClassification(unittest.TestCase):
         self.assertTrue(_is_disfluent_starter(""))
         self.assertTrue(_is_disfluent_starter("okay so like"))
         self.assertTrue(_is_disfluent_starter("yeah no I mean"))
+
+    def test_greeting_tokens_are_disfluent(self):
+        """Greetings like 'Hi.', 'Hello!', 'Hey' are disfluent starters."""
+        self.assertTrue(_is_disfluent_starter("Hi."))
+        self.assertTrue(_is_disfluent_starter("Hello!"))
+        self.assertTrue(_is_disfluent_starter("Hey"))
+        self.assertTrue(_is_disfluent_starter("hi"))
+        self.assertTrue(_is_disfluent_starter("Hey, yeah"))
+        self.assertTrue(_is_disfluent_starter("Hello, um"))
+
+    def test_greeting_with_substance_not_disfluent(self):
+        """Greeting followed by substantive content should NOT match."""
+        self.assertFalse(_is_disfluent_starter("Hi, I love the product"))
+        self.assertFalse(_is_disfluent_starter("Hello, my name is Christopher"))
+        self.assertFalse(_is_disfluent_starter("Hey, productivity increases"))
 
     def test_substantive_cases(self):
         self.assertFalse(_is_disfluent_starter("I love cheese"))

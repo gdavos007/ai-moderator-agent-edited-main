@@ -231,6 +231,7 @@ _DISFLUENT_STARTER_TOKENS = frozenset({
     "you", "know", "yeah", "yes", "no", "okay", "ok",
     "right", "and", "but", "just", "that", "the", "a",
     "it", "its", "is", "was", "not", "really",
+    "hi", "hello", "hey",
 })
 
 DISFLUENCY_EXTENSION_BUDGET = 10.0  # Total extra seconds added to _polling_deadline for disfluency
