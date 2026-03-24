@@ -2683,6 +2683,14 @@ class CommunityModeratorAgent(Agent):
             f"📢 [{question_context}] Short off-topic response needs clarification "
             f"({loop_label}): '{captured_text[:100]}'"
         )
+        # Record the triggering utterance before the nudge so the transcript
+        # shows what caused the clarification (matches existing patterns:
+        # [Initial uncertain response before encouragement], [Initial off-topic response]).
+        responder = self.actual_respondent if self.actual_respondent else participant
+        self.survey_transcript.add_response(
+            question_number=self.current_question_num, participant=responder,
+            response_text=f"[Short response before clarification] {captured_text}",
+        )
         await self._safe_say(
             nudge_text,
             allow_interruptions=False,

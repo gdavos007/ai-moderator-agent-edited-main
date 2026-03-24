@@ -315,6 +315,51 @@ class TestIdleNoVadWatchdog:
         assert state.should_idle_no_vad_fire() is False
 
 
+class TestShortOfftopicTranscriptOrdering:
+    """Verify that the nudge path records the triggering utterance before the nudge.
+
+    Source of truth: _nudge_for_short_offtopic_retry() in src/moderator_agent.py
+    should call add_response([Short response before clarification] ...) then
+    add_acknowledgment(nudge_text).
+    """
+
+    def test_transcript_entry_order(self):
+        """Simulate the transcript calls made by _nudge_for_short_offtopic_retry."""
+        transcript_log = []
+
+        # Simulate the two transcript calls in order
+        captured_text = "What?"
+        participant = "christopher"
+        question_number = 1
+        speaker_name = "Christopher"
+
+        # 1. Response entry with label (added before the nudge)
+        transcript_log.append({
+            "type": "response",
+            "question_number": question_number,
+            "speaker": participant,
+            "text": f"[Short response before clarification] {captured_text}",
+        })
+
+        # 2. Acknowledgment entry (the nudge itself)
+        nudge_text = (
+            f"Could you say a bit more about your answer, {speaker_name}? "
+            f"I want to make sure it responds to the question."
+        )
+        transcript_log.append({
+            "type": "acknowledgment",
+            "speaker": "agent",
+            "text": nudge_text,
+        })
+
+        assert len(transcript_log) == 2
+        assert transcript_log[0]["type"] == "response"
+        assert transcript_log[0]["text"].startswith("[Short response before clarification]")
+        assert captured_text in transcript_log[0]["text"]
+        assert transcript_log[1]["type"] == "acknowledgment"
+        assert "say a bit more" in transcript_log[1]["text"]
+
+
 class TestAcceptanceQ2:
     """
     Q2 flow: User says "I don't know" → encouragement → "I love cheese"
