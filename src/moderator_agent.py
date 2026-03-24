@@ -3898,31 +3898,13 @@ class CommunityModeratorAgent(Agent):
 
             # Use direct TTS for closing (no LLM) — avatar stays connected
             # so the closing speech renders visually and audibly
-            try:
-                logger.critical("🎤 CLOSING: Using direct TTS (no LLM)")
-                import time as _time
-                _closing_tts_start = _time.time()
-                closing_handle = self.agent_session.say(closing_text, allow_interruptions=False)
-                await closing_handle
-                try:
-                    await asyncio.wait_for(closing_handle.wait_for_playout(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    logger.warning("Closing TTS playout timed out after 60s")
-                # wait_for_playout() resolves when frames are queued (~0.5s), not when
-                # the client finishes playback. Sleep for estimated remaining duration
-                # so the closing message is fully heard before avatar cleanup.
-                _closing_elapsed = _time.time() - _closing_tts_start
-                _closing_estimated = _estimate_tts_duration(closing_text)
-                _closing_remaining = max(_closing_estimated - _closing_elapsed, 0.0)
-                if _closing_remaining > 0:
-                    logger.info(
-                        f"Waiting {_closing_remaining:.1f}s for estimated closing TTS playback "
-                        f"({len(closing_text)} chars)"
-                    )
-                    await asyncio.sleep(_closing_remaining)
-                await asyncio.sleep(2)
-            except RuntimeError as e:
-                logger.warning(f"Could not speak completion message, session may be closing: {e}")
+            logger.critical("🎤 CLOSING: Using direct TTS (no LLM)")
+            await self._say_and_wait_for_playback(
+                closing_text,
+                context="closing_message",
+                playout_timeout=60.0,
+            )
+            await asyncio.sleep(2)  # Extra buffer before avatar cleanup
 
             # Clean up avatar AFTER closing TTS is confirmed complete
             await self._cleanup_avatar()
