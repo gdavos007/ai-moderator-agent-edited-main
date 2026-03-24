@@ -246,6 +246,44 @@ def _is_disfluent_starter(text: str) -> bool:
     return all(w in _DISFLUENT_STARTER_TOKENS for w in words)
 
 
+# Greeting / acknowledgment / mic-check tokens that should be ignored as
+# non-substantive turn-start chatter on the FIRST utterance only.
+# These are NOT in _DISFLUENT_STARTER_TOKENS because they carry meaning in
+# later utterances (e.g., "Sure" as agreement to a follow-up).
+_FIRST_UTTERANCE_GREETING_TOKENS = frozenset({
+    "sure", "thanks", "thank", "morning", "evening", "afternoon",
+    "good", "nice", "meet", "to", "how", "are", "doing", "fine",
+    "great", "welcome", "greetings",
+})
+
+# Multi-word greeting phrases checked via substring match.
+_FIRST_UTTERANCE_GREETING_PHRASES = (
+    "thank you",
+    "good morning",
+    "good evening",
+    "good afternoon",
+    "how are you",
+    "nice to meet you",
+    "nice to meet",
+)
+
+
+def _is_first_utterance_greeting(text: str) -> bool:
+    """Return True if text is a greeting/acknowledgment with no substantive content.
+
+    Uses the same ALL-words semantics as _is_disfluent_starter(): every word
+    must be either a disfluent token or a greeting token.  This prevents
+    masking real answers that happen to start with a greeting, e.g.
+    "Sure, I think the product is great" → False.
+    """
+    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
+    words = [w for w in words if w]
+    if not words:
+        return False  # Empty text is handled by disfluency guard
+    allowed = _DISFLUENT_STARTER_TOKENS | _FIRST_UTTERANCE_GREETING_TOKENS
+    return all(w in allowed for w in words)
+
+
 def _normalize_for_offtopic_compare(text: str) -> str:
     """Lowercase, strip punctuation and collapse whitespace for off-topic repeat detection."""
     import re as _re
@@ -1587,6 +1625,7 @@ class CommunityModeratorAgent(Agent):
         self.turn_time_exceeded = False
         self._ack_already_spoken = False
         self._prewarmed_ack_text = None
+        self._first_utterance_greeting_guard_used = False
         self._transition_filler_said = False
         self._estimated_remaining_tts = 0.0
 
@@ -2005,6 +2044,53 @@ class CommunityModeratorAgent(Agent):
             if not _got_new_text:
                 break  # Deadline hit or no new speech → fall through to LLM
             # Loop back: re-check if new captured_text is still disfluent
+
+        # ── FIRST-UTTERANCE GREETING GUARD ──────────────────────────────────
+        # If the very first captured utterance after question delivery is a
+        # greeting / acknowledgment / mic-check token (e.g. "Sure", "Thanks",
+        # "Good morning"), treat it as non-substantive turn-start chatter:
+        # skip off-topic analysis, do NOT increment _short_offtopic_count,
+        # and continue polling with a one-time deadline extension.
+        if (not self._first_utterance_greeting_guard_used
+                and not self.encouragement_given
+                and not self.relevance_prompt_given
+                and self._short_offtopic_count == 0
+                and _is_first_utterance_greeting(captured_text)):
+            self._first_utterance_greeting_guard_used = True
+            logger.info(
+                f"[{question_context}] First-utterance greeting guard — treating as "
+                f"non-substantive turn-start chatter: '{captured_text[:60]}'"
+            )
+            if self._polling_deadline is not None:
+                import time as _time
+                new_deadline = _time.time() + DISFLUENCY_EXTENSION_BUDGET
+                if new_deadline > self._polling_deadline:
+                    self._polling_deadline = new_deadline
+                    logger.info(
+                        f"[{question_context}] Extended polling deadline by "
+                        f"{DISFLUENCY_EXTENSION_BUDGET}s after greeting guard"
+                    )
+            self.captured_response = None
+            self._response_ready.clear()
+            self.latest_user_response = None
+            self.response_captured = False
+            self.last_stt_fragment = ""
+            self._turn_accumulated_text = ""
+            self.pending_stt_transcript = None
+            self.response_fragments = []
+            self.last_fragment_time = None
+            self.actual_respondent = None
+            self.waiting_for_response = True
+            self.last_speech_time = None
+            self._had_stt_transcript_this_turn = False
+            self._idle_no_vad_nudge_fired = False
+            self._stt_nudge_given = False
+            self._first_fragment_time = None
+            self._user_stopped_speaking_at = None
+            self._silence_watchdog_fired = False
+            if not self.user_currently_speaking:
+                self._first_vad_speaking_time = None
+            return "retry"
 
         response_to_analyze = captured_text
 
