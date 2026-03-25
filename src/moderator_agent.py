@@ -669,9 +669,11 @@ def is_repeat_request(text: str) -> bool:
         return False
 
     # ── Substring-match phrases ──────────────────────────────────────────
+    # Keep this list limited to request forms that are unlikely to appear
+    # inside normal answers. Generic fragments like "repeat", "one more time",
+    # or "the last part" are handled by stricter regexes below so narrative
+    # answers such as "I repeat myself when I'm nervous" are not false positives.
     repeat_phrases = [
-        # Explicit "repeat"
-        "repeat",
         # "say … again"
         "say that again",
         "say it again",
@@ -702,8 +704,6 @@ def is_repeat_request(text: str) -> bool:
         "can you repeat",
         "could you repeat",
         "please repeat",
-        # "one more time"
-        "one more time",
         "again please",
         # politeness / mishearing
         "pardon",
@@ -727,11 +727,6 @@ def is_repeat_request(text: str) -> bool:
         "what again",
         "huh",
         "what?",
-        # "last part" / "first part" variants (without "what was")
-        "the last part",
-        "the first part",
-        "last part of the question",
-        "first part of the question",
     ]
 
     for phrase in repeat_phrases:
@@ -762,12 +757,18 @@ def is_repeat_request(text: str) -> bool:
 
     # ── Regex patterns for harder-to-catch variants ──────────────────────
     _repeat_patterns = [
+        # Standalone repeat command: "repeat", "repeat that please"
+        r"^\s*repeat(?:\s+(?:that|it|the question))?(?:\s+please)?[.?!]*$",
+        # Standalone "one more time" request, but not narrative usage
+        r"^\s*one more time(?:\s+please)?[.?!]*$",
         # "say … again" with anything in between: "can you say the question again"
         r"\bsay\b.{0,30}\bagain\b",
         # "hear … last/first part": "I didn't hear the last part"
         r"\bhear\b.{0,20}\b(last|first)\s*part\b",
         # "what was … part": "what was the second part"
         r"\bwhat\s+was\b.{0,20}\bpart\b",
+        # Explicit requests for the first/last part of the question.
+        r"\b(?:can|could)\s+you\b.{0,20}\b(last|first)\s+part(?:\s+of\s+the\s+question)?\b",
     ]
     for pattern in _repeat_patterns:
         if re.search(pattern, text_lower):
