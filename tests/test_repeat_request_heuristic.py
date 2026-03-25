@@ -23,7 +23,6 @@ import re
 # ── Mirror of is_repeat_request() logic from src/moderator_agent.py ──────────
 
 REPEAT_PHRASES = [
-    "repeat",
     "say that again",
     "say it again",
     "say the question again",
@@ -52,7 +51,6 @@ REPEAT_PHRASES = [
     "can you repeat",
     "could you repeat",
     "please repeat",
-    "one more time",
     "again please",
     "pardon",
     "excuse me",
@@ -73,16 +71,15 @@ REPEAT_PHRASES = [
     "what again",
     "huh",
     "what?",
-    "the last part",
-    "the first part",
-    "last part of the question",
-    "first part of the question",
 ]
 
 REPEAT_PATTERNS = [
+    r"^\s*repeat(?:\s+(?:that|it|the question))?(?:\s+please)?[.?!]*$",
+    r"^\s*one more time(?:\s+please)?[.?!]*$",
     r"\bsay\b.{0,30}\bagain\b",
     r"\bhear\b.{0,20}\b(last|first)\s*part\b",
     r"\bwhat\s+was\b.{0,20}\bpart\b",
+    r"\b(?:can|could)\s+you\b.{0,20}\b(last|first)\s+part(?:\s+of\s+the\s+question)?\b",
 ]
 
 SHORT_REPEAT = {"what", "what?", "huh", "huh?", "sorry", "sorry?", "come again", "come again?"}
@@ -169,6 +166,10 @@ NEGATIVE_CASES = [
     "That's a good question, let me think",
     "No, I haven't",
     "Well, in my experience the government needs to invest more",
+    "I liked the last part best.",
+    "The first part was the easiest for me.",
+    "It happened one more time last week.",
+    "I repeat myself when I'm nervous.",
 ]
 
 # ── Length-gate regression cases (from real sessions) ────────────────────────
@@ -252,12 +253,12 @@ class TestLengthGate:
     def test_boundary_length(self):
         """Responses right at the boundary."""
         # 60 chars or fewer should still be checked
-        short = "x" * 50 + " repeat"
+        short = "Can you say that one more time please?"
         assert len(short) <= HEURISTIC_MAX_LENGTH
         assert is_repeat_request(short) is True
 
-        # Over 60 chars should be skipped
-        long = "x" * 55 + " repeat"
+        # Over 60 chars should be skipped even if they contain a request phrase
+        long = short + " I was distracted by background noise just now."
         assert len(long) > HEURISTIC_MAX_LENGTH
         assert is_repeat_request(long) is False
 
@@ -273,3 +274,10 @@ class TestRegexPatterns:
 
     def test_what_was_second_part(self):
         assert is_repeat_request("What was the second part?") is True
+
+    def test_standalone_repeat_command(self):
+        assert is_repeat_request("Repeat") is True
+        assert is_repeat_request("Repeat that please") is True
+
+    def test_standalone_one_more_time(self):
+        assert is_repeat_request("One more time please") is True
