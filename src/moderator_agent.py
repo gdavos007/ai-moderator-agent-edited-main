@@ -5030,13 +5030,17 @@ async def create_moderator_session(
 
     @ctx.room.on("track_published")
     def on_track_published(publication, participant):
-        """Subscribe to audio tracks from all participants (including late joiners).
-        Skip avatar tracks — we do not want STT/moderation logic on avatar audio."""
-        from livekit.rtc import TrackKind
+        """Subscribe to audio tracks from human participants only.
+        Skip all agent participants (avatar, duplicate moderators, etc.)."""
+        from livekit.rtc import TrackKind, ParticipantKind
 
-        # Never subscribe STT to avatar audio tracks
-        if moderator._is_avatar_identity(participant.identity):
-            logger.info(f"AVATAR_LIFECYCLE track_published skipped for avatar: {participant.identity} (kind={publication.kind})")
+        # Skip ALL agent participants — not just the avatar
+        if getattr(participant, "kind", None) == ParticipantKind.PARTICIPANT_KIND_AGENT:
+            logger.info(f"track_published skipped for agent participant: {participant.identity} (kind={participant.kind})")
+            return
+        # Fallback: identity-based check for agents that lack .kind metadata
+        if moderator._is_avatar_identity(participant.identity) or participant.identity.startswith("agent"):
+            logger.info(f"track_published skipped for agent identity: {participant.identity}")
             return
 
         logger.critical(f"🔥 TRACK_PUBLISHED EVENT: {participant.identity}, kind={publication.kind}, sid={publication.sid}")

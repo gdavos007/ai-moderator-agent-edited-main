@@ -17,6 +17,8 @@ import os
 import sys
 import json
 import asyncio
+import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -40,6 +42,7 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env.local")
 from livekit import api
 
 app = FastAPI(title="AI Survey - Join Portal")
+logger = logging.getLogger(__name__)
 
 # Setup paths
 WEB_DIR = Path(__file__).parent.parent
@@ -144,90 +147,95 @@ def generate_participant_token(room_name: str, participant_name: str, identity: 
     return token.to_jwt()
 
 
-async def create_room_if_needed(room_name: str, max_participants: int = 10, has_observer: bool = False) -> bool:
-    """Create a LiveKit room if it doesn't exist"""
-    url, api_key, api_secret = get_livekit_credentials()
-    livekit_api = api.LiveKitAPI(url, api_key, api_secret)
+# ── Per-room locking to prevent duplicate agent dispatch ──────────────────────
+_room_locks: defaultdict = defaultdict(asyncio.Lock)
+_dispatched_rooms: set = set()
 
-    # Build room metadata (same format as start_fresh_survey.py)
-    room_metadata = {
-        "expected_participants": max_participants,
-        "has_observer": has_observer
-    }
 
-    try:
-        # Check if room exists
-        response = await livekit_api.room.list_rooms(api.ListRoomsRequest())
-        existing_rooms = [r.name for r in (response.rooms or [])]
+async def ensure_room_and_agent(
+    room_name: str,
+    *,
+    max_participants: int = 10,
+    has_observer: bool = False,
+) -> bool:
+    """Create a LiveKit room and dispatch exactly one agent, atomically.
 
-        if room_name not in existing_rooms:
-            # Create room with metadata
+    Acquires a per-room asyncio.Lock so concurrent requests for the same room
+    cannot both decide to create/dispatch.  Room creation is idempotent (no
+    list_rooms precheck).  Agent presence is verified under the lock before
+    dispatching.
+
+    Returns True on success, False on error.
+    """
+    lock = _room_locks[room_name]
+    logger.info(f"[ensure] Acquiring lock for room {room_name}")
+
+    async with lock:
+        logger.info(f"[ensure] Lock acquired for room {room_name}")
+
+        # Fast path: already dispatched in a previous request
+        if room_name in _dispatched_rooms:
+            logger.info(f"[ensure] Agent already dispatched to {room_name} (cache hit)")
+            return True
+
+        url, api_key, api_secret = get_livekit_credentials()
+        livekit_api = api.LiveKitAPI(url, api_key, api_secret)
+
+        # ── Step 1: Create room (idempotent — LiveKit returns existing room) ─
+        room_metadata = {
+            "expected_participants": max_participants,
+            "has_observer": has_observer,
+        }
+        try:
             await livekit_api.room.create_room(
                 api.CreateRoomRequest(
                     name=room_name,
-                    empty_timeout=3600,  # 1 hour
+                    empty_timeout=3600,
                     max_participants=max_participants + 2 + (1 if has_observer else 0),
                     metadata=json.dumps(room_metadata),
                 )
             )
-            print(f"Created room {room_name} with metadata: {room_metadata}")
-            return True
-        return True
-    except Exception as e:
-        print(f"Error creating room: {e}")
-        return False
+            logger.info(f"[ensure] Room {room_name} created/confirmed (metadata={room_metadata})")
+        except Exception as e:
+            logger.error(f"[ensure] Room creation failed for {room_name}: {e}")
+            return False
 
-
-# Track rooms where agent has been dispatched (to prevent race condition duplicates)
-_dispatched_rooms: set = set()
-
-
-async def dispatch_agent_to_room(room_name: str) -> bool:
-    """Dispatch the survey agent to a room"""
-    global _dispatched_rooms
-
-    # Quick check: already dispatched to this room?
-    if room_name in _dispatched_rooms:
-        print(f"Agent already dispatched to room {room_name} (from cache)")
-        return True
-
-    url, api_key, api_secret = get_livekit_credentials()
-    livekit_api = api.LiveKitAPI(url, api_key, api_secret)
-
-    try:
-        # Check if agent already in room
-        # Note: ParticipantKind.PARTICIPANT_KIND_AGENT = 4 in LiveKit SDK
-        participants_response = await livekit_api.room.list_participants(
-            api.ListParticipantsRequest(room=room_name)
-        )
-        participants = participants_response.participants or []
-
-        # Check for agents - kind=4 is AGENT, also check identity prefix
-        agent_count = sum(1 for p in participants
-                        if p.kind == 4 or p.identity.startswith('agent'))
-
-        if agent_count > 0:
-            print(f"Agent already in room {room_name} (found {agent_count} agent(s))")
-            _dispatched_rooms.add(room_name)
-            return True
-
-        # Mark as dispatched BEFORE actual dispatch to prevent race conditions
-        _dispatched_rooms.add(room_name)
-
-        # Dispatch agent
-        await livekit_api.agent_dispatch.create_dispatch(
-            api.CreateAgentDispatchRequest(
-                room=room_name,
-                agent_name="survey-moderator"
+        # ── Step 2: Check for existing agent participants ────────────────────
+        try:
+            resp = await livekit_api.room.list_participants(
+                api.ListParticipantsRequest(room=room_name)
             )
-        )
-        print(f"Dispatched agent to room {room_name}")
-        return True
-    except Exception as e:
-        print(f"Error dispatching agent: {e}")
-        # Remove from cache on error so retry is possible
-        _dispatched_rooms.discard(room_name)
-        return False
+            participants = resp.participants or []
+            # kind=4 is PARTICIPANT_KIND_AGENT in LiveKit SDK
+            agent_count = sum(
+                1 for p in participants
+                if p.kind == 4 or p.identity.startswith("agent")
+            )
+            if agent_count > 0:
+                logger.info(
+                    f"[ensure] Agent already present in {room_name} "
+                    f"({agent_count} agent(s)) — skipping dispatch"
+                )
+                _dispatched_rooms.add(room_name)
+                return True
+        except Exception as e:
+            logger.warning(f"[ensure] Could not list participants for {room_name}: {e}")
+            # Proceed to dispatch anyway — worst case LiveKit rejects duplicate
+
+        # ── Step 3: Dispatch agent exactly once ──────────────────────────────
+        try:
+            await livekit_api.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    room=room_name,
+                    agent_name="survey-moderator",
+                )
+            )
+            _dispatched_rooms.add(room_name)
+            logger.info(f"[ensure] Agent dispatched to {room_name}")
+            return True
+        except Exception as e:
+            logger.error(f"[ensure] Agent dispatch failed for {room_name}: {e}")
+            return False
 
 
 # ============================================================
@@ -343,12 +351,11 @@ async def join_survey(join_request: JoinRequest):
     survey = active_surveys[survey_id]
     room_name = survey["room_name"]
 
-    # Create room if needed (pass has_observer so agent knows to wait)
-    await create_room_if_needed(room_name, max_participants=10, has_observer=has_observer)
-
-    # Dispatch agent
-    agent_dispatched = await dispatch_agent_to_room(room_name)
-    if not agent_dispatched:
+    # Create room + dispatch agent atomically (per-room lock prevents duplicate dispatch)
+    agent_ready = await ensure_room_and_agent(
+        room_name, max_participants=10, has_observer=has_observer,
+    )
+    if not agent_ready:
         raise HTTPException(status_code=500, detail="Could not start survey agent. Make sure agent.py is running.")
 
     # Generate identity based on role

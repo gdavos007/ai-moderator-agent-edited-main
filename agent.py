@@ -183,6 +183,23 @@ async def entrypoint(ctx: agents.JobContext):
         logger.info(f"Process PID: {multiprocessing.current_process().pid}")
         logger.info("=" * 80)
 
+        # ── Duplicate agent guard ────────────────────────────────────────────
+        # If another survey-moderator agent is already in the room (e.g. due
+        # to a dispatch race), exit immediately before welcome TTS / avatar.
+        from livekit.rtc import ParticipantKind
+        for participant in ctx.room.remote_participants.values():
+            is_agent = (
+                getattr(participant, "kind", None) == ParticipantKind.PARTICIPANT_KIND_AGENT
+                or participant.identity.startswith("agent")
+            )
+            if is_agent and participant.identity != ctx.room.local_participant.identity:
+                logger.warning(
+                    f"⚠️ DUPLICATE AGENT DETECTED — another agent already in room "
+                    f"{ctx.room.name}: {participant.identity} (kind={getattr(participant, 'kind', '?')}). "
+                    f"Exiting this job ({ctx.job.id}) to avoid double welcome/avatar."
+                )
+                return  # Exit entrypoint — no welcome, no avatar, no survey
+
         # Validate configuration
         config.validate()
 
