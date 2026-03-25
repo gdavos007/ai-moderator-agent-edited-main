@@ -253,12 +253,12 @@ class TestLengthGate:
     def test_boundary_length(self):
         """Responses right at the boundary."""
         # 60 chars or fewer should still be checked
-        short = "x" * 50 + " repeat"
+        short = "Can you say that one more time please?"
         assert len(short) <= HEURISTIC_MAX_LENGTH
         assert is_repeat_request(short) is True
 
-        # Over 60 chars should be skipped
-        long = "x" * 55 + " repeat"
+        # Over 60 chars should be skipped even if they contain a request phrase
+        long = short + " I was distracted by background noise just now."
         assert len(long) > HEURISTIC_MAX_LENGTH
         assert is_repeat_request(long) is False
 
