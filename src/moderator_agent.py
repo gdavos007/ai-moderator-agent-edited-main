@@ -3963,7 +3963,6 @@ class CommunityModeratorAgent(Agent):
         question = self.question_loader.get_next_question()
         if not question:
             logger.info("No more questions - survey complete!")
-            self._shutting_down = True
             self._cancel_all_monitor_tasks()
 
             # Unmute all participants - survey is over
@@ -3979,8 +3978,9 @@ class CommunityModeratorAgent(Agent):
                 closing_text = "Thank you for completing the survey. Your feedback is valuable."
                 logger.info("Using default closing message")
 
-            # Use direct TTS for closing (no LLM) — avatar stays connected
-            # so the closing speech renders visually and audibly
+            # Deliver closing TTS BEFORE enabling shutdown mode — the
+            # _say_and_wait_for_playback() helper returns immediately when
+            # _shutting_down is True, so we must speak first, then shut down.
             logger.critical("🎤 CLOSING: Using direct TTS (no LLM)")
             await self._say_and_wait_for_playback(
                 closing_text,
@@ -3988,6 +3988,9 @@ class CommunityModeratorAgent(Agent):
                 playout_timeout=60.0,
             )
             await asyncio.sleep(2)  # Extra buffer before avatar cleanup
+
+            # NOW enable shutdown mode — after closing TTS is confirmed complete
+            self._shutting_down = True
 
             # Clean up avatar AFTER closing TTS is confirmed complete
             await self._cleanup_avatar()
