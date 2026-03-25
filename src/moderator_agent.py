@@ -980,13 +980,21 @@ Examples:
 - Partial with explicit request: Question "What do you like AND dislike?", Response "I like the food. What else did you ask?": "relevant|no_claim|no_repeat|PARTIAL|I like the food.|what do you dislike"
 - Answered both parts: Question "Where do you live AND work?", Response "Dallas, I'm retired. What else?": "relevant|no_claim|no_repeat|NO_REPEAT||" (Both answered, no unanswered parts!)
 
-IMPORTANT: Default to NO_REPEAT. Only use PARTIAL when user EXPLICITLY asks for remaining parts AND there actually ARE unanswered parts."""
+IMPORTANT: Default to NO_REPEAT. Only use PARTIAL when user EXPLICITLY asks for remaining parts AND there actually ARE unanswered parts.
+
+5. META-COMMENTARY: If the participant is commenting on the survey PROCESS rather than answering the question, do NOT treat it as a repeat request, partial answer, or already-answered claim.
+   Examples of meta-commentary (classify as relevant, no_claim, no_repeat, NO_REPEAT):
+   - "You skipped the last part" / "You're skipping on that question" — complaint about delivery, NOT a request to repeat
+   - "I answered the question" / "I already said that" — frustration, NOT a genuine already-answered claim (use no_claim)
+   - "You didn't hear me" / "Why are you asking me again" — frustration, NOT a repeat request
+   - "That's the same question as before" — observation, NOT a repeat request
+   These responses may contain substantive content mixed with complaints. Extract and evaluate the substantive content."""
 
         user_prompt = f"""Question: {question_text}
 
 Participant's Response: {response_text}
 
-Analyze this response and output in the exact format: relevance|already_answered|partial_status|partial_answer|unanswered_questions"""
+Analyze this response and output in the exact format: relevance|already_answered|repeat_request|partial_status|partial_answer|unanswered_questions"""
 
         client = openai_client.AsyncOpenAI()
         llm_response = await client.chat.completions.create(
@@ -1028,6 +1036,29 @@ Analyze this response and output in the exact format: relevance|already_answered
                 partial_answer=partial_answer if partial_status == "PARTIAL" else "",
                 unanswered_questions=unanswered if partial_status in ("REPEAT_ONLY", "PARTIAL") else ""
             )
+
+            # ── Post-LLM sanity checks ────────────────────────────────
+            # 1. Downgrade weak PARTIAL: if unanswered_questions is a
+            #    single short word (e.g. "how") it's likely an LLM
+            #    hallucination, not a genuine unanswered sub-question.
+            if partial_status == "PARTIAL" and unanswered:
+                _unanswered_words = len(unanswered.split())
+                if _unanswered_words <= 1:
+                    logger.info(
+                        f"⚠️ Downgrading weak PARTIAL — unanswered_questions "
+                        f"too vague ({_unanswered_words} word): '{unanswered}'"
+                    )
+                    partial_status = "NO_REPEAT"
+                    partial_answer = ""
+                    unanswered = ""
+                    analysis = ResponseAnalysis(
+                        is_relevant=is_relevant,
+                        is_already_answered_claim=is_claim,
+                        is_repeat_request=is_repeat,
+                        partial_repeat_status=partial_status,
+                        partial_answer="",
+                        unanswered_questions="",
+                    )
 
             # Log warnings for special cases
             if not is_relevant:
@@ -1618,6 +1649,7 @@ class CommunityModeratorAgent(Agent):
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
+        self._first_nudge_given = False
         self.question_repeated = False
         self.relevance_prompt_given = False
         self.partial_repeat_handled = False
@@ -1888,6 +1920,15 @@ class CommunityModeratorAgent(Agent):
                     self.response_timeout_task.cancel()
                     self.response_timeout_task = None
 
+                # ── Single-owner guard: only one first nudge per turn ─
+                if self._first_nudge_given:
+                    logger.info(
+                        "idle-no-VAD: suppressing nudge — "
+                        "_first_nudge_given already set by timeout monitor"
+                    )
+                    return
+                self._first_nudge_given = True
+
                 if not tts_fully_spoken:
                     await self._safe_say(
                         PARTIAL_DELIVERY_NUDGE_TEXT,
@@ -2052,7 +2093,12 @@ class CommunityModeratorAgent(Agent):
         # "Good morning"), treat it as non-substantive turn-start chatter:
         # skip off-topic analysis, do NOT increment _short_offtopic_count,
         # and continue polling with a one-time deadline extension.
-        if (not self._first_utterance_greeting_guard_used
+        #
+        # SKIP if the disfluency guard already consumed its budget on this
+        # same text — double-handling the same utterance through both guards
+        # creates an excessive delay cascade (Bug 1, Q3 demo 2026-03-25).
+        if (not _disfluency_budget_used
+                and not self._first_utterance_greeting_guard_used
                 and not self.encouragement_given
                 and not self.relevance_prompt_given
                 and self._short_offtopic_count == 0
@@ -2085,6 +2131,7 @@ class CommunityModeratorAgent(Agent):
             self.last_speech_time = None
             self._had_stt_transcript_this_turn = False
             self._idle_no_vad_nudge_fired = False
+            self._first_nudge_given = False
             self._stt_nudge_given = False
             self._first_fragment_time = None
             self._user_stopped_speaking_at = None
@@ -2166,6 +2213,27 @@ class CommunityModeratorAgent(Agent):
             return "retry"
 
         # --- CHECK 3b: "ALREADY ANSWERED" CLAIM ---
+        # Sanity check: suppress claim on first interaction for this question.
+        # A participant cannot have "already answered" a question they are
+        # encountering for the first time — this is likely meta-commentary
+        # frustration (e.g. "I answered the question" after a perceived repeat).
+        if (analysis.is_already_answered_claim
+                and not self.already_answered_prompt_given
+                and not self.encouragement_given
+                and self._short_offtopic_count == 0
+                and not self.partial_repeat_handled):
+            logger.info(
+                f"⚠️ Suppressing already-answered claim on first interaction — "
+                f"likely meta-commentary: '{captured_text[:80]}'"
+            )
+            analysis = ResponseAnalysis(
+                is_relevant=analysis.is_relevant,
+                is_already_answered_claim=False,
+                is_repeat_request=analysis.is_repeat_request,
+                partial_repeat_status=analysis.partial_repeat_status,
+                partial_answer=analysis.partial_answer,
+                unanswered_questions=analysis.unanswered_questions,
+            )
         if analysis.is_already_answered_claim and not self.already_answered_prompt_given:
             self.already_answered_prompt_given = True
             responder = self.actual_respondent if self.actual_respondent else participant
@@ -2527,6 +2595,7 @@ class CommunityModeratorAgent(Agent):
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
+        self._first_nudge_given = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -2716,6 +2785,7 @@ class CommunityModeratorAgent(Agent):
         self.last_speech_time = None
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
+        self._first_nudge_given = False
         self._stt_nudge_given = False
         self._first_fragment_time = None
         self._user_stopped_speaking_at = None
@@ -2783,6 +2853,7 @@ class CommunityModeratorAgent(Agent):
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
+        self._first_nudge_given = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -3714,16 +3785,24 @@ class CommunityModeratorAgent(Agent):
     async def monitor_response_timeout(self, participant: str):
         """Monitor for response timeout and prompt/move on if no response.
 
-        Guards against overlapping the idle-no-VAD watchdog: if the agent
-        is currently speaking (``_tts_active`` property), the nudge is
-        suppressed because the watchdog is already re-prompting the question.
+        The first nudge sleep accounts for ``_estimated_remaining_tts`` so
+        we never prompt before the participant has heard the full question.
+        Uses ``_first_nudge_given`` to coordinate with the idle-no-VAD
+        watchdog so only one first-nudge fires per turn.
         """
         try:
             nudge_timeout = 15
             skip_timeout = 30
 
-            # Wait for participant to start responding
-            await asyncio.sleep(nudge_timeout)
+            # Account for TTS still playing to the client — do not start
+            # the no-response timer until audible delivery is complete.
+            _tts_remaining = getattr(self, '_estimated_remaining_tts', 0.0)
+            _effective_nudge = nudge_timeout + _tts_remaining
+            logger.info(
+                f"monitor_response_timeout: effective first-nudge sleep "
+                f"= {nudge_timeout}s + {_tts_remaining:.1f}s TTS = {_effective_nudge:.1f}s"
+            )
+            await asyncio.sleep(_effective_nudge)
 
             # Shutdown guard
             if self._shutting_down:
@@ -3737,29 +3816,32 @@ class CommunityModeratorAgent(Agent):
 
             # Check if they started speaking
             if self.last_speech_time is None and self.waiting_for_response:
+                # ── Single-owner guard: only one first nudge per turn ─
+                if self._first_nudge_given:
+                    logger.info(
+                        "monitor_response_timeout: suppressing nudge — "
+                        "_first_nudge_given already set by another watchdog"
+                    )
+                    return
+
                 # ── Guard: suppress nudge while agent is speaking ──────
-                # The idle-no-VAD watchdog may be in the middle of
-                # repeating the question.  Speaking over it with "Please
-                # go ahead..." creates a confusing double-prompt.
                 if self._tts_active:
                     logger.info(
                         "monitor_response_timeout: suppressing nudge — "
                         "agent TTS is active (likely idle watchdog re-prompt)"
                     )
-                    # Wait for current speech to finish via SDK
                     speech = self.agent_session.current_speech if self.agent_session else None
                     if speech and not speech.done():
                         try:
                             await asyncio.wait_for(speech.wait_for_playout(), timeout=10.0)
                         except asyncio.TimeoutError:
                             pass
-                    # After the re-prompt finishes, the user may start
-                    # speaking.  Re-check before nudging.
                     if self.last_speech_time is not None or not self.waiting_for_response:
                         logger.info("monitor_response_timeout: user responded after re-prompt — skipping nudge")
                         return
 
-                logger.warning(f"No response from {participant} after {nudge_timeout} seconds, prompting...")
+                self._first_nudge_given = True
+                logger.warning(f"No response from {participant} after {_effective_nudge:.0f}s (base={nudge_timeout}s + TTS={_tts_remaining:.1f}s), prompting...")
                 await self._safe_say(TIMEOUT_NUDGE_TEXT, allow_interruptions=False, context="timeout_nudge")
                 logger.info(f"🔊 Prompted participant with direct TTS: '{TIMEOUT_NUDGE_TEXT}'")
 
