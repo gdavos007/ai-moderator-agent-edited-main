@@ -1220,6 +1220,7 @@ class CommunityModeratorAgent(Agent):
         self.current_question_num = 0
         self.agent_session: Optional[AgentSession] = None
         self.waiting_for_response = False
+        self._response_epoch: int = 0  # Monotonic counter — stale async tasks compare against this to detect turn/window changes
         self.response_timeout_task: Optional[asyncio.Task] = None
         self.last_speech_time: Optional[datetime] = None
         self.user_currently_speaking = False  # Track if user is actively speaking (for polling)
@@ -1667,6 +1668,9 @@ class CommunityModeratorAgent(Agent):
         self.last_speech_time = None
         self._polling_start_time = _time.time()
 
+        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
+        self._response_epoch += 1
+
     async def _await_response(
         self,
         participant: str,
@@ -1689,7 +1693,7 @@ class CommunityModeratorAgent(Agent):
             self.response_timeout_task.cancel()
             self.response_timeout_task = None
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+            self.monitor_response_timeout(participant, epoch=self._response_epoch)
         )
 
         self._polling_deadline = _time.time() + polling_timeout
@@ -1958,8 +1962,9 @@ class CommunityModeratorAgent(Agent):
                     )
 
                 self.last_speech_time = None
+                self._response_epoch += 1
                 self.response_timeout_task = asyncio.create_task(
-                    self.monitor_response_timeout(participant)
+                    self.monitor_response_timeout(participant, epoch=self._response_epoch)
                 )
                 logger.info("Restarted timeout monitor after idle-no-VAD re-prompt")
 
@@ -2196,10 +2201,11 @@ class CommunityModeratorAgent(Agent):
             self.encouragement_given = False
             self.waiting_for_response = True
             self.last_speech_time = None
+            self._response_epoch += 1
             if self.response_timeout_task:
                 self.response_timeout_task.cancel()
             self.response_timeout_task = asyncio.create_task(
-                self.monitor_response_timeout(participant)
+                self.monitor_response_timeout(participant, epoch=self._response_epoch)
             )
             if self.turn_monitor_task:
                 self.turn_monitor_task.cancel()
@@ -2256,10 +2262,11 @@ class CommunityModeratorAgent(Agent):
             self.last_stt_fragment = ""
             self.waiting_for_response = True
             self.last_speech_time = None
+            self._response_epoch += 1
             if self.response_timeout_task:
                 self.response_timeout_task.cancel()
             self.response_timeout_task = asyncio.create_task(
-                self.monitor_response_timeout(participant)
+                self.monitor_response_timeout(participant, epoch=self._response_epoch)
             )
             if self.turn_monitor_task:
                 self.turn_monitor_task.cancel()
@@ -2606,11 +2613,14 @@ class CommunityModeratorAgent(Agent):
         self._first_vad_speaking_time = None
         self._stt_nudge_given = False
 
+        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
+        self._response_epoch += 1
+
         # ── Timeout monitoring ─────────────────────────────────────────
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+            self.monitor_response_timeout(participant, epoch=self._response_epoch)
         )
 
         # ── Turn monitoring ────────────────────────────────────────────
@@ -2794,10 +2804,11 @@ class CommunityModeratorAgent(Agent):
         if not self.user_currently_speaking:
             self._first_vad_speaking_time = None
 
+        self._response_epoch += 1
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+            self.monitor_response_timeout(participant, epoch=self._response_epoch)
         )
 
         if self.turn_monitor_task:
@@ -2864,11 +2875,14 @@ class CommunityModeratorAgent(Agent):
         self._first_vad_speaking_time = None
         self._stt_nudge_given = False
 
+        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
+        self._response_epoch += 1
+
         # ── Timeout monitoring ─────────────────────────────────────────
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant)
+            self.monitor_response_timeout(participant, epoch=self._response_epoch)
         )
 
         # ── Turn monitoring ────────────────────────────────────────────
@@ -3782,13 +3796,18 @@ class CommunityModeratorAgent(Agent):
         except Exception as e:
             logger.error(f"Error monitoring off-topic: {e}", exc_info=True)
 
-    async def monitor_response_timeout(self, participant: str):
+    async def monitor_response_timeout(self, participant: str, *, epoch: int):
         """Monitor for response timeout and prompt/move on if no response.
 
         The first nudge sleep accounts for ``_estimated_remaining_tts`` so
         we never prompt before the participant has heard the full question.
         Uses ``_first_nudge_given`` to coordinate with the idle-no-VAD
         watchdog so only one first-nudge fires per turn.
+
+        The *epoch* parameter ties this task to a specific response-collection
+        window.  If ``self._response_epoch`` has moved on (repeat, re-prompt,
+        off-topic reset …), this task silently exits instead of mutating
+        state that now belongs to a newer window.
         """
         try:
             nudge_timeout = 15
@@ -3799,10 +3818,18 @@ class CommunityModeratorAgent(Agent):
             _tts_remaining = getattr(self, '_estimated_remaining_tts', 0.0)
             _effective_nudge = nudge_timeout + _tts_remaining
             logger.info(
-                f"monitor_response_timeout: effective first-nudge sleep "
+                f"monitor_response_timeout(epoch={epoch}): effective first-nudge sleep "
                 f"= {nudge_timeout}s + {_tts_remaining:.1f}s TTS = {_effective_nudge:.1f}s"
             )
             await asyncio.sleep(_effective_nudge)
+
+            # ── Stale-epoch guard (post first sleep) ─────────────────
+            if self._response_epoch != epoch:
+                logger.info(
+                    f"monitor_response_timeout(epoch={epoch}): stale — "
+                    f"current epoch is {self._response_epoch}, exiting"
+                )
+                return
 
             # Shutdown guard
             if self._shutting_down:
@@ -3840,12 +3867,28 @@ class CommunityModeratorAgent(Agent):
                         logger.info("monitor_response_timeout: user responded after re-prompt — skipping nudge")
                         return
 
+                # ── Stale-epoch guard (pre nudge mutation) ───────────
+                if self._response_epoch != epoch:
+                    logger.info(
+                        f"monitor_response_timeout(epoch={epoch}): stale before nudge — "
+                        f"current epoch is {self._response_epoch}, exiting"
+                    )
+                    return
+
                 self._first_nudge_given = True
                 logger.warning(f"No response from {participant} after {_effective_nudge:.0f}s (base={nudge_timeout}s + TTS={_tts_remaining:.1f}s), prompting...")
                 await self._safe_say(TIMEOUT_NUDGE_TEXT, allow_interruptions=False, context="timeout_nudge")
                 logger.info(f"🔊 Prompted participant with direct TTS: '{TIMEOUT_NUDGE_TEXT}'")
 
                 await asyncio.sleep(skip_timeout - nudge_timeout)
+
+                # ── Stale-epoch guard (post second sleep) ────────────
+                if self._response_epoch != epoch:
+                    logger.info(
+                        f"monitor_response_timeout(epoch={epoch}): stale after skip sleep — "
+                        f"current epoch is {self._response_epoch}, exiting"
+                    )
+                    return
 
                 # Check if paused - don't timeout during pause
                 if self.survey_state == SurveyState.PAUSED:

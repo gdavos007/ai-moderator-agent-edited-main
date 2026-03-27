@@ -68,13 +68,14 @@ class MockModerator:
         self.current_question_num = 3
         self.current_turn = TurnInfo(participant, datetime.now())
 
+        self._response_epoch = 0
         self.response_timeout_task = MagicMock()
         self.response_timeout_task.cancel = MagicMock()
         self.turn_monitor_task = MagicMock()
         self.turn_monitor_task.cancel = MagicMock()
         self.agent_session = MagicMock()
 
-    def monitor_response_timeout(self, participant):
+    def monitor_response_timeout(self, participant, *, epoch=0):
         f = asyncio.Future()
         f.set_result(None)
         return f
@@ -101,6 +102,9 @@ def _reset_for_repeat_standalone(mod: MockModerator, participant: str, *, contex
     mod.waiting_for_response = True
     mod.last_speech_time = None
     mod._transition_filler_said = False
+
+    # Epoch bump — invalidates stale timeout tasks
+    mod._response_epoch += 1
 
     if mod.response_timeout_task:
         mod.response_timeout_task.cancel()
@@ -258,3 +262,150 @@ class TestFullRepeatScenario:
         assert mod.expected_respondent == "ganesh"
         assert mod.actual_respondent == "ganesh"
         assert "valuable" in mod.latest_user_response
+
+
+# ── Epoch-based stale-timeout regression tests ─────────────────────────────
+# Regression for Q2 Ganesh case (2026-03-26): timeout nudge → repeat request →
+# stale timeout task from the pre-repeat turn sets waiting_for_response=False
+# and the agent records [NO RESPONSE - TIMEOUT] even though the participant
+# was about to answer the repeated question.
+
+
+class _FakeTimeout:
+    """Simulates monitor_response_timeout logic with epoch guard."""
+
+    @staticmethod
+    def would_fire(mod: MockModerator, captured_epoch: int) -> bool:
+        """Return True if a timeout task holding *captured_epoch* would
+        set ``waiting_for_response = False`` — i.e. the stale-task race.
+
+        Mirrors the three epoch checks in the production
+        ``monitor_response_timeout``.
+        """
+        if mod._response_epoch != captured_epoch:
+            return False  # Stale — silently exit
+        if mod.last_speech_time is not None:
+            return False  # User spoke
+        if not mod.waiting_for_response:
+            return False  # Already handled
+        return True
+
+
+class TestRepeatAfterTimeoutEpochGuard:
+    """Regression: nudge → repeat → fresh answer must succeed.
+
+    Scenario from logs/agent.log 2026-03-26 12:17:54 Q#2 for Ganesh:
+      1. Timeout nudge fires ("Please go ahead and share your thoughts.")
+      2. Ganesh says "Can you repeat the question?"
+      3. Agent repeats question, calls _reset_for_repeat
+      4. A stale timeout task from the OLD turn wakes up and sees
+         last_speech_time=None / waiting_for_response=True (freshly reset)
+      5. BUG (pre-fix): stale task sets waiting_for_response=False → timeout
+      6. FIX: epoch guard prevents stale task from acting
+    """
+
+    def test_stale_timeout_cannot_end_repeated_turn(self):
+        """A timeout task from the pre-repeat epoch must NOT set
+        waiting_for_response=False on the repeated turn."""
+        mod = MockModerator("ganesh")
+
+        # Simulate: first turn starts, timeout monitor captures epoch
+        mod._response_epoch = 1
+        mod.waiting_for_response = True
+        stale_epoch = mod._response_epoch  # epoch=1
+
+        # Timeout nudge fires, user says "repeat", _reset_for_repeat runs
+        _reset_for_repeat_standalone(mod, "ganesh", context="heuristic_repeat")
+
+        # After reset, epoch has advanced
+        assert mod._response_epoch == stale_epoch + 1
+        assert mod.waiting_for_response is True
+        assert mod.last_speech_time is None  # freshly cleared
+
+        # Stale task wakes up and tries to fire — epoch guard blocks it
+        assert not _FakeTimeout.would_fire(mod, stale_epoch), (
+            "Stale timeout task must NOT fire after epoch has advanced"
+        )
+
+        # Verify the current-epoch task CAN still fire (if timeout actually expires)
+        assert _FakeTimeout.would_fire(mod, mod._response_epoch), (
+            "Current-epoch timeout must still be able to fire"
+        )
+
+    def test_nudge_then_repeat_then_fresh_answer_accepted(self):
+        """After repeat, participant answers — must NOT be timed out."""
+        mod = MockModerator("ganesh")
+        mod._response_epoch = 1
+        mod.waiting_for_response = True
+        stale_epoch = mod._response_epoch
+
+        # Timeout nudge → repeat → reset
+        _reset_for_repeat_standalone(mod, "ganesh", context="heuristic_repeat")
+        current_epoch = mod._response_epoch
+        assert current_epoch == stale_epoch + 1
+
+        # Participant speaks after the repeated question
+        mod.last_speech_time = datetime.now()
+        mod.actual_respondent = "ganesh"
+        mod.latest_user_response = "I believe opinion research is very valuable."
+        mod.response_captured = True
+
+        # Stale task from old epoch cannot fire
+        assert not _FakeTimeout.would_fire(mod, stale_epoch)
+        # Current-epoch task also cannot fire — user spoke (last_speech_time set)
+        assert not _FakeTimeout.would_fire(mod, current_epoch)
+        # waiting_for_response remains True until polling loop processes
+        assert mod.waiting_for_response is True
+
+    def test_repeated_turn_timeout_only_if_actually_expires(self):
+        """Repeated turn records [NO RESPONSE - TIMEOUT] ONLY if the
+        repeated turn's own timeout fires (same epoch, no speech)."""
+        mod = MockModerator("ganesh")
+        mod._response_epoch = 1
+        mod.waiting_for_response = True
+
+        # Repeat happens
+        _reset_for_repeat_standalone(mod, "ganesh", context="heuristic_repeat")
+        repeated_epoch = mod._response_epoch
+
+        # User does NOT speak after the repeat — genuine timeout
+        assert mod.last_speech_time is None
+        assert mod.waiting_for_response is True
+
+        # Current-epoch task can fire (this is correct behavior)
+        assert _FakeTimeout.would_fire(mod, repeated_epoch)
+
+        # Simulate the timeout firing
+        mod.waiting_for_response = False
+
+        # Now the stale pre-repeat task also wakes — still blocked
+        assert not _FakeTimeout.would_fire(mod, repeated_epoch - 1)
+
+    def test_epoch_increments_on_every_reset(self):
+        """Each _reset_for_repeat call must bump the epoch."""
+        mod = MockModerator("ganesh")
+        initial = mod._response_epoch
+
+        _reset_for_repeat_standalone(mod, "ganesh", context="repeat_1")
+        assert mod._response_epoch == initial + 1
+
+        _reset_for_repeat_standalone(mod, "ganesh", context="repeat_2")
+        assert mod._response_epoch == initial + 2
+
+    def test_multiple_stale_tasks_all_blocked(self):
+        """If multiple stale tasks exist (from cascading resets), ALL are
+        blocked by their respective epoch mismatches."""
+        mod = MockModerator("ganesh")
+        mod._response_epoch = 1
+        mod.waiting_for_response = True
+
+        epochs_captured = []
+        for i in range(3):
+            epochs_captured.append(mod._response_epoch)
+            _reset_for_repeat_standalone(mod, "ganesh", context=f"reset_{i}")
+
+        # All previously-captured epochs are stale
+        for old_epoch in epochs_captured:
+            assert not _FakeTimeout.would_fire(mod, old_epoch), (
+                f"Epoch {old_epoch} should be stale (current={mod._response_epoch})"
+            )
