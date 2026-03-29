@@ -841,32 +841,46 @@ body {
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 40px 20px;
+    padding: 20px;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
 }
 
-/* Video Grid - 2x2 CSS Grid Layout */
+/* Video Grid - Responsive layout for 1–10 participants */
 .video-grid {
     display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    grid-template-rows: repeat(2, 1fr);
-    gap: 20px;
-    max-width: 1200px;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 12px;
+    max-width: 1400px;
     width: 100%;
-    margin-bottom: 24px;
-    padding: 0 20px;
+    flex: 1;
+    min-height: 0;
+    align-content: center;
+    padding: 0 12px;
 }
+
+/* Dynamic column overrides for specific participant counts */
+.video-grid[data-tiles="1"] { grid-template-columns: 1fr; max-width: 800px; }
+.video-grid[data-tiles="2"] { grid-template-columns: repeat(2, 1fr); }
+.video-grid[data-tiles="3"] { grid-template-columns: repeat(3, 1fr); }
+.video-grid[data-tiles="4"] { grid-template-columns: repeat(2, 1fr); }
+.video-grid[data-tiles="5"],
+.video-grid[data-tiles="6"] { grid-template-columns: repeat(3, 1fr); }
+.video-grid[data-tiles="7"],
+.video-grid[data-tiles="8"] { grid-template-columns: repeat(4, 1fr); }
+.video-grid[data-tiles="9"],
+.video-grid[data-tiles="10"] { grid-template-columns: repeat(5, 1fr); }
 
 .video-tile {
     position: relative;
     width: 100%;
-    height: 100%;
     aspect-ratio: 16 / 9;
     background: rgba(0, 0, 0, 0.4);
     border-radius: var(--radius-lg);
     overflow: hidden;
     border: 2px solid transparent;
     transition: border-color 0.3s ease, box-shadow 0.3s ease;
-    min-height: 280px;
     /* Hint to compositor so border/shadow changes don't trigger layout */
     will-change: border-color, box-shadow;
 }
@@ -1438,14 +1452,13 @@ body {
 /* Responsive */
 @media (max-width: 768px) {
     .video-grid {
-        grid-template-columns: 1fr;
-        max-width: 600px;
+        grid-template-columns: 1fr !important;
+        max-width: 600px !important;
         padding: 0 10px;
     }
 
     .video-tile {
         aspect-ratio: 4 / 3;
-        min-height: 220px;
     }
 }
 
@@ -1481,7 +1494,7 @@ body {
     }
 
     .video-grid {
-        gap: 12px;
+        gap: 8px;
     }
 
     .agent-avatar-animated {

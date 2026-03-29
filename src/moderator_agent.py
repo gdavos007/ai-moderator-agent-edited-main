@@ -15,7 +15,8 @@ from difflib import get_close_matches
 
 from livekit import agents, api
 from livekit.agents import Agent, AgentSession, RoomInputOptions
-from livekit.plugins import openai, silero, noise_cancellation
+from livekit.plugins import openai, google, silero, noise_cancellation
+from livekit.agents import LanguageCode
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 import openai as openai_client  # Direct OpenAI client for relevance checks
 try:
@@ -498,6 +499,29 @@ def correct_transcription(text: str, expected_options: List[str]) -> str:
     return text
 
 
+
+# Meta-commentary phrases: conversational remarks about the interaction mechanics
+# (e.g. "you're talking to me") that carry no substantive survey content.
+# Stripped before the uncertain-phrase check so they don't inflate the
+# substantive-word count.
+META_COMMENTARY_PHRASES = [
+    "you're talking to me",
+    "you are talking to me",
+    "are you talking to me",
+    "are you asking me",
+    "are you speaking to me",
+    "is that for me",
+    "was that for me",
+    "is that directed at me",
+    "that's for me",
+    "oh that's me",
+    "you mean me",
+    "do you mean me",
+    "is it my turn",
+    "is that my turn",
+]
+
+
 def is_uncertain_response(text: str) -> bool:
     """
     Detect if a response is ENTIRELY/PRIMARILY an uncertainty statement.
@@ -507,11 +531,16 @@ def is_uncertain_response(text: str) -> bool:
     partial answer along with "I don't know", this returns False to allow the
     partial answer to be processed.
 
+    Meta-commentary phrases (e.g. "you're talking to me") are stripped before
+    the substantive-content check so they don't mask an otherwise pure uncertain
+    response.
+
     Examples that return True:
     - "I don't know"
     - "I'm not sure"
     - "Honestly, I don't know"
     - "I really have no idea"
+    - "Oh, you're talking to me. Uh, I don't know."
 
     Examples that return False (have partial answers):
     - "I like the product but I don't know what else to say"
@@ -528,6 +557,14 @@ def is_uncertain_response(text: str) -> bool:
         return False
 
     text_lower = text.lower().strip()
+
+    # ── Strip meta-commentary phrases before substantive-content check ──
+    for meta_phrase in META_COMMENTARY_PHRASES:
+        if meta_phrase in text_lower:
+            logger.info(f"Stripping meta-commentary phrase '{meta_phrase}' from: '{text}'")
+            text_lower = text_lower.replace(meta_phrase, " ", 1)
+    # Clean up leftover whitespace and punctuation fragments
+    text_lower = re.sub(r'\s+', ' ', text_lower).strip()
 
     # Common uncertainty phrases
     uncertain_phrases = [
@@ -5113,7 +5150,7 @@ async def create_moderator_session(
 
     session = AgentSession(
         stt=stt_instance,
-        llm=openai.LLM(
+       llm=openai.LLM(
             model=llm_model,
             temperature=temperature,  # CRITICAL: Must be 0.0 to prevent question generation
         ),

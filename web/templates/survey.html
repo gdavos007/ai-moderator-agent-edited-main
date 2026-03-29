@@ -59,7 +59,7 @@
         <!-- Main Content Area -->
         <main class="survey-main">
             <!-- Video Grid (Zoom-like layout) -->
-            <div class="video-grid">
+            <div class="video-grid" data-tiles="2">
                 <!-- AI Moderator (Anam avatar video shown when available, else placeholder) -->
                 <div class="video-tile agent-tile" id="agent-tile">
                     <div class="video-tile-content">
@@ -741,6 +741,14 @@
             console.log('Agent message received:', message);
         }
 
+        function updateTileCount() {
+            const grid = document.querySelector('.video-grid');
+            if (grid) {
+                const count = grid.querySelectorAll('.video-tile').length;
+                grid.setAttribute('data-tiles', Math.min(count, 10));
+            }
+        }
+
         function createRemoteParticipantTile(participant) {
             const container = document.getElementById('remote-participants-container');
             if (!container) return;
@@ -771,6 +779,7 @@
             `;
 
             container.appendChild(tile);
+            updateTileCount();
             console.log('Created tile for remote participant:', participant.identity);
 
             // Check if participant already has video track published
@@ -790,6 +799,7 @@
             const tile = document.getElementById(tileId);
             if (tile) {
                 tile.remove();
+                updateTileCount();
                 console.log('Removed tile for:', identity);
             }
         }

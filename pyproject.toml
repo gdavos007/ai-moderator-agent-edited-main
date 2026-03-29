@@ -4,21 +4,19 @@ version = "0.1.0"
 description = "AI-powered community discussion moderator using LiveKit"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = [
-    "livekit-agents[silero,turn-detector]~=1.2",
-    "livekit-plugins-noise-cancellation~=0.2",
-    "livekit-agents[openai]~=1.2",
-    "livekit-agents[anthropic]~=1.2",
-    "livekit-agents[anam]~=1.4",
-    "livekit-plugins-deepgram~=1.2",
-    "livekit-plugins-elevenlabs>=1.2",
-    "python-docx>=1.1.0",
-    "python-dotenv>=1.0.0",
-    "pandas>=2.3.3",
-    "fastapi>=0.128.6",
-    "uvicorn>=0.39.0",
-    "python-multipart>=0.0.20",
-    "jinja2>=3.1.6",
+dependencies = [ 
+    "livekit-agents[google,silero,turn-detector,openai,anthropic,anam]~=1.5", 
+    "livekit-plugins-google~=1.5",
+    "livekit-plugins-noise-cancellation~=0.2", 
+    "livekit-plugins-deepgram~=1.5", 
+    "livekit-plugins-elevenlabs>=1.5", 
+    "python-docx>=1.1.0", 
+    "python-dotenv>=1.0.0", 
+    "pandas>=2.3.3", 
+    "fastapi>=0.128.6", 
+    "uvicorn>=0.39.0", 
+    "python-multipart>=0.0.20", 
+    "jinja2>=3.1.6", 
 ]
 
 [project.optional-dependencies]

@@ -21,6 +21,23 @@ import pytest
 
 # ── Mirror of is_uncertain_response() from src/moderator_agent.py ────────────
 
+META_COMMENTARY_PHRASES = [
+    "you're talking to me",
+    "you are talking to me",
+    "are you talking to me",
+    "are you asking me",
+    "are you speaking to me",
+    "is that for me",
+    "was that for me",
+    "is that directed at me",
+    "that's for me",
+    "oh that's me",
+    "you mean me",
+    "do you mean me",
+    "is it my turn",
+    "is that my turn",
+]
+
 UNCERTAIN_PHRASES = [
     "i don't know",
     "i do not know",
@@ -56,6 +73,13 @@ def is_uncertain_response(text: str) -> bool:
     if not text:
         return False
     text_lower = text.lower().strip()
+
+    # ── Strip meta-commentary phrases before substantive-content check ──
+    for meta_phrase in META_COMMENTARY_PHRASES:
+        if meta_phrase in text_lower:
+            text_lower = text_lower.replace(meta_phrase, " ", 1)
+    text_lower = re.sub(r'\s+', ' ', text_lower).strip()
+
     text_lower = re.sub(r"[^\w\s']", "", text_lower).strip()
 
     if text_lower in SHORT_UNCERTAIN:
@@ -161,6 +185,16 @@ class TestIsUncertainResponse:
         assert is_uncertain_response(text), f"Expected uncertain: '{text}'"
 
     @pytest.mark.parametrize("text", [
+        # Meta-commentary + uncertain phrase → should be uncertain
+        "Oh, you're talking to me. Uh, I don't know.",
+        "Are you talking to me? I'm not sure.",
+        "Is that for me? I have no idea.",
+        "Oh that's me. Pass.",
+    ])
+    def test_detects_uncertain_with_meta_commentary(self, text):
+        assert is_uncertain_response(text), f"Expected uncertain after meta-commentary stripping: '{text}'"
+
+    @pytest.mark.parametrize("text", [
         "I like the product but I don't know what else to say",
         "The color is nice, but I'm not sure about the price",
         "Five out of ten",
@@ -168,6 +202,19 @@ class TestIsUncertainResponse:
         "I would recommend it because the quality is good",
     ])
     def test_rejects_substantive(self, text):
+        assert not is_uncertain_response(text), f"Expected NOT uncertain: '{text}'"
+
+    @pytest.mark.parametrize("text", [
+        # Meta-commentary + real partial answer → NOT uncertain
+        "Oh, you're talking to me. I think the product is decent but I'm not sure about pricing.",
+        # Pure meta-commentary without uncertainty phrase → NOT uncertain
+        "You're talking to me.",
+        # Meta-commentary + repeat request → NOT uncertain (should reach is_repeat_request)
+        "Oh, you're talking to me? Can you repeat the question?",
+        # "talking to" in substantive context → must NOT be stripped
+        "I was talking to my friend about this, I don't know",
+    ])
+    def test_rejects_meta_commentary_without_pure_uncertainty(self, text):
         assert not is_uncertain_response(text), f"Expected NOT uncertain: '{text}'"
 
     def test_empty_string(self):
