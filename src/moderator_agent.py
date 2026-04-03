@@ -237,6 +237,27 @@ _DISFLUENT_STARTER_TOKENS = frozenset({
 
 DISFLUENCY_EXTENSION_BUDGET = 10.0  # Total extra seconds added to _polling_deadline for disfluency
 
+# Post-nudge extension: seconds added to polling deadline when participant activity
+# (VAD speaking or STT fragment) arrives after a timeout nudge has already fired.
+POST_NUDGE_EXTENSION_SECS = 15.0
+
+# Substance gate: minimum character count for a transcript to be committed
+# as a response.  Fragments shorter than this are accumulated in
+# _turn_accumulated_text instead of triggering _process_captured_response.
+# Threshold of 2 preserves "No", "OK", "Yes" while blocking "I", "A".
+MIN_COMMITTED_CHARS = 2
+
+# Pause cooldown: seconds after user stops speaking before fragment promotion
+# in the legacy fallback path of _await_response.  Prevents treating brief
+# thinking pauses as completed answers.
+PAUSE_COOLDOWN_QUANTITATIVE = 1.5  # increased from 1.0 — 1s is too aggressive
+PAUSE_COOLDOWN_QUALITATIVE = 2.5
+
+
+def _is_committable(text: str) -> bool:
+    """Return True if text is long enough to be committed as a response."""
+    return len(text.strip()) >= MIN_COMMITTED_CHARS
+
 
 def _is_disfluent_starter(text: str) -> bool:
     """Return True if text consists entirely of disfluent/filler tokens."""
@@ -1688,6 +1709,7 @@ class CommunityModeratorAgent(Agent):
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
         self._first_nudge_given = False
+        self._post_nudge_extended = False
         self.question_repeated = False
         self.relevance_prompt_given = False
         self.partial_repeat_handled = False
@@ -1707,6 +1729,44 @@ class CommunityModeratorAgent(Agent):
 
         # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
         self._response_epoch += 1
+
+    def _extend_post_nudge_window(self, participant: str) -> None:
+        """Extend the response window after a timeout nudge when participant activity arrives.
+
+        Called from both the VAD "speaking" handler and the STT fragment handler.
+        Fires at most once per nudge cycle (guarded by ``_post_nudge_extended``).
+        Clears ``_first_nudge_given`` so the restarted timeout task runs its full
+        two-phase cycle (nudge at 15s, give-up at 30s) instead of suppressing itself.
+        """
+        if not self._first_nudge_given or self._post_nudge_extended:
+            return
+
+        import time as _time
+        self._post_nudge_extended = True
+
+        # Extend polling deadline
+        if self._polling_deadline is not None:
+            fresh_deadline = _time.time() + POST_NUDGE_EXTENSION_SECS
+            if fresh_deadline > self._polling_deadline:
+                self._polling_deadline = fresh_deadline
+
+        # Clear _first_nudge_given so the restarted monitor_response_timeout
+        # won't suppress itself at line 3884 (single-owner guard)
+        self._first_nudge_given = False
+
+        # Bump epoch to invalidate any stale timeout task
+        self._response_epoch += 1
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+        )
+
+        logger.info(
+            f"POST-NUDGE EXTENSION: Extended polling deadline by "
+            f"{POST_NUDGE_EXTENSION_SECS}s after participant activity detected "
+            f"(participant={participant}, epoch={self._response_epoch})"
+        )
 
     async def _await_response(
         self,
@@ -1830,7 +1890,7 @@ class CommunityModeratorAgent(Agent):
                     if (not self.user_currently_speaking
                         and not self.turn_time_exceeded
                         and self._user_stopped_speaking_at is not None):
-                        pause_cooldown = 2.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                        pause_cooldown = PAUSE_COOLDOWN_QUALITATIVE if (self.current_question_object and self.current_question_object.is_qualitative()) else PAUSE_COOLDOWN_QUANTITATIVE
                         since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
                         if since_stopped < pause_cooldown:
                             continue
@@ -1861,12 +1921,13 @@ class CommunityModeratorAgent(Agent):
                         and (datetime.now() - self._first_fragment_time).total_seconds() < 2.0):
                         continue
                     if (self._user_stopped_speaking_at is not None):
-                        pause_cooldown = 2.5 if (self.current_question_object and self.current_question_object.is_qualitative()) else 1.0
+                        pause_cooldown = PAUSE_COOLDOWN_QUALITATIVE if (self.current_question_object and self.current_question_object.is_qualitative()) else PAUSE_COOLDOWN_QUANTITATIVE
                         since_stopped = (datetime.now() - self._user_stopped_speaking_at).total_seconds()
                         if since_stopped < pause_cooldown:
                             continue
-                    # Promote fragment to captured_response
-                    if self._is_delivery_confirmed(self.current_question_num, participant):
+                    # Promote fragment to captured_response (substance gate)
+                    if (self._is_delivery_confirmed(self.current_question_num, participant)
+                            and _is_committable(self.latest_user_response)):
                         self.captured_response = self.latest_user_response
                         self._silence_confirmed_time = datetime.now()
                         return self.captured_response
@@ -2159,6 +2220,13 @@ class CommunityModeratorAgent(Agent):
                         f"[{question_context}] Extended polling deadline by "
                         f"{DISFLUENCY_EXTENSION_BUDGET}s after greeting guard"
                     )
+            # ── Inline reset (greeting guard) ──────────────────────────────
+            # Resembles _nudge_for_short_offtopic_retry but intentionally
+            # preserves: encouragement_given, _encouragement_followup_given,
+            # _short_offtopic_count (escalation state), relevance_prompt_given,
+            # question_repeated.  Does NOT bump epoch or restart timeout —
+            # the existing timer continues counting (this is a lightweight
+            # discard, not a full turn reset).
             self.captured_response = None
             self._response_ready.clear()
             self.latest_user_response = None
@@ -2174,6 +2242,7 @@ class CommunityModeratorAgent(Agent):
             self._had_stt_transcript_this_turn = False
             self._idle_no_vad_nudge_fired = False
             self._first_nudge_given = False
+            self._post_nudge_extended = False
             self._stt_nudge_given = False
             self._first_fragment_time = None
             self._user_stopped_speaking_at = None
@@ -2229,7 +2298,11 @@ class CommunityModeratorAgent(Agent):
             _est = _estimate_tts_duration(analysis.unanswered_questions)
             self._estimated_remaining_tts = max(_est - _elapsed, 0.0)
 
-            # Reset for new response (keep accumulated_partial_answer)
+            # ── Inline reset (partial-repeat) ─────────────────────────────
+            # Resembles _reset_for_repeat but intentionally preserves:
+            # accumulated_partial_answer (will be merged with next response),
+            # question_repeated, relevance_prompt_given, _short_offtopic_count.
+            # DOES bump epoch and restart timeout + turn monitor (fresh window).
             self.captured_response = None
             self._response_ready.clear()
             self.latest_user_response = None
@@ -2292,6 +2365,11 @@ class CommunityModeratorAgent(Agent):
             await self._safe_say(rephrase_prompt, allow_interruptions=False, context="rephrase_prompt")
             self.survey_transcript.add_acknowledgment(rephrase_prompt)
 
+            # ── Inline reset (already-answered rephrase) ─────────────────
+            # Resembles _reset_for_repeat but intentionally preserves:
+            # already_answered_prompt_given (one-shot), encouragement state,
+            # _short_offtopic_count.  DOES bump epoch and restart timeout +
+            # turn monitor (fresh window for the rephrase attempt).
             self.captured_response = None
             self._response_ready.clear()
             self.latest_user_response = None
@@ -2640,11 +2718,13 @@ class CommunityModeratorAgent(Agent):
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
         self._first_nudge_given = False
+        self._post_nudge_extended = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
         self._ack_already_spoken = False
         self._prewarmed_ack_text = None
+        self._first_utterance_greeting_guard_used = False  # Fixed: was missing — greeting guard fires on repeated question
 
         # ── STT health-check state ────────────────────────────────────
         self._first_vad_speaking_time = None
@@ -2817,6 +2897,16 @@ class CommunityModeratorAgent(Agent):
 
         # Fresh retry state, but preserve short off-topic counters so a repeat
         # or second non-sequitur can still escalate on the next attempt.
+        #
+        # Intentionally NOT reset (lightweight retry, same escalation trajectory):
+        #   - encouragement_given: preserved so 2nd uncertain → move_on, not re-encourage
+        #   - _encouragement_followup_given: preserved for same reason
+        #   - _short_offtopic_count / _last_short_offtopic_norm: preserved for escalation
+        #   - question_repeated: preserved — user already heard repeat
+        #   - relevance_prompt_given: preserved — already redirected
+        #   - _first_utterance_greeting_guard_used: preserved — same turn
+        #
+        # DOES bump epoch and restart timeout task (fresh timeout window).
         self.captured_response = None
         self._response_ready.clear()
         self.latest_user_response = None
@@ -2833,6 +2923,7 @@ class CommunityModeratorAgent(Agent):
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
         self._first_nudge_given = False
+        self._post_nudge_extended = False
         self._stt_nudge_given = False
         self._first_fragment_time = None
         self._user_stopped_speaking_at = None
@@ -2893,15 +2984,20 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []
         self.last_fragment_time = None
         self.actual_respondent = None
+        self._turn_accumulated_text = ""  # Fixed: was missing — could carry forward off-topic text
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
+        self._encouragement_followup_given = False  # Fixed: was missing — silence watchdog needs fresh state
+        self._last_transcript_progress_time = None  # Fixed: was missing — silence watchdog reference point
+        self._silence_watchdog_fired = False  # Fixed: was missing — re-arms silence watchdog
         self.question_repeated = False
         self._short_offtopic_count = 0
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
         self._idle_no_vad_nudge_fired = False
         self._first_nudge_given = False
+        self._post_nudge_extended = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -5849,6 +5945,12 @@ async def create_moderator_session(
         moderator._had_stt_transcript_this_turn = True
         logger.info(f"STT fragment ({len(new_fragment)} chars): '{new_fragment[:80]}'")
 
+        # Post-nudge extension: if a nudge already fired, give the
+        # participant a fresh response window now that STT is arriving.
+        moderator._extend_post_nudge_window(
+            moderator.expected_respondent or "unknown"
+        )
+
     # PRIMARY EVENT: user_speech_committed — fires after VAD silence under server_vad
     @session.on("user_speech_committed")
     def on_user_speech_committed(message):
@@ -5898,6 +6000,25 @@ async def create_moderator_session(
                     f"delivery_state={_ds} for Q#{moderator.current_question_num}/{_expected}"
                 )
                 return
+
+        # ── Substance gate: block micro-fragments from brief pauses ──
+        # Fragments shorter than MIN_COMMITTED_CHARS (e.g., "I") are accumulated
+        # rather than committed, preventing premature processing.
+        if not _is_committable(transcript):
+            if moderator._turn_accumulated_text:
+                moderator._turn_accumulated_text += " " + transcript
+            else:
+                moderator._turn_accumulated_text = transcript
+            logger.info(
+                f"SUBSTANCE GATE (committed): micro-fragment ({len(transcript)} chars) "
+                f"accumulated, not committed: '{transcript}'"
+            )
+            # Still update tracking so watchdogs know speech happened
+            moderator._last_transcript_progress_time = _time_mod.time()
+            moderator._had_stt_transcript_this_turn = True
+            if moderator._first_fragment_time is None:
+                moderator._first_fragment_time = datetime.now()
+            return
 
         # ── Apply STT correction if response options exist ──
         corrected = transcript
@@ -5993,6 +6114,12 @@ async def create_moderator_session(
                 moderator.response_timeout_task.cancel()
                 moderator.response_timeout_task = None
             moderator.last_speech_time = datetime.now()
+
+            # Post-nudge extension: if a nudge already fired, give the
+            # participant a fresh response window now that they're speaking.
+            moderator._extend_post_nudge_window(
+                moderator.expected_respondent or "unknown"
+            )
             # NOTE: Do NOT set waiting_for_response = False here.
             # The polling loop interprets that flag as "timeout confirmed no-response."
             # Cancelling the timeout task + setting last_speech_time is sufficient

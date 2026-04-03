@@ -864,7 +864,11 @@ body {
 .video-grid[data-tiles="1"] { grid-template-columns: 1fr; max-width: 800px; }
 .video-grid[data-tiles="2"] { grid-template-columns: repeat(2, 1fr); }
 .video-grid[data-tiles="3"] { grid-template-columns: repeat(3, 1fr); }
-.video-grid[data-tiles="4"] { grid-template-columns: repeat(2, 1fr); }
+.video-grid[data-tiles="4"] {
+    grid-template-columns: repeat(2, 1fr);
+    /* Cap each row so two 16:9 rows + gap never exceed the grid height */
+    grid-template-rows: repeat(2, minmax(0, calc((100% - 12px) / 2)));
+}
 .video-grid[data-tiles="5"],
 .video-grid[data-tiles="6"] { grid-template-columns: repeat(3, 1fr); }
 .video-grid[data-tiles="7"],
@@ -875,6 +879,7 @@ body {
 .video-tile {
     position: relative;
     width: 100%;
+    min-height: 0;            /* allow tile to shrink below aspect-ratio height */
     aspect-ratio: 16 / 9;
     background: rgba(0, 0, 0, 0.4);
     border-radius: var(--radius-lg);
@@ -904,7 +909,7 @@ body {
 .video-tile video {
     width: 100%;
     height: 100%;
-    object-fit: cover;
+    object-fit: cover;  /* fill tile on desktop; overridden to contain on small screens */
 }
 
 .video-tile .video-placeholder {
@@ -1449,7 +1454,7 @@ body {
     flex: 1;
 }
 
-/* Responsive */
+/* Responsive — tablet */
 @media (max-width: 768px) {
     .video-grid {
         grid-template-columns: 1fr !important;
@@ -1457,8 +1462,25 @@ body {
         padding: 0 10px;
     }
 
+    /* 4-tile override: keep 2x2 on tablet instead of stacking */
+    .video-grid[data-tiles="4"] {
+        grid-template-columns: repeat(2, 1fr) !important;
+        grid-template-rows: repeat(2, minmax(0, calc((100% - 12px) / 2)));
+        max-width: 100% !important;
+    }
+
     .video-tile {
         aspect-ratio: 4 / 3;
+    }
+
+    /* Preserve 16:9 for 4-tile 2x2 so tiles fill rows without squishing */
+    .video-grid[data-tiles="4"] .video-tile {
+        aspect-ratio: 16 / 9;
+    }
+
+    /* Contain video within constrained rows — prevents crop/squish */
+    .video-grid[data-tiles="4"] .video-tile video {
+        object-fit: contain;
     }
 }
 
@@ -1495,6 +1517,22 @@ body {
 
     .video-grid {
         gap: 8px;
+    }
+
+    /* 4-tile: 2x2 with tighter gap on small screens */
+    .video-grid[data-tiles="4"] {
+        grid-template-columns: repeat(2, 1fr) !important;
+        grid-template-rows: repeat(2, minmax(0, calc((100% - 8px) / 2)));
+        gap: 8px;
+        max-width: 100% !important;
+    }
+
+    .video-grid[data-tiles="4"] .video-tile {
+        aspect-ratio: 16 / 9;
+    }
+
+    .video-grid[data-tiles="4"] .video-tile video {
+        object-fit: contain;
     }
 
     .agent-avatar-animated {
