@@ -15,9 +15,11 @@ import pytest
 from datetime import datetime
 from typing import Dict, Tuple, Optional
 
+from src.domain.delivery_state import delivery_key, set_delivery_state, is_delivery_confirmed
+
 
 class DeliveryStateMixin:
-    """Replica of the delivery-state logic from CommunityModeratorAgent."""
+    """Wraps domain delivery-state functions with agent-like interface for tests."""
 
     def __init__(self):
         self.question_delivery_state: Dict[Tuple[int, str], str] = {}
@@ -32,15 +34,13 @@ class DeliveryStateMixin:
         self.last_stt_fragment: str = ""
 
     def _delivery_key(self, question_num: int, participant: str) -> Tuple[int, str]:
-        return (question_num, participant)
+        return delivery_key(question_num, participant)
 
     def _set_delivery_state(self, question_num: int, participant: str, state: str, context: str = ""):
-        key = self._delivery_key(question_num, participant)
-        self.question_delivery_state[key] = state
+        set_delivery_state(self.question_delivery_state, question_num, participant, state)
 
     def _is_delivery_confirmed(self, question_num: int, participant: str) -> bool:
-        key = self._delivery_key(question_num, participant)
-        return self.question_delivery_state.get(key) == "delivered"
+        return is_delivery_confirmed(self.question_delivery_state, question_num, participant)
 
 
 def delivery_guard_check(mod: DeliveryStateMixin) -> bool:

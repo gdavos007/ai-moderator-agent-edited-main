@@ -5,41 +5,11 @@ The guard fires only on the first captured utterance after question delivery
 when the text is purely a greeting / acknowledgment / mic-check token.
 It prevents premature off-topic analysis on social phrases like "Sure",
 "Thanks", "Good morning" without polluting the global disfluency token set.
-
-Source of truth: src/moderator_agent.py — _is_first_utterance_greeting(),
-_FIRST_UTTERANCE_GREETING_TOKENS, _FIRST_UTTERANCE_GREETING_PHRASES,
-_DISFLUENT_STARTER_TOKENS.
 """
 
 import unittest
 
-
-# ── Mirror constants / helpers from moderator_agent.py ──
-
-_DISFLUENT_STARTER_TOKENS = frozenset({
-    "well", "um", "uh", "uhm", "erm", "hmm", "ah", "oh",
-    "like", "so", "i", "think", "guess", "mean",
-    "you", "know", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "that", "the", "a",
-    "it", "its", "is", "was", "not", "really",
-    "hi", "hello", "hey",
-})
-
-_FIRST_UTTERANCE_GREETING_TOKENS = frozenset({
-    "sure", "thanks", "thank", "morning", "evening", "afternoon",
-    "good", "nice", "meet", "to", "how", "are", "doing", "fine",
-    "great", "welcome", "greetings",
-})
-
-
-def _is_first_utterance_greeting(text: str) -> bool:
-    """Return True if text is a greeting/acknowledgment with no substantive content."""
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return False
-    allowed = _DISFLUENT_STARTER_TOKENS | _FIRST_UTTERANCE_GREETING_TOKENS
-    return all(w in allowed for w in words)
+from src.domain.text_analysis import _is_first_utterance_greeting
 
 
 class TestFirstUtteranceGreetingClassification(unittest.TestCase):

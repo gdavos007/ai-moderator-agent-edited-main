@@ -21,22 +21,8 @@ from dataclasses import dataclass
 from unittest.mock import AsyncMock, MagicMock
 from enum import Enum
 
-
-# ── Minimal replicas of production types ─────────────────────────────────────
-
-@dataclass
-class TurnInfo:
-    participant_identity: str
-    start_time: datetime
-    actual_speaking_duration: float = 0.0
-
-
-class SurveyState(Enum):
-    WELCOME = "welcome"
-    WAITING_FOR_OBSERVER = "waiting_for_observer"
-    RUNNING = "running"
-    PAUSED = "paused"
-    COMPLETED = "completed"
+from src.domain.turn_state import TurnInfo, reset_for_repeat_flags
+from src.domain.constants import SurveyState
 
 
 # ── Mock moderator with the fields that _reset_for_repeat touches ────────────
@@ -47,33 +33,53 @@ class MockModerator:
     def __init__(self, participant: str):
         self.expected_respondent = participant
         self.actual_respondent = participant  # stale from "repeat" utterance
+        self.captured_response = "Can you repeat the question?"
         self.latest_user_response = "Can you repeat the question?"
         self.response_captured = True
         self.last_stt_fragment = "Can you repeat the question?"
         self.pending_stt_transcript = "Can you repeat the question?"
         self.response_fragments = ["Can you repeat the question?"]
         self.last_fragment_time = datetime.now()
+        self._turn_accumulated_text = "Can you repeat the question?"
         self.encouragement_given = True
+        self._encouragement_followup_given = False
+        self._last_transcript_progress_time = None
+        self._short_offtopic_count = 0
+        self._last_short_offtopic_norm = None
+        self._had_stt_transcript_this_turn = True
         self.waiting_for_response = False
         self.last_speech_time = datetime.now()
         self._transition_filler_said = True
+        self._ack_already_spoken = False
+        self._prewarmed_ack_text = None
+        self._first_utterance_greeting_guard_used = False
+        self._first_vad_speaking_time = None
         self.user_currently_speaking = True
         self.turn_time_exceeded = True
         self.turn_transition_time = None
-        self._polling_deadline = time.time() + 10  # only 10s left
 
         self.max_turn_duration = 20
         self.first_interrupt_grace = 10
         self.second_interrupt_grace = 15
         self.current_question_num = 3
-        self.current_turn = TurnInfo(participant, datetime.now())
+        self.current_turn = TurnInfo(participant_identity=participant, start_time=datetime.now())
 
-        self._response_epoch = 0
+        from src.domain.deadline_manager import DeadlineManager
+        self._deadline_mgr = DeadlineManager()
+        self._deadline_mgr.set_deadline(10)  # only 10s left
         self.response_timeout_task = MagicMock()
         self.response_timeout_task.cancel = MagicMock()
         self.turn_monitor_task = MagicMock()
         self.turn_monitor_task.cancel = MagicMock()
         self.agent_session = MagicMock()
+
+    @property
+    def _response_epoch(self):
+        return self._deadline_mgr.epoch
+
+    @property
+    def _polling_deadline(self):
+        return self._deadline_mgr.deadline
 
     def monitor_response_timeout(self, participant, *, epoch=0):
         f = asyncio.Future()
@@ -87,25 +93,22 @@ class MockModerator:
 
 
 def _reset_for_repeat_standalone(mod: MockModerator, participant: str, *, context: str = ""):
-    """Standalone replica of CommunityModeratorAgent._reset_for_repeat."""
+    """Wrapper around domain reset_for_repeat_flags plus task/timing management."""
     saved_expected = mod.expected_respondent
 
-    mod.latest_user_response = None
-    mod.response_captured = False
-    mod.last_stt_fragment = ""
-    mod.pending_stt_transcript = None
-    mod.response_fragments = []
-    mod.last_fragment_time = None
-    mod.actual_respondent = None
+    # Use domain function for core flag reset (no longer bumps epoch)
+    reset_for_repeat_flags(mod)
 
-    mod.encouragement_given = False
-    mod.waiting_for_response = True
-    mod.last_speech_time = None
-    mod._transition_filler_said = False
+    # Deadline/watchdog reset via DeadlineManager (bumps epoch, sets deadline)
+    polling_timeout = (
+        mod.max_turn_duration
+        + mod.first_interrupt_grace
+        + mod.second_interrupt_grace
+        + 10
+    )
+    mod._deadline_mgr.reset_for_retry(polling_timeout)
 
-    # Epoch bump — invalidates stale timeout tasks
-    mod._response_epoch += 1
-
+    # Task management (not in domain function)
     if mod.response_timeout_task:
         mod.response_timeout_task.cancel()
     mod.response_timeout_task = asyncio.Future()
@@ -124,14 +127,6 @@ def _reset_for_repeat_standalone(mod: MockModerator, participant: str, *, contex
     mod.turn_monitor_task.set_result(None)
 
     mod.turn_transition_time = datetime.now()
-
-    polling_timeout = (
-        mod.max_turn_duration
-        + mod.first_interrupt_grace
-        + mod.second_interrupt_grace
-        + 10
-    )
-    mod._polling_deadline = time.time() + polling_timeout
 
     assert mod.expected_respondent == saved_expected, (
         f"REPEAT BUG: expected_respondent changed from "
@@ -310,7 +305,7 @@ class TestRepeatAfterTimeoutEpochGuard:
         mod = MockModerator("ganesh")
 
         # Simulate: first turn starts, timeout monitor captures epoch
-        mod._response_epoch = 1
+        mod._deadline_mgr.bump_epoch()  # epoch -> 1
         mod.waiting_for_response = True
         stale_epoch = mod._response_epoch  # epoch=1
 
@@ -335,7 +330,7 @@ class TestRepeatAfterTimeoutEpochGuard:
     def test_nudge_then_repeat_then_fresh_answer_accepted(self):
         """After repeat, participant answers — must NOT be timed out."""
         mod = MockModerator("ganesh")
-        mod._response_epoch = 1
+        mod._deadline_mgr.bump_epoch()  # epoch -> 1
         mod.waiting_for_response = True
         stale_epoch = mod._response_epoch
 
@@ -361,7 +356,7 @@ class TestRepeatAfterTimeoutEpochGuard:
         """Repeated turn records [NO RESPONSE - TIMEOUT] ONLY if the
         repeated turn's own timeout fires (same epoch, no speech)."""
         mod = MockModerator("ganesh")
-        mod._response_epoch = 1
+        mod._deadline_mgr.bump_epoch()  # epoch -> 1
         mod.waiting_for_response = True
 
         # Repeat happens
@@ -396,7 +391,7 @@ class TestRepeatAfterTimeoutEpochGuard:
         """If multiple stale tasks exist (from cascading resets), ALL are
         blocked by their respective epoch mismatches."""
         mod = MockModerator("ganesh")
-        mod._response_epoch = 1
+        mod._deadline_mgr.bump_epoch()  # epoch -> 1
         mod.waiting_for_response = True
 
         epochs_captured = []

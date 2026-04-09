@@ -139,36 +139,12 @@ class TestInterruptRuntimeError:
 # Bug 5: Short response off-topic guard
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Minimum thresholds mirrored from moderator_agent.py
-MIN_OFFTOPIC_WORDS = 8
-MIN_OFFTOPIC_CHARS = 40
-
-# Filler tokens mirrored from moderator_agent.py
-_FILLER_TOKENS = frozenset({
-    "um", "uh", "uhm", "erm", "hmm", "hm", "ah", "oh",
-    "like", "so", "well", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "you", "know", "mean",
-    "i", "a", "the", "is", "it", "that", "this",
-})
-
-
-def _substantive_word_count(text: str) -> int:
-    """Count words that are NOT filler/hedge tokens."""
-    return sum(1 for w in text.lower().split() if w.strip(".,!?…") not in _FILLER_TOKENS)
+from src.domain.text_analysis import _substantive_word_count, _is_too_short_for_offtopic
 
 
 def should_skip_offtopic_check(response_text: str) -> bool:
-    """Mirror of _is_too_short_for_offtopic() from moderator_agent.py.
-
-    Three gates (any one triggers skip):
-      1. Total word count < MIN_OFFTOPIC_WORDS
-      2. Total char count < MIN_OFFTOPIC_CHARS
-      3. Substantive (non-filler) word count < 4
-    """
-    words = len(response_text.split())
-    chars = len(response_text)
-    substantive = _substantive_word_count(response_text)
-    return words < MIN_OFFTOPIC_WORDS or chars < MIN_OFFTOPIC_CHARS or substantive < 4
+    """Thin wrapper around domain _is_too_short_for_offtopic for test readability."""
+    return _is_too_short_for_offtopic(response_text)
 
 
 class TestSubstantiveWordCount:

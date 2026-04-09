@@ -14,9 +14,7 @@ import time
 
 import pytest
 
-
-# ── Mirrored constant ────────────────────────────────────────────────────────
-POST_NUDGE_EXTENSION_SECS = 15.0
+from src.domain.constants import POST_NUDGE_EXTENSION_SECS
 
 
 # ── Minimal state simulation ─────────────────────────────────────────────────

@@ -4,23 +4,16 @@ Tests for substance gate and pause cooldown constants (Commits 2 & 3).
 Covers the invariant: neither on_user_speech_committed nor the legacy
 fallback in _await_response may commit text shorter than MIN_COMMITTED_CHARS.
 Also tests the pause cooldown constants.
-
-NOTE: These tests mirror logic from src/moderator_agent.py rather than
-importing it directly (heavy LiveKit dependencies).
 """
 
 import pytest
 
-
-# ── Mirrored constants ────────────────────────────────────────────────────────
-MIN_COMMITTED_CHARS = 2
-PAUSE_COOLDOWN_QUANTITATIVE = 1.5
-PAUSE_COOLDOWN_QUALITATIVE = 2.5
-
-
-def _is_committable(text: str) -> bool:
-    """Mirror of the _is_committable helper in moderator_agent.py."""
-    return len(text.strip()) >= MIN_COMMITTED_CHARS
+from src.domain.text_analysis import _is_committable
+from src.domain.constants import (
+    MIN_COMMITTED_CHARS,
+    PAUSE_COOLDOWN_QUANTITATIVE,
+    PAUSE_COOLDOWN_QUALITATIVE,
+)
 
 
 # ── Tests for _is_committable ─────────────────────────────────────────────────

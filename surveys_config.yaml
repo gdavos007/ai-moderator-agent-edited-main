@@ -3,10 +3,16 @@
 
 # Default survey to use (can be overridden with SURVEY_ID environment variable)
 # Example: SURVEY_ID=quantitative_example python agent.py
-default_survey: "orange_county_resident_employee_survey"
+default_survey: "poc_focus_group"
 
 # Survey definitions
 surveys:
+  - survey_id: "poc_focus_group"
+    name: "POC Focus Group"
+    description: "Focus group discussion about healthcare available to seniors enrolled in a PACE program"
+    questions_file: "topic_questions/poc_focusgroup.json"
+    enabled: true
+
   - survey_id: "quantitative_example"
     name: "Orange County Survey - Unified Format"
     description: "Example quantitative survey"

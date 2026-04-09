@@ -7,125 +7,18 @@ Covers:
   3. Silence watchdog triggers after N seconds of no transcript progression
   4. Flag reset consistency across question and participant transitions
   5. Scenario: user says "I don't know" → encouragement → 10s silence → watchdog fires
-
-NOTE: These tests mirror logic from src/moderator_agent.py rather than importing it
-directly (heavy LiveKit dependencies). If you change the uncertain-response constants,
-phrase lists, or _handle_uncertain_response() in the source, update tests here too.
 """
 
-import re
 import time
 
 import pytest
 
-
-# ── Mirror of is_uncertain_response() from src/moderator_agent.py ────────────
-
-META_COMMENTARY_PHRASES = [
-    "you're talking to me",
-    "you are talking to me",
-    "are you talking to me",
-    "are you asking me",
-    "are you speaking to me",
-    "is that for me",
-    "was that for me",
-    "is that directed at me",
-    "that's for me",
-    "oh that's me",
-    "you mean me",
-    "do you mean me",
-    "is it my turn",
-    "is that my turn",
-]
-
-UNCERTAIN_PHRASES = [
-    "i don't know",
-    "i do not know",
-    "don't know",
-    "dunno",
-    "i'm not sure",
-    "i am not sure",
-    "not sure",
-    "i haven't got a clue",
-    "no clue",
-    "clueless",
-    "beats me",
-    "no idea",
-    "i have no idea",
-    "no opinion",
-    "i have no opinion",
-    "uncertain",
-    "i'm uncertain",
-    "i am uncertain",
-    "not certain",
-    "i'm not certain",
-    "i am not certain",
-    "pass",
-    "skip",
-    "next question",
-]
-
-SHORT_UNCERTAIN = {"idk", "dunno", "dk", "na", "n/a", "none", "nothing"}
-
-
-def is_uncertain_response(text: str) -> bool:
-    """Standalone copy of the heuristic for testing."""
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-
-    # ── Strip meta-commentary phrases before substantive-content check ──
-    for meta_phrase in META_COMMENTARY_PHRASES:
-        if meta_phrase in text_lower:
-            text_lower = text_lower.replace(meta_phrase, " ", 1)
-    text_lower = re.sub(r'\s+', ' ', text_lower).strip()
-
-    text_lower = re.sub(r"[^\w\s']", "", text_lower).strip()
-
-    if text_lower in SHORT_UNCERTAIN:
-        return True
-
-    # STT misrecognition workaround: "I know" or "I know." might be "I don't know"
-    if text_lower in ("i know", "i know."):
-        return True
-
-    filler_prefixes = [
-        "honestly", "well", "um", "uh", "hmm", "like",
-        "to be honest", "truthfully", "frankly",
-        "i really", "i just", "i mean",
-    ]
-    cleaned = text_lower
-    for prefix in filler_prefixes:
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):].lstrip(" ,").strip()
-
-    for phrase in UNCERTAIN_PHRASES:
-        if phrase in cleaned:
-            remaining = cleaned.replace(phrase, "", 1).strip()
-            remaining = re.sub(r"[^\w\s]", "", remaining).strip()
-            filler_words = {"i", "well", "um", "uh", "like", "really", "just",
-                            "honestly", "hmm", "yeah", "ok", "okay", "so",
-                            "mean", "guess", "think", "basically"}
-            remaining_words = remaining.split()
-            substantive_words = [w for w in remaining_words if w.lower() not in filler_words]
-            if len(substantive_words) <= 2:
-                return True
-
-    return False
-
-
-# ── Constants mirrored from src/moderator_agent.py ────────────────────────────
-
-POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE = (
-    "That's perfectly fine, {name}. Let's move on to the next question."
+from src.domain.text_analysis import is_uncertain_response
+from src.domain.constants import (
+    SILENCE_WATCHDOG_TIMEOUT,
+    POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE,
+    SILENCE_WATCHDOG_PROMPT_TEMPLATE,
 )
-
-SILENCE_WATCHDOG_PROMPT_TEMPLATE = (
-    "I just want to make sure we're still connected, {name}. "
-    "Would you like me to repeat the question, or shall we move on?"
-)
-
-SILENCE_WATCHDOG_TIMEOUT = 12.0
 
 
 # ── Simulated state for _handle_uncertain_response logic ─────────────────────

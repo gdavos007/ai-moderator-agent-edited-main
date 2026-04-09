@@ -11,105 +11,13 @@ containing substantive content alongside a trigger phrase are deferred to
 LLM analysis.  This prevents false positives like:
   - "I'm an engineer. I live in Dallas. And what's the last part?"
   - "you're asking me to repeat / speak up and I'm like, I am talking"
-
-NOTE: This duplicates the core matching logic from is_repeat_request() in
-src/moderator_agent.py rather than importing it (the module has heavy livekit
-dependencies).  If you change the phrase list in the source, update it here too.
 """
 
-import re
+from src.domain.text_analysis import is_repeat_request
 
-
-# ── Mirror of is_repeat_request() logic from src/moderator_agent.py ──────────
-
-REPEAT_PHRASES = [
-    "say that again",
-    "say it again",
-    "say the question again",
-    "say that one more time",
-    "come again",
-    "what was the question",
-    "what's the question",
-    "what is the question",
-    "what was the last part",
-    "what was the first part",
-    "what was that last part",
-    "what was that first part",
-    "didn't hear",
-    "did not hear",
-    "didn't catch",
-    "did not catch",
-    "couldn't hear",
-    "could not hear",
-    "can you say that again",
-    "could you say that again",
-    "can you say the last part",
-    "can you say the first part",
-    "could you say the last part",
-    "could you say the first part",
-    "can you say that one more time",
-    "can you repeat",
-    "could you repeat",
-    "please repeat",
-    "again please",
-    "pardon",
-    "excuse me",
-    "sorry what",
-    "what did you say",
-    "what did you ask",
-    "i missed that",
-    "missed the question",
-    "didn't understand",
-    "did not understand",
-    "didn't get that",
-    "did not get that",
-    "i didn't get the question",
-    "can't hear",
-    "cannot hear",
-    "speak up",
-    "louder please",
-    "what again",
-    "huh",
-    "what?",
-]
-
-REPEAT_PATTERNS = [
-    r"^\s*repeat(?:\s+(?:that|it|the question))?(?:\s+please)?[.?!]*$",
-    r"^\s*one more time(?:\s+please)?[.?!]*$",
-    r"\bsay\b.{0,30}\bagain\b",
-    r"\bhear\b.{0,20}\b(last|first)\s*part\b",
-    r"\bwhat\s+was\b.{0,20}\bpart\b",
-    r"\b(?:can|could)\s+you\b.{0,20}\b(last|first)\s+part(?:\s+of\s+the\s+question)?\b",
-]
-
-SHORT_REPEAT = {"what", "what?", "huh", "huh?", "sorry", "sorry?", "come again", "come again?"}
-
-
+# Length gate constant used in boundary tests — mirrors the value inside
+# is_repeat_request() in src/domain/text_analysis.py.
 HEURISTIC_MAX_LENGTH = 60
-
-
-def is_repeat_request(text: str) -> bool:
-    """Standalone copy of the heuristic for testing without livekit imports."""
-    if not text:
-        return False
-    text_lower = text.lower().strip()
-
-    # Length gate: long responses likely contain substantive content — defer to LLM.
-    if len(text_lower) > HEURISTIC_MAX_LENGTH:
-        return False
-
-    for phrase in REPEAT_PHRASES:
-        if phrase in text_lower:
-            return True
-
-    for pattern in REPEAT_PATTERNS:
-        if re.search(pattern, text_lower):
-            return True
-
-    if text_lower in SHORT_REPEAT:
-        return True
-
-    return False
 
 
 # ── Positive cases: MUST be detected as repeat requests ──────────────────────
