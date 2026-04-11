@@ -18,9 +18,11 @@ COPY agent.py .
 COPY config/ ./config/
 COPY src/ ./src/
 COPY topic_questions/ ./topic_questions/
+COPY surveys_config.yaml .
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app/src
 
 # Run the agent with start command
 CMD ["python", "agent.py", "start"]

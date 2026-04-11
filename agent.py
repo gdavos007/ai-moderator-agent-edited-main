@@ -442,9 +442,12 @@ async def entrypoint(ctx: agents.JobContext):
             logger.info(f"🟢 Survey state: WELCOME → RUNNING (welcome/greeting complete, questions starting)")
 
             # #region agent log
-            import json as _json
-            with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
-                _f.write(_json.dumps({"location": "agent.py:state_transition", "message": "WELCOME → RUNNING transition", "data": {"survey_state": moderator.survey_state.value}, "timestamp": int(__import__('datetime').datetime.now().timestamp() * 1000), "hypothesisId": "B"}) + "\n")
+            try:
+                import json as _json
+                with open("/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log", "a") as _f:
+                    _f.write(_json.dumps({"location": "agent.py:state_transition", "message": "WELCOME → RUNNING transition", "data": {"survey_state": moderator.survey_state.value}, "timestamp": int(__import__('datetime').datetime.now().timestamp() * 1000), "hypothesisId": "B"}) + "\n")
+            except Exception:
+                pass  # Best-effort — path doesn't exist in Docker
             # #endregion
 
             # Clear any response fragments that may have accumulated during welcome

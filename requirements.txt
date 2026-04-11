@@ -1,11 +1,12 @@
-# LiveKit Agents SDK
-livekit-agents>=0.8.0
-livekit-plugins-openai>=0.6.0
-livekit-plugins-silero>=0.6.0
+# LiveKit Agents SDK (core + plugins)
+livekit-agents[google,silero,turn-detector,openai]~=1.5
+livekit-plugins-deepgram~=1.5
+livekit-plugins-noise-cancellation~=0.2
 
-# Optional STT/TTS providers (install as needed)
-livekit-plugins-deepgram>=0.6.0  # For Deepgram Nova-3, Flux STT and Aura TTS
-livekit-plugins-google>=0.6.0    # For Google Cloud Speech-to-Text
+# Optional providers
+livekit-plugins-anthropic~=1.5
+livekit-plugins-elevenlabs~=1.5
+livekit-plugins-anam~=1.5
 
 # Environment and Configuration
 python-dotenv>=1.0.0
@@ -17,14 +18,15 @@ python-docx>=1.0.0
 # Data Export and Analysis
 pandas>=2.0.0
 
-# LiveKit API (for join_survey.py)
+# LiveKit API
 livekit-api>=0.5.0
 
-# Zoom Bridge Integration (Phase 1: Recall.ai)
-fastapi>=0.104.0           # Webhook server
-uvicorn[standard]>=0.24.0  # ASGI server
-requests>=2.31.0           # HTTP client for Recall.ai API
-numpy>=1.24.0              # Audio data processing
-pydub>=0.25.0              # Audio format conversion (PCM to MP3)
-                           # Note: Also requires ffmpeg to be installed on system
-                           # Install with: brew install ffmpeg (macOS)
+# Web server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+requests>=2.31.0
+jinja2>=3.0.0
+
+# Audio processing
+numpy>=1.24.0
+pydub>=0.25.0
