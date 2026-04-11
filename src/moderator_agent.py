@@ -190,6 +190,8 @@ class CommunityModeratorAgent(Agent):
         self.agent_session: Optional[AgentSession] = None
         self.waiting_for_response = False
         self._deadline_mgr = DeadlineManager()
+        self._question_spoken_to_group: bool = False
+        self._question_callout_counter: int = 0
         self._turn_phase = TurnPhaseMachine(
             on_invalid_transition=lambda src, tgt: logger.error(
                 f"INVALID TURN PHASE: {src.value} -> {tgt.value} in {self.__class__.__name__}"
@@ -2869,6 +2871,7 @@ class CommunityModeratorAgent(Agent):
         """
         logger.warning(f"🚪 Ending survey early: {reason}")
         self._turn_phase.force_to(TurnPhase.IDLE)
+        self._question_spoken_to_group = False
 
         # Generate STT debug report
         try:
@@ -3089,6 +3092,7 @@ class CommunityModeratorAgent(Agent):
             category_announcement = ""
 
         self.current_question_num += 1
+        self._question_spoken_to_group = False
 
         # Detect if this is a multi-option question (e.g., "Choose THREE", "select 3")
         # These require longer collection windows since users pause between options
@@ -3268,6 +3272,7 @@ class CommunityModeratorAgent(Agent):
         # Change 3: Use explicit delivery states instead of a single "delivered"
         if tts_fully_spoken:
             self._set_delivery_state(self.current_question_num, participant, "delivered_full", context="ask_next_question")
+            self._question_spoken_to_group = True
         else:
             self._set_delivery_state(self.current_question_num, participant, "delivered_partial", context="ask_next_question_partial_tts")
             logger.warning(f"⚠️ Delivery partial — polling will proceed but timeout is suppressed")
@@ -3562,11 +3567,26 @@ class CommunityModeratorAgent(Agent):
         # Get participant's display name (from LiveKit token) for natural TTS
         participant_display_name = self.participant_manager.get_display_name(participant)
 
-        # Use the exact question text with display name (not lowercase identity)
-        exact_text_to_say = f"{participant_display_name}, {self.current_question}"
+        # Call on participant by name if full question already spoken to the group;
+        # otherwise speak the full question (e.g. after a partial first delivery).
+        if self._question_spoken_to_group:
+            _callout_idx = self._question_callout_counter % 4
+            _callout_templates = [
+                "{name}, what are your thoughts on this?",
+                "How about you, {name}?",
+                "{name}, what do you think?",
+                "And {name}, what's your take?",
+            ]
+            exact_text_to_say = _callout_templates[_callout_idx].format(name=participant_display_name)
+            self._question_callout_counter += 1
+        else:
+            exact_text_to_say = f"{participant_display_name}, {self.current_question}"
 
         # DEBUG LOGGING
-        logger.critical(f"🔁 REPEATING QUESTION #{self.current_question_num} for next participant")
+        if self._question_spoken_to_group:
+            logger.critical(f"🔁 CALLING ON next participant for Q#{self.current_question_num}")
+        else:
+            logger.critical(f"🔁 REPEATING QUESTION #{self.current_question_num} for next participant")
         logger.critical(f"👤 Next participant: {participant} (display: {participant_display_name})")
         logger.critical(f"🗣️  Exact text to say: {exact_text_to_say[:150]}...")
 
@@ -3614,6 +3634,7 @@ class CommunityModeratorAgent(Agent):
         # Change 3: Use explicit delivery states
         if tts_fully_spoken:
             self._set_delivery_state(self.current_question_num, participant, "delivered_full", context="move_to_next_participant")
+            self._question_spoken_to_group = True
         else:
             self._set_delivery_state(self.current_question_num, participant, "delivered_partial", context="move_to_next_participant_partial_tts")
             logger.warning(f"⚠️ Delivery partial — polling will proceed but timeout is suppressed")
