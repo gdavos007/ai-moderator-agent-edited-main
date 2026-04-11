@@ -11,7 +11,6 @@ import time as _time_mod
 from typing import Optional, Dict, Any, List, Set, Tuple
 from datetime import datetime, timedelta
 from dataclasses import dataclass
-from difflib import get_close_matches
 
 from livekit import agents, api
 from livekit.agents import Agent, AgentSession, RoomInputOptions
@@ -58,123 +57,47 @@ from .survey_data_export import SurveyDataExport
 from .survey_config import SurveyConfig
 from .stt_debug_logger import STTDebugLogger
 from .keyword_extractor import KeywordExtractor
-from enum import Enum
 
 # Setup logging
 logger = logging.getLogger(__name__)
 
 
-# ── TTS prompt constants ─────────────────────────────────────────────────────
-# Centralised here so every TTS utterance is easy to audit / translate.
-# Templates with {name} are formatted at call-sites with the participant's
-# display name.  Name-free constants must NEVER be changed to include names —
-# the question itself already addresses the participant.
-
-# Response timeout nudge (NO name — question already used it)
-TIMEOUT_NUDGE_TEXT = "Please go ahead and share your thoughts."
-
-# STT health-check nudge (name needed — may fire outside question context)
-STT_NUDGE_TEMPLATE = (
-    "I'm sorry {name}, I couldn't quite hear you. "
-    "Could you please repeat that a bit louder?"
+# ── Domain modules (extracted from this file) ────────────────────────────────
+from .domain.constants import (
+    TIMEOUT_NUDGE_TEXT, STT_NUDGE_TEMPLATE, GENTLE_WARNING_TEMPLATE,
+    FORCE_END_TEMPLATE, REPEAT_INTRO_TEMPLATE, PARTIAL_REPEAT_INTRO_TEMPLATE,
+    RELEVANCE_PROMPT_TEMPLATE, POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE,
+    SILENCE_WATCHDOG_PROMPT_TEMPLATE, PARTIAL_DELIVERY_NUDGE_TEXT,
+    AVATAR_DISCONNECT_TEXT, AVATAR_RECONNECT_TEXT,
+    SILENCE_WATCHDOG_TIMEOUT, IDLE_NO_VAD_TIMEOUT, TTS_SAFETY_MARGIN,
+    DISFLUENCY_EXTENSION_BUDGET, POST_NUDGE_EXTENSION_SECS,
+    MIN_COMMITTED_CHARS, PAUSE_COOLDOWN_QUANTITATIVE, PAUSE_COOLDOWN_QUALITATIVE,
+    AVATAR_STATE_IDLE, AVATAR_STATE_STARTING, AVATAR_STATE_CONNECTED,
+    AVATAR_STATE_DISCONNECTED, AVATAR_STATE_RECONNECTING, AVATAR_STATE_FAILED,
+    ANAM_AVATAR_IDENTITY,
+    MIN_OFFTOPIC_WORDS, MIN_OFFTOPIC_CHARS,
+    _BLATANT_OFFTOPIC_KEYWORDS, _BLATANT_OFFTOPIC_PHRASES,
+    _FILLER_TOKENS, _DISFLUENT_STARTER_TOKENS,
+    _FIRST_UTTERANCE_GREETING_TOKENS, _FIRST_UTTERANCE_GREETING_PHRASES,
+    META_COMMENTARY_PHRASES,
+    SurveyState,
 )
-
-# Turn-time gentle warning
-GENTLE_WARNING_TEMPLATE = (
-    "{name}, we're going to need to wrap it up so we can get to others. "
-    "Can you spend the next ten to fifteen seconds finishing your thoughts?"
+from .domain.text_analysis import (
+    _substantive_word_count, _is_too_short_for_offtopic, _estimate_tts_duration,
+    _is_committable, _is_disfluent_starter, _is_first_utterance_greeting,
+    _normalize_for_offtopic_compare, _has_blatant_offtopic_keywords,
+    is_uncertain_response, is_repeat_request,
+    is_avatar_identity as _is_avatar_identity_fn,
 )
-
-# Turn-time force end
-FORCE_END_TEMPLATE = (
-    "Thank you, {name}. We need to move on to ensure we complete all questions."
+from .domain.transcription import parse_multi_option_response, correct_transcription
+from .domain.observer import is_observer_command
+from .domain.delivery_state import (
+    delivery_key, set_delivery_state, is_delivery_confirmed, is_delivery_full,
 )
-
-# Repeat-request acknowledgment
-REPEAT_INTRO_TEMPLATE = "Of course, {name}. I'll repeat the question."
-
-# Partial-answer repeat acknowledgment
-PARTIAL_REPEAT_INTRO_TEMPLATE = "Got it, {name}. Let me repeat the rest of the question."
-
-# Off-topic / irrelevance redirect
-RELEVANCE_PROMPT_TEMPLATE = (
-    "Thank you {name}, but I don't think you quite answered the question. "
-    "I may be wrong, but I'm going to repeat the question and would you mind "
-    "answering again after I'm done repeating it?"
-)
-
-# Post-encouragement deterministic follow-up (encouragement already used once)
-POST_ENCOURAGEMENT_FOLLOWUP_TEMPLATE = (
-    "That's perfectly fine, {name}. Let's move on to the next question."
-)
-
-# Silence watchdog prompt — fires when no transcript progression for N seconds
-SILENCE_WATCHDOG_PROMPT_TEMPLATE = (
-    "I just want to make sure we're still connected, {name}. "
-    "Would you like me to repeat the question, or shall we move on?"
-)
-
-# Silence watchdog: seconds of no transcript progression before firing
-SILENCE_WATCHDOG_TIMEOUT = 12.0
-
-# Idle-no-VAD watchdog: seconds after question delivery with zero VAD
-# activity before we nudge the participant.  Covers cases where the user
-# stays completely quiet and VAD never fires (partial delivery, mic issues).
-IDLE_NO_VAD_TIMEOUT = 12.0
-
-# Extra seconds added to estimated TTS duration before idle watchdog can fire
-TTS_SAFETY_MARGIN = 3.0
-
-# Partial-delivery fallback nudge (NO name — re-asks question after)
-PARTIAL_DELIVERY_NUDGE_TEXT = (
-    "I'm not sure if you heard the full question. Let me repeat it."
-)
-
-# Avatar disconnect notice (NO name)
-AVATAR_DISCONNECT_TEXT = (
-    "Please bear with us for a moment — our visual display "
-    "had a brief interruption, but the survey will continue."
-)
-
-# Avatar reconnect success notice (NO name)
-AVATAR_RECONNECT_TEXT = (
-    "Our visual display is back. Let's continue."
-)
-
-# ── Avatar health states ────────────────────────────────────────────────────
-AVATAR_STATE_IDLE = "idle"            # Not started / not configured
-AVATAR_STATE_STARTING = "starting"    # start() in progress
-AVATAR_STATE_CONNECTED = "connected"  # Running normally
-AVATAR_STATE_DISCONNECTED = "disconnected"  # Lost connection
-AVATAR_STATE_RECONNECTING = "reconnecting"  # Reconnect attempt in-flight
-AVATAR_STATE_FAILED = "failed"        # Gave up after retries
-
-ANAM_AVATAR_IDENTITY = "anam-avatar-agent"
-
-# ── Off-topic short-response guard constants ──────────────────────────────────
-MIN_OFFTOPIC_WORDS = 3
-MIN_OFFTOPIC_CHARS = 40
-
-# Blatant off-topic topics where even a short answer is worth checking.
-_BLATANT_OFFTOPIC_KEYWORDS = frozenset({
-    "basketball", "breakfast", "cat", "cheese", "dinner", "dog",
-    "football", "lunch", "movie", "movies", "music", "pizza",
-    "soccer", "sport", "sports", "weather", "weekend",
-})
-_BLATANT_OFFTOPIC_PHRASES = (
-    "mind your own business",
-    "none of your business",
-)
-
-# Filler / hedge words that carry no substantive content.
-# Stripped before counting to avoid "um uh well like you know so" (7 words)
-# from reaching the word threshold.
-_FILLER_TOKENS = frozenset({
-    "um", "uh", "uhm", "erm", "hmm", "hm", "ah", "oh",
-    "like", "so", "well", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "you", "know", "mean",
-    "i", "a", "the", "is", "it", "that", "this",
-})
+from .domain.turn_state import TurnResult, TurnInfo
+from .domain.response_analysis import ResponseAnalysis, analyze_response, check_response_relevance
+from .domain.deadline_manager import DeadlineManager, WatchdogSignal
+from .domain.turn_phase import TurnPhase, TurnPhaseMachine
 
 
 _DEBUG_LOG_PATH = "/Users/ganeshkrishnan/Documents/Lever_AI_FINAL/ai-moderator-agent-edited-main/.cursor/debug.log"
@@ -193,1018 +116,6 @@ def _debug_log_write(payload: str) -> None:
     except Exception:
         pass  # Best-effort — never crash the event loop for debug logging
 
-
-def _substantive_word_count(text: str) -> int:
-    """Count words that are NOT filler/hedge tokens."""
-    return sum(1 for w in text.lower().split() if w.strip(".,!?…") not in _FILLER_TOKENS)
-
-
-def _is_too_short_for_offtopic(text: str) -> bool:
-    """Return True if *text* is too short/insubstantial for an off-topic verdict.
-
-    Uses three gates (any one triggers skip):
-      1. Total word count < MIN_OFFTOPIC_WORDS
-      2. Total char count < MIN_OFFTOPIC_CHARS
-      3. Substantive (non-filler) word count < 4
-    """
-    words = len(text.split())
-    chars = len(text)
-    substantive = _substantive_word_count(text)
-    if words < MIN_OFFTOPIC_WORDS or chars < MIN_OFFTOPIC_CHARS or substantive < 4:
-        return True
-    return False
-
-
-def _estimate_tts_duration(text: str) -> float:
-    """Estimate TTS audio duration from character count.
-
-    ElevenLabs / OpenAI TTS speak at approximately 150 words per minute,
-    which is roughly 15 characters per second including spaces.
-    Intentionally conservative (slightly slow) so we overestimate rather
-    than underestimate — better to wait an extra second than to cut off audio.
-    """
-    return max(len(text) / 15.0, 1.0)
-
-
-_DISFLUENT_STARTER_TOKENS = frozenset({
-    "well", "um", "uh", "uhm", "erm", "hmm", "ah", "oh",
-    "like", "so", "i", "think", "guess", "mean",
-    "you", "know", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "that", "the", "a",
-    "it", "its", "is", "was", "not", "really",
-    "hi", "hello", "hey",
-})
-
-DISFLUENCY_EXTENSION_BUDGET = 10.0  # Total extra seconds added to _polling_deadline for disfluency
-
-# Post-nudge extension: seconds added to polling deadline when participant activity
-# (VAD speaking or STT fragment) arrives after a timeout nudge has already fired.
-POST_NUDGE_EXTENSION_SECS = 15.0
-
-# Substance gate: minimum character count for a transcript to be committed
-# as a response.  Fragments shorter than this are accumulated in
-# _turn_accumulated_text instead of triggering _process_captured_response.
-# Threshold of 2 preserves "No", "OK", "Yes" while blocking "I", "A".
-MIN_COMMITTED_CHARS = 2
-
-# Pause cooldown: seconds after user stops speaking before fragment promotion
-# in the legacy fallback path of _await_response.  Prevents treating brief
-# thinking pauses as completed answers.
-PAUSE_COOLDOWN_QUANTITATIVE = 1.5  # increased from 1.0 — 1s is too aggressive
-PAUSE_COOLDOWN_QUALITATIVE = 2.5
-
-
-def _is_committable(text: str) -> bool:
-    """Return True if text is long enough to be committed as a response."""
-    return len(text.strip()) >= MIN_COMMITTED_CHARS
-
-
-def _is_disfluent_starter(text: str) -> bool:
-    """Return True if text consists entirely of disfluent/filler tokens."""
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return True
-    return all(w in _DISFLUENT_STARTER_TOKENS for w in words)
-
-
-# Greeting / acknowledgment / mic-check tokens that should be ignored as
-# non-substantive turn-start chatter on the FIRST utterance only.
-# These are NOT in _DISFLUENT_STARTER_TOKENS because they carry meaning in
-# later utterances (e.g., "Sure" as agreement to a follow-up).
-_FIRST_UTTERANCE_GREETING_TOKENS = frozenset({
-    "sure", "thanks", "thank", "morning", "evening", "afternoon",
-    "good", "nice", "meet", "to", "how", "are", "doing", "fine",
-    "great", "welcome", "greetings",
-})
-
-# Multi-word greeting phrases checked via substring match.
-_FIRST_UTTERANCE_GREETING_PHRASES = (
-    "thank you",
-    "good morning",
-    "good evening",
-    "good afternoon",
-    "how are you",
-    "nice to meet you",
-    "nice to meet",
-)
-
-
-def _is_first_utterance_greeting(text: str) -> bool:
-    """Return True if text is a greeting/acknowledgment with no substantive content.
-
-    Uses the same ALL-words semantics as _is_disfluent_starter(): every word
-    must be either a disfluent token or a greeting token.  This prevents
-    masking real answers that happen to start with a greeting, e.g.
-    "Sure, I think the product is great" → False.
-    """
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return False  # Empty text is handled by disfluency guard
-    allowed = _DISFLUENT_STARTER_TOKENS | _FIRST_UTTERANCE_GREETING_TOKENS
-    return all(w in allowed for w in words)
-
-
-def _normalize_for_offtopic_compare(text: str) -> str:
-    """Lowercase, strip punctuation and collapse whitespace for off-topic repeat detection."""
-    import re as _re
-    return _re.sub(r'\s+', ' ', _re.sub(r'[^\w\s]', '', text.lower())).strip()
-
-
-def _has_blatant_offtopic_keywords(text: str) -> bool:
-    """Return True for obviously unrelated short-topic cues like food/weather."""
-    normalized = _normalize_for_offtopic_compare(text)
-    if not normalized:
-        return False
-    if any(phrase in normalized for phrase in _BLATANT_OFFTOPIC_PHRASES):
-        return True
-    return bool(set(normalized.split()) & _BLATANT_OFFTOPIC_KEYWORDS)
-
-
-# Survey state enum for Observer control
-class SurveyState(Enum):
-    """Track the current state of the survey for Observer control."""
-    WELCOME = "welcome"                             # Delivering welcome/greeting (ignore user STT)
-    WAITING_FOR_OBSERVER = "waiting_for_observer"  # Observer must trigger start
-    RUNNING = "running"                             # Survey in progress
-    PAUSED = "paused"                               # Paused by observer
-    COMPLETED = "completed"                         # Survey finished
-
-
-def parse_multi_option_response(text: str, expected_options: List[str], max_selections: int) -> str:
-    """
-    Parse a multi-option response and match each part to the expected options list.
-    Uses the max_selections from the question to know how many options to extract.
-
-    Args:
-        text: The transcribed text containing multiple options
-        expected_options: List of valid response options
-        max_selections: Number of options expected (from question's max_selections field)
-
-    Returns:
-        Formatted string with matched options separated by "; "
-    """
-    if not expected_options or not text or max_selections <= 1:
-        return text
-
-    matched_options = []
-    text_lower = text.lower()
-
-    # Try to match each expected option against the text
-    for option in expected_options:
-        option_lower = option.lower()
-        # Get significant words from the option (skip short common words)
-        option_words = [w for w in option_lower.split() if len(w) > 3 and w not in ('and', 'the', 'for', 'from', 'with')]
-
-        if not option_words:
-            # If no significant words, use all words
-            option_words = option_lower.split()
-
-        if not option_words:
-            continue
-
-        # Count how many significant words from this option appear in the text
-        matches = sum(1 for word in option_words if word in text_lower)
-        match_ratio = matches / len(option_words) if option_words else 0
-
-        # If more than 50% of significant words match, consider it a match
-        if match_ratio >= 0.5:
-            # Find position of first matching word for ordering
-            first_pos = -1
-            for word in option_words:
-                pos = text_lower.find(word)
-                if pos >= 0:
-                    first_pos = pos
-                    break
-            matched_options.append((option, match_ratio, first_pos if first_pos >= 0 else 999))
-
-    # Sort by position in text (to maintain order user spoke them)
-    matched_options.sort(key=lambda x: x[2])
-
-    # Take top N unique matches based on max_selections
-    seen = set()
-    final_options = []
-    for opt, ratio, pos in matched_options:
-        if opt not in seen and len(final_options) < max_selections:
-            final_options.append(opt)
-            seen.add(opt)
-
-    if final_options:
-        result = "; ".join(final_options)
-        logger.info(f"Multi-option parsing ({max_selections} expected): '{text[:50]}...' → {len(final_options)} matched: {result[:100]}")
-        return result
-
-    # Fallback: return original text if no matches found
-    logger.warning(f"Multi-option parsing: No matches found for '{text[:50]}...' (expected {max_selections} options)")
-    return text
-
-
-def correct_transcription(text: str, expected_options: List[str]) -> str:
-    """
-    Correct common STT errors by fuzzy matching to expected options.
-    Uses multiple strategies: exact match, common misrecognitions,
-    phonetic matching, and fuzzy string matching.
-
-    Args:
-        text: The transcribed text from STT
-        expected_options: List of valid response options
-
-    Returns:
-        Corrected text matching an expected option, or original text if no match
-    """
-    if not expected_options:
-        return text
-
-    # Normalize text - remove punctuation and extra spaces
-    text_clean = re.sub(r'[^\w\s]', '', text.lower().strip())
-    text_lower = text.lower().strip()
-
-    # STEP 1: Try exact match first
-    for option in expected_options:
-        option_clean = re.sub(r'[^\w\s]', '', option.lower().strip())
-        if option_clean == text_clean or option.lower() == text_lower:
-            return option
-
-    # STEP 2: Common STT misrecognition mappings (phonetic confusions)
-    common_corrections = {
-        # Right track / Wrong track confusions
-        'backtrack': 'right track',
-        'back track': 'right track',
-        'write track': 'right track',
-        'like track': 'right track',
-        'white track': 'right track',
-        'bright track': 'right track',
-        'long track': 'wrong track',
-        'strong track': 'wrong track',
-
-        # Rating scale confusions - numbers that sound like words
-        '4': 'good',  # "four" sounds like "good" in some accents
-        'four': 'good',
-        'for': 'good',
-        'fore': 'good',
-        'beri': 'very poor',
-        'berry': 'very poor',
-        'very': 'very poor',  # Partial match
-        'we report': 'very poor',
-        'report': 'very poor',
-        'po': 'poor',
-        'poo': 'poor',
-        'pour': 'poor',
-        'blink': 'excellent',  # Might be mishearing
-        'great': 'very likely',  # Context-based guess
-        'guts': 'gangs',
-
-        # Safe/Likely confusions
-        'very safe': 'very safe',
-        'somewhat safe': 'somewhat safe',
-        'not very safe': 'not very safe',
-        'not at all safe': 'not at all safe',
-
-        # Agree/Disagree
-        'strongly agree': 'strongly agree',
-        'somewhat agree': 'somewhat agree',
-        'strongly disagree': 'strongly disagree',
-        'somewhat disagree': 'somewhat disagree',
-    }
-
-    # Check if text matches any common correction
-    if text_clean in common_corrections:
-        corrected = common_corrections[text_clean]
-        # Find the matching option
-        for option in expected_options:
-            if corrected in option.lower():
-                logger.info(f"STT Correction (common mapping): '{text}' → '{option}'")
-                return option
-
-    # STEP 3: Check if any expected option is CONTAINED in the text
-    for option in expected_options:
-        option_words = option.lower().split()
-        # Check if key words from option appear in text
-        matches = sum(1 for word in option_words if word in text_clean)
-        if matches >= len(option_words) * 0.5:  # At least 50% of words match
-            logger.info(f"STT Correction (partial match): '{text}' → '{option}'")
-            return option
-
-    # STEP 4: Check if text is contained in any option
-    for option in expected_options:
-        if text_clean in option.lower() or any(word in option.lower() for word in text_clean.split() if len(word) > 2):
-            logger.info(f"STT Correction (substring match): '{text}' → '{option}'")
-            return option
-
-    # STEP 5: Fuzzy match with LOWER threshold (40% instead of 60%)
-    matches = get_close_matches(
-        text_clean,
-        [re.sub(r'[^\w\s]', '', opt.lower()) for opt in expected_options],
-        n=1,
-        cutoff=0.4  # Lowered from 0.6 to 0.4 for more aggressive matching
-    )
-
-    if matches:
-        # Find original case version
-        for option in expected_options:
-            if re.sub(r'[^\w\s]', '', option.lower()) == matches[0]:
-                logger.info(f"STT Correction (fuzzy match): '{text}' → '{option}'")
-                return option
-
-    # STEP 6: Try matching just the first word (for truncated responses)
-    first_word = text_clean.split()[0] if text_clean.split() else ""
-    if len(first_word) >= 3:
-        for option in expected_options:
-            if option.lower().startswith(first_word) or first_word in option.lower():
-                logger.info(f"STT Correction (first word match): '{text}' → '{option}'")
-                return option
-
-    # Return original if no good match found
-    logger.warning(f"STT: No correction found for '{text}' in options: {expected_options}")
-    return text
-
-
-
-# Meta-commentary phrases: conversational remarks about the interaction mechanics
-# (e.g. "you're talking to me") that carry no substantive survey content.
-# Stripped before the uncertain-phrase check so they don't inflate the
-# substantive-word count.
-META_COMMENTARY_PHRASES = [
-    "you're talking to me",
-    "you are talking to me",
-    "are you talking to me",
-    "are you asking me",
-    "are you speaking to me",
-    "is that for me",
-    "was that for me",
-    "is that directed at me",
-    "that's for me",
-    "oh that's me",
-    "you mean me",
-    "do you mean me",
-    "is it my turn",
-    "is that my turn",
-]
-
-
-def is_uncertain_response(text: str) -> bool:
-    """
-    Detect if a response is ENTIRELY/PRIMARILY an uncertainty statement.
-
-    IMPORTANT: Only returns True if the response is essentially JUST an uncertain
-    phrase without any substantive content. If the participant has provided a
-    partial answer along with "I don't know", this returns False to allow the
-    partial answer to be processed.
-
-    Meta-commentary phrases (e.g. "you're talking to me") are stripped before
-    the substantive-content check so they don't mask an otherwise pure uncertain
-    response.
-
-    Examples that return True:
-    - "I don't know"
-    - "I'm not sure"
-    - "Honestly, I don't know"
-    - "I really have no idea"
-    - "Oh, you're talking to me. Uh, I don't know."
-
-    Examples that return False (have partial answers):
-    - "I like the product but I don't know what else to say"
-    - "The color is nice, but I'm not sure about the price"
-    - "I think it's good, don't know"
-
-    Args:
-        text: The transcribed response text
-
-    Returns:
-        True if the response is ENTIRELY/PRIMARILY uncertain, False otherwise
-    """
-    if not text:
-        return False
-
-    text_lower = text.lower().strip()
-
-    # ── Strip meta-commentary phrases before substantive-content check ──
-    for meta_phrase in META_COMMENTARY_PHRASES:
-        if meta_phrase in text_lower:
-            logger.info(f"Stripping meta-commentary phrase '{meta_phrase}' from: '{text}'")
-            text_lower = text_lower.replace(meta_phrase, " ", 1)
-    # Clean up leftover whitespace and punctuation fragments
-    text_lower = re.sub(r'\s+', ' ', text_lower).strip()
-
-    # Common uncertainty phrases
-    uncertain_phrases = [
-        "i don't know",
-        "i do not know",
-        "don't know",
-        "do not know",
-        "i'm not sure",
-        "i am not sure",
-        "not sure",
-        "no idea",
-        "i have no idea",
-        "no clue",
-        "i have no clue",
-        "can't say",
-        "cannot say",
-        "i can't say",
-        "i cannot say",
-        "not certain",
-        "i'm not certain",
-        "i am not certain",
-        "uncertain",
-        "i'm uncertain",
-        "beats me",
-        "i couldn't tell you",
-        "i could not tell you",
-        "couldn't tell you",
-        "hard to say",
-        "it's hard to say",
-        "difficult to say",
-        "i'm unsure",
-        "i am unsure",
-        "unsure",
-        "i wouldn't know",
-        "i would not know",
-        "i really don't know",
-        "honestly don't know",
-        "honestly i don't know",
-        "i honestly don't know",
-        "no opinion",
-        "i have no opinion",
-        "pass",
-        "skip",
-        "next question",
-    ]
-
-    # Filler words that can appear around uncertain phrases without adding substance
-    filler_words = {
-        "um", "uh", "well", "like", "you know", "i mean", "honestly",
-        "actually", "really", "just", "so", "yeah", "hmm", "oh", "ah",
-        "let me think", "let me see", "i guess", "i think", "maybe",
-        "probably", "perhaps", "sorry", "i'm sorry", "to be honest",
-        "tbh", "right", "okay", "ok", "man", "dude", "huh", "er"
-    }
-
-    # Check if the response matches any uncertainty phrase
-    for phrase in uncertain_phrases:
-        if phrase in text_lower:
-            # Found an uncertain phrase - now check if there's substantive content
-            # Remove the uncertain phrase from the text
-            remaining = text_lower.replace(phrase, " ", 1).strip()
-
-            # Remove punctuation and common filler words from remaining text
-            remaining = re.sub(r'[.,!?;:\'"()-]', ' ', remaining)
-            remaining_words = remaining.split()
-
-            # Filter out filler words
-            substantive_words = [
-                w for w in remaining_words
-                if w not in filler_words and len(w) > 1
-            ]
-
-            # If there are no substantive words remaining, it's a pure uncertain response
-            if len(substantive_words) == 0:
-                logger.info(f"Detected pure uncertain response: '{text}' (phrase: '{phrase}', no substantive content)")
-                return True
-            else:
-                logger.info(f"Response contains uncertain phrase but has substantive content: '{text}' (substantive words: {substantive_words})")
-                return False
-
-    # Also check for very short responses that might indicate uncertainty
-    # (single word responses that are essentially non-answers)
-    short_uncertain = ["idk", "dunno", "dk", "na", "n/a", "none", "nothing"]
-    text_words = text_lower.split()
-    if len(text_words) <= 2:
-        for word in text_words:
-            if word in short_uncertain:
-                logger.info(f"Detected short uncertain response: '{text}' contains '{word}'")
-                return True
-
-    # WORKAROUND: STT sometimes mishears "I don't know" as "I know"
-    # If response is just "I know" or "I know." without elaboration, treat as uncertain
-    # A genuine "I know" response would typically have more context
-    if text_lower in ["i know", "i know."]:
-        logger.info(f"Detected potential STT misrecognition: '{text}' (might be 'I don't know')")
-        return True
-
-    return False
-
-
-def is_repeat_request(text: str) -> bool:
-    """
-    Deterministic heuristic to detect if a response is a request to repeat
-    the question.  Called BEFORE the LLM analysis so that common phrasing
-    is caught instantly without an extra round-trip.
-
-    Matches phrases like:
-    - "Can you repeat that?"
-    - "Repeat the question"
-    - "Say that again"
-    - "What was the question?"
-    - "I didn't hear you" / "I didn't hear the last part"
-    - "Can you say the first part of the question?"
-    - "Come again?"
-    - etc.
-
-    Args:
-        text: The transcribed response text
-
-    Returns:
-        True if the response is a repeat request, False otherwise
-    """
-    if not text:
-        return False
-
-    text_lower = text.lower().strip()
-
-    # ── Length gate ──────────────────────────────────────────────────────
-    # If the response is long, it likely contains substantive content
-    # alongside a trigger phrase (e.g. "I'm an engineer. I live in Dallas.
-    # And what's the last part of the question?").  Defer to LLM analysis
-    # which can distinguish partial-answer+repeat from a pure repeat request.
-    HEURISTIC_MAX_LENGTH = 60
-    if len(text_lower) > HEURISTIC_MAX_LENGTH:
-        logger.debug(
-            f"🔁 Skipping heuristic repeat check — response too long "
-            f"({len(text_lower)} chars > {HEURISTIC_MAX_LENGTH}), deferring to LLM"
-        )
-        return False
-
-    # ── Substring-match phrases ──────────────────────────────────────────
-    # Keep this list limited to request forms that are unlikely to appear
-    # inside normal answers. Generic fragments like "repeat", "one more time",
-    # or "the last part" are handled by stricter regexes below so narrative
-    # answers such as "I repeat myself when I'm nervous" are not false positives.
-    repeat_phrases = [
-        # "say … again"
-        "say that again",
-        "say it again",
-        "say the question again",
-        "say that one more time",
-        # "come again"
-        "come again",
-        # "what was the question / last part / first part"
-        "what was the question",
-        "what's the question",
-        "what is the question",
-        "what was the last part",
-        "what was the first part",
-        "what was that last part",
-        "what was that first part",
-        # "didn't catch" (non-directional — always a repeat request)
-        "didn't catch",
-        "did not catch",
-        # "can you say …"
-        "can you say that again",
-        "could you say that again",
-        "can you say the last part",
-        "can you say the first part",
-        "could you say the last part",
-        "could you say the first part",
-        "can you say that one more time",
-        # "can you repeat"
-        "can you repeat",
-        "could you repeat",
-        "please repeat",
-        "again please",
-        # politeness / mishearing
-        "pardon",
-        "excuse me",
-        "sorry what",
-        # "what did you …"
-        "what did you say",
-        "what did you ask",
-        # missed / misunderstood
-        "i missed that",
-        "missed the question",
-        "didn't understand",
-        "did not understand",
-        "didn't get that",
-        "did not get that",
-        "i didn't get the question",
-        # audio issues (directional "hear" phrases handled via regex below)
-        "speak up",
-        "louder please",
-        # short interjections
-        "what again",
-        "huh",
-        "what?",
-    ]
-
-    for phrase in repeat_phrases:
-        if phrase in text_lower:
-            logger.info(f"🔁 Heuristic repeat-request detected: '{text}' matches phrase '{phrase}'")
-            return True
-
-    # ── Context-aware "hear" phrases ────────────────────────────────────
-    # Only match when the *user* is the one who didn't hear (repeat request),
-    # NOT when the user is saying the *agent* didn't hear them (complaint).
-    # e.g. "I didn't hear you" → repeat request
-    #      "you didn't hear me" / "why didn't you hear me" → NOT a repeat request
-    import re
-
-    _hear_phrases = [
-        r"didn'?t hear", r"did not hear",
-        r"couldn'?t hear", r"could not hear",
-        r"can'?t hear", r"cannot hear",
-    ]
-    for hp in _hear_phrases:
-        if re.search(hp, text_lower):
-            # Check if "you" is the subject (agent didn't hear) → skip
-            if re.search(r"\byou\b.{0,10}" + hp, text_lower) or re.search(r"\byou'?re\b.{0,10}" + hp, text_lower):
-                logger.debug(f"🔁 Skipping hear-phrase '{hp}' — subject is 'you' (agent complaint, not repeat request): '{text}'")
-            else:
-                logger.info(f"🔁 Heuristic repeat-request detected (hear-phrase): '{text}' matches /{hp}/")
-                return True
-
-    # ── Regex patterns for harder-to-catch variants ──────────────────────
-    _repeat_patterns = [
-        # Standalone repeat command: "repeat", "repeat that please"
-        r"^\s*repeat(?:\s+(?:that|it|the question))?(?:\s+please)?[.?!]*$",
-        # Standalone "one more time" request, but not narrative usage
-        r"^\s*one more time(?:\s+please)?[.?!]*$",
-        # "say … again" with anything in between: "can you say the question again"
-        r"\bsay\b.{0,30}\bagain\b",
-        # "hear … last/first part": "I didn't hear the last part"
-        r"\bhear\b.{0,20}\b(last|first)\s*part\b",
-        # "what was … part": "what was the second part"
-        r"\bwhat\s+was\b.{0,20}\bpart\b",
-        # Explicit requests for the first/last part of the question.
-        r"\b(?:can|could)\s+you\b.{0,20}\b(last|first)\s+part(?:\s+of\s+the\s+question)?\b",
-    ]
-    for pattern in _repeat_patterns:
-        if re.search(pattern, text_lower):
-            logger.info(f"🔁 Heuristic repeat-request detected (regex): '{text}' matches /{pattern}/")
-            return True
-
-    # ── Very short responses that are just confusion ─────────────────────
-    if text_lower in ["what", "what?", "huh", "huh?", "sorry", "sorry?", "come again", "come again?"]:
-        logger.info(f"🔁 Heuristic repeat-request detected (short): '{text}'")
-        return True
-
-    return False
-
-
-def is_observer_command(text: str) -> tuple[bool, Optional[str]]:
-    """
-    Detect if a response is an observer command (start, pause, resume).
-
-    Args:
-        text: The transcribed text to check
-
-    Returns:
-        Tuple of (is_command, command_type) where command_type is 'start', 'pause', or 'resume'
-    """
-    if not text:
-        return False, None
-
-    text_lower = text.lower().strip()
-
-    # Start survey commands (including common STT misrecognitions)
-    start_phrases = [
-        "start survey", "start the survey", "begin survey", "begin the survey",
-        "let's start", "lets start", "let's begin", "lets begin",
-        "start now", "begin now", "go ahead", "start it",
-        # Common STT errors for "start the survey"
-        "start the seven", "start this survey", "start this up",
-        "start to survey", "started survey", "starting survey",
-        "start the serve", "start deserve", "start the server",
-    ]
-
-    # Pause survey commands
-    pause_phrases = [
-        "pause survey", "pause the survey", "pause",
-        "hold on", "hold", "stop survey", "stop the survey",
-        "wait", "one moment", "hang on",
-        # Common STT errors
-        "pause it", "pose", "paws", "halls",
-    ]
-
-    # Resume survey commands
-    resume_phrases = [
-        "resume survey", "resume the survey", "resume",
-        "continue survey", "continue the survey", "continue",
-        "let's continue", "lets continue", "go on", "carry on",
-        "unpause", "start again",
-        # Common STT errors
-        "resume it", "result", "presume",
-    ]
-
-    # Check for start commands
-    for phrase in start_phrases:
-        if phrase in text_lower:
-            logger.info(f"👁️ Detected OBSERVER START command: '{text}' matches phrase '{phrase}'")
-            return True, "start"
-
-    # Check for pause commands
-    for phrase in pause_phrases:
-        if phrase in text_lower:
-            logger.info(f"👁️ Detected OBSERVER PAUSE command: '{text}' matches phrase '{phrase}'")
-            return True, "pause"
-
-    # Check for resume commands
-    for phrase in resume_phrases:
-        if phrase in text_lower:
-            logger.info(f"👁️ Detected OBSERVER RESUME command: '{text}' matches phrase '{phrase}'")
-            return True, "resume"
-
-    # Fuzzy matching: Check if key words appear (for STT errors)
-    words = text_lower.split()
-    start_keywords = ["start", "begin", "go"]
-    survey_keywords = ["survey", "seven", "serve", "server"]  # Common STT misrecognitions
-
-    # If "start/begin" + any survey-like word appears, treat as start command
-    has_start_word = any(w in words for w in start_keywords)
-    has_survey_word = any(w in words for w in survey_keywords)
-    if has_start_word and has_survey_word:
-        logger.info(f"👁️ Detected OBSERVER START command (fuzzy match): '{text}'")
-        return True, "start"
-
-    return False, None
-
-
-@dataclass
-class ResponseAnalysis:
-    """Result of unified response analysis via LLM"""
-    is_relevant: bool  # Is the response relevant to the question?
-    is_already_answered_claim: bool  # Is participant claiming they already answered?
-    is_repeat_request: bool  # Is participant asking to repeat the question?
-    partial_repeat_status: str  # "NO_REPEAT", "REPEAT_ONLY", or "PARTIAL"
-    partial_answer: str  # The answer portion if PARTIAL, otherwise empty
-    unanswered_questions: str  # Verbatim unanswered sub-questions if PARTIAL, otherwise empty
-
-
-async def analyze_response(question_text: str, response_text: str, survey_description: str = "") -> ResponseAnalysis:
-    """
-    Unified LLM analysis of participant response. Checks multiple aspects in a single call:
-    1. Is the response relevant to the question?
-    2. Is the participant claiming they already answered?
-    3. Is there a partial answer with a repeat request for remaining parts?
-
-    Args:
-        question_text: The question that was asked
-        response_text: The participant's response
-        survey_description: Description of the survey topic (from meta.description)
-
-    Returns:
-        ResponseAnalysis with all detection results
-    """
-    # Default result (assume everything is fine)
-    default_result = ResponseAnalysis(
-        is_relevant=True,
-        is_already_answered_claim=False,
-        is_repeat_request=False,
-        partial_repeat_status="NO_REPEAT",
-        partial_answer="",
-        unanswered_questions=""
-    )
-
-    if not question_text or not response_text:
-        return default_result
-
-    # Build survey context for relevance check
-    survey_context = f"Survey topic: {survey_description}" if survey_description else "Survey topic: General survey"
-
-    try:
-        system_prompt = f"""You are a survey response analyzer. Analyze the participant's response for FOUR aspects.
-
-{survey_context}
-
-1. RELEVANCE: Is the response relevant to the question asked?
-   Mark as "relevant" if:
-   - The response attempts to answer the question, even if brief or incomplete
-   - The response mentions topics related to the survey subject described above
-   - UNCERTAINTY expressions: "I don't know", "I'm not sure", etc. (these ARE valid responses)
-   - AFFIRMATIVE/NEGATIVE responses: "yes", "no", "definitely", etc.
-   - The response shows engagement with the topic even if indirect
-
-   Mark as "not_relevant" if:
-   - The response is about a completely unrelated topic (weather, sports, random subjects unrelated to survey)
-   - The response is hostile/rude and deflects instead of answering (e.g., "Why are you asking me this?", "That's a stupid question")
-   - The response ignores the question entirely with irrelevant content
-   - Examples: "Weather is nice today", "I had pizza for lunch", "Mind your own business"
-
-2. ALREADY_ANSWERED: Is the participant ONLY claiming they already answered WITHOUT providing an answer?
-   - "claim" ONLY if they say "I already answered", "I told you before", etc. AND do NOT provide any actual answer content
-   - "no_claim" if they provide an actual answer (even if they ALSO mention "I already answered")
-
-   CRITICAL: If the response contains BOTH a claim AND an actual answer, mark as "no_claim"!
-   - "Life changing. I've answered this." = "no_claim" (contains answer "life changing")
-   - "I already told you, it's the single point of contact." = "no_claim" (contains answer)
-   - "I already answered that question." = "claim" (no actual answer provided)
-   - "Same as what I said before." = "claim" (no specific content, just reference)
-
-3. REPEAT_REQUEST: Is the participant asking to repeat/hear the question again?
-   - "repeat" if they're asking to hear the question again: "can you repeat that", "what was the question", "I didn't hear you", "say that again", "come again", "pardon", "sorry what"
-   - "no_repeat" if they're providing an answer (even if the answer mentions "didn't hear")
-
-   CRITICAL DISTINCTION:
-   - "I didn't hear you" or "I didn't catch that" = repeat request (asking to repeat question)
-   - "I didn't hear about [topic]" or "I never heard of that" = NOT a repeat request (this is an ANSWER about not having heard of something)
-
-4. PARTIAL_REPEAT: Did they provide a PARTIAL answer AND EXPLICITLY ask to repeat/hear the remaining parts?
-   - "NO_REPEAT" - Normal response, even if incomplete (DEFAULT - use this most of the time)
-   - "REPEAT_ONLY" - Just asking to repeat the full question, no answer given
-   - "PARTIAL" - ONLY use when BOTH conditions are met:
-     a) They gave an answer to SOME parts of a multi-part question
-     b) They EXPLICITLY asked to hear the rest: "what else?", "what was the other part?", "repeat the rest", "what's the other question?"
-
-   CRITICAL: DO NOT use PARTIAL just because the answer seems incomplete!
-   - If they answered some parts but didn't ask for remaining parts → use NO_REPEAT
-   - If they asked "what else?" or "what was the other question?" → use PARTIAL
-
-   WHEN PARTIAL: The unanswered_questions field must contain ONLY the sub-question(s) they DID NOT answer.
-   - CAREFULLY compare each part of the question against what they said
-   - If they mentioned a topic, that part IS answered (even if brief)
-   - Example: Question "Where do you live AND what do you do for work?"
-     Response "I'm an engineer in Dallas. What else?"
-     - They answered BOTH parts (engineer=work, Dallas=where)
-     - unanswered_questions should be EMPTY because both were answered
-     - This should be NO_REPEAT, not PARTIAL!
-
-   - Example: Question "Where do you live AND what do you do for work?"
-     Response "I live in Dallas. What was the other part?"
-     - They answered WHERE (Dallas) but NOT work
-     - unanswered_questions: "what do you do for work"
-
-RESPONSE FORMAT (use | as delimiter, exactly 6 fields):
-<relevance>|<already_answered>|<repeat_request>|<partial_status>|<partial_answer>|<unanswered_questions>
-
-Examples:
-- Normal complete answer: "relevant|no_claim|no_repeat|NO_REPEAT||"
-- Incomplete answer (no repeat request): "relevant|no_claim|no_repeat|NO_REPEAT||" (NOT PARTIAL!)
-- Asking to repeat full question: "relevant|no_claim|repeat|NO_REPEAT||"
-- "I didn't hear about [topic] before": "relevant|no_claim|no_repeat|NO_REPEAT||" (THIS IS AN ANSWER!)
-- Off-topic like "Weather is nice": "not_relevant|no_claim|no_repeat|NO_REPEAT||"
-- Uncertainty "I don't know": "relevant|no_claim|no_repeat|NO_REPEAT||"
-- Already answered claim ONLY (no answer): "relevant|claim|no_repeat|NO_REPEAT||"
-- Claim WITH answer "Life changing. I've answered this.": "relevant|no_claim|no_repeat|NO_REPEAT||" (has actual answer!)
-- Partial with explicit request: Question "What do you like AND dislike?", Response "I like the food. What else did you ask?": "relevant|no_claim|no_repeat|PARTIAL|I like the food.|what do you dislike"
-- Answered both parts: Question "Where do you live AND work?", Response "Dallas, I'm retired. What else?": "relevant|no_claim|no_repeat|NO_REPEAT||" (Both answered, no unanswered parts!)
-
-IMPORTANT: Default to NO_REPEAT. Only use PARTIAL when user EXPLICITLY asks for remaining parts AND there actually ARE unanswered parts.
-
-5. META-COMMENTARY: If the participant is commenting on the survey PROCESS rather than answering the question, do NOT treat it as a repeat request, partial answer, or already-answered claim.
-   Examples of meta-commentary (classify as relevant, no_claim, no_repeat, NO_REPEAT):
-   - "You skipped the last part" / "You're skipping on that question" — complaint about delivery, NOT a request to repeat
-   - "I answered the question" / "I already said that" — frustration, NOT a genuine already-answered claim (use no_claim)
-   - "You didn't hear me" / "Why are you asking me again" — frustration, NOT a repeat request
-   - "That's the same question as before" — observation, NOT a repeat request
-   These responses may contain substantive content mixed with complaints. Extract and evaluate the substantive content."""
-
-        user_prompt = f"""Question: {question_text}
-
-Participant's Response: {response_text}
-
-Analyze this response and output in the exact format: relevance|already_answered|repeat_request|partial_status|partial_answer|unanswered_questions"""
-
-        client = openai_client.AsyncOpenAI()
-        llm_response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            max_tokens=500,
-            temperature=0.0
-        )
-
-        result = llm_response.choices[0].message.content.strip()
-        logger.info(f"🔍 Response analysis - Question: '{question_text[:50]}...', Response: '{response_text[:50]}...', LLM says: '{result}'")
-
-        # Parse the response (6 fields separated by |)
-        parts = result.split("|")
-        if len(parts) >= 6:
-            relevance = parts[0].strip().lower()
-            already_answered = parts[1].strip().lower()
-            repeat_request = parts[2].strip().lower()
-            partial_status = parts[3].strip().upper()
-            partial_answer = parts[4].strip()
-            unanswered = parts[5].strip()
-
-            # Validate and normalize
-            is_relevant = "not_relevant" not in relevance and "not relevant" not in relevance
-            is_claim = "claim" in already_answered and "no_claim" not in already_answered
-            is_repeat = "repeat" in repeat_request and "no_repeat" not in repeat_request
-
-            if partial_status not in ("NO_REPEAT", "REPEAT_ONLY", "PARTIAL"):
-                partial_status = "NO_REPEAT"
-
-            analysis = ResponseAnalysis(
-                is_relevant=is_relevant,
-                is_already_answered_claim=is_claim,
-                is_repeat_request=is_repeat,
-                partial_repeat_status=partial_status,
-                partial_answer=partial_answer if partial_status == "PARTIAL" else "",
-                unanswered_questions=unanswered if partial_status in ("REPEAT_ONLY", "PARTIAL") else ""
-            )
-
-            # ── Post-LLM sanity checks ────────────────────────────────
-            # 1. Downgrade weak PARTIAL: if unanswered_questions is a
-            #    single short word (e.g. "how") it's likely an LLM
-            #    hallucination, not a genuine unanswered sub-question.
-            if partial_status == "PARTIAL" and unanswered:
-                _unanswered_words = len(unanswered.split())
-                if _unanswered_words <= 1:
-                    logger.info(
-                        f"⚠️ Downgrading weak PARTIAL — unanswered_questions "
-                        f"too vague ({_unanswered_words} word): '{unanswered}'"
-                    )
-                    partial_status = "NO_REPEAT"
-                    partial_answer = ""
-                    unanswered = ""
-                    analysis = ResponseAnalysis(
-                        is_relevant=is_relevant,
-                        is_already_answered_claim=is_claim,
-                        is_repeat_request=is_repeat,
-                        partial_repeat_status=partial_status,
-                        partial_answer="",
-                        unanswered_questions="",
-                    )
-
-            # Log warnings for special cases
-            if not is_relevant:
-                logger.warning(f"⚠️ Off-topic response detected: '{response_text[:100]}'")
-            if is_claim:
-                logger.warning(f"⚠️ 'Already answered' claim detected: '{response_text[:100]}'")
-            if is_repeat:
-                logger.info(f"🔁 Repeat request detected: '{response_text[:100]}'")
-            if partial_status == "PARTIAL":
-                logger.info(f"📝 Partial answer detected. Answer: '{partial_answer[:50]}...', Unanswered: '{unanswered[:50]}...'")
-
-            return analysis
-        elif len(parts) >= 5:
-            # Backward compatibility: handle old 5-field format
-            relevance = parts[0].strip().lower()
-            already_answered = parts[1].strip().lower()
-            partial_status = parts[2].strip().upper()
-            partial_answer = parts[3].strip()
-            unanswered = parts[4].strip()
-
-            is_relevant = "not_relevant" not in relevance and "not relevant" not in relevance
-            is_claim = "claim" in already_answered and "no_claim" not in already_answered
-
-            if partial_status not in ("NO_REPEAT", "REPEAT_ONLY", "PARTIAL"):
-                partial_status = "NO_REPEAT"
-
-            return ResponseAnalysis(
-                is_relevant=is_relevant,
-                is_already_answered_claim=is_claim,
-                is_repeat_request=(partial_status == "REPEAT_ONLY"),
-                partial_repeat_status=partial_status,
-                partial_answer=partial_answer if partial_status == "PARTIAL" else "",
-                unanswered_questions=unanswered if partial_status in ("REPEAT_ONLY", "PARTIAL") else ""
-            )
-        else:
-            logger.warning(f"Unexpected LLM response format (expected 6 parts): {result}")
-            return default_result
-
-    except Exception as e:
-        logger.error(f"Error analyzing response: {e}")
-        return default_result
-
-
-# Backward compatibility wrapper for existing code
-async def check_response_relevance(question_text: str, response_text: str, survey_description: str = "") -> bool:
-    """
-    Legacy wrapper for analyze_response(). Returns only relevance check result.
-    Prefer using analyze_response() directly for full analysis.
-    """
-    analysis = await analyze_response(question_text, response_text, survey_description)
-    return analysis.is_relevant
-
-
-@dataclass(frozen=True)
-class TurnResult:
-    """Immutable snapshot of who answered and how — used for acknowledgments.
-
-    The ack_name is always derived from the same identity that was used to store
-    the response (actual speaker), preventing stale-name bugs when the mutable
-    ``last_respondent`` field drifts between turns.
-    """
-    expected_identity: str
-    actual_identity: str
-    expected_display: str
-    actual_display: str
-    was_timeout: bool = False
-
-    @property
-    def ack_name(self) -> str:
-        """Display name for the acknowledgment — always the actual speaker."""
-        return self.actual_display
-
-
-@dataclass
-class TurnInfo:
-    """Track information about a participant's turn"""
-    participant_identity: str
-    start_time: datetime
-    duration: float = 0.0
-    warned: bool = False  # Whether we've given pre-warning
-    first_interrupted: bool = False  # Whether we've aggressively interrupted
-    force_interrupted: bool = False  # Whether we've force-ended
-    interruption_count: int = 0  # Number of times interrupted
-    interrupt_denied_count: int = 0  # session.interrupt() calls that raised RuntimeError
-    off_topic_start: Optional[datetime] = None  # When participant went off-topic
-    off_topic_interrupted: bool = False  # Whether we've interrupted for off-topic
-    actual_speaking_duration: float = 0.0  # Actual speaking time (captured when user stops, doesn't include pauses)
-    pending_soft_warning: bool = False  # Flag: time exceeded, waiting to deliver warning when user is speaking
 
 
 class CommunityModeratorAgent(Agent):
@@ -1278,7 +189,12 @@ class CommunityModeratorAgent(Agent):
         self.current_question_num = 0
         self.agent_session: Optional[AgentSession] = None
         self.waiting_for_response = False
-        self._response_epoch: int = 0  # Monotonic counter — stale async tasks compare against this to detect turn/window changes
+        self._deadline_mgr = DeadlineManager()
+        self._turn_phase = TurnPhaseMachine(
+            on_invalid_transition=lambda src, tgt: logger.error(
+                f"INVALID TURN PHASE: {src.value} -> {tgt.value} in {self.__class__.__name__}"
+            ),
+        )
         self.response_timeout_task: Optional[asyncio.Task] = None
         self.last_speech_time: Optional[datetime] = None
         self.user_currently_speaking = False  # Track if user is actively speaking (for polling)
@@ -1340,27 +256,23 @@ class CommunityModeratorAgent(Agent):
         self.turn_time_exceeded: bool = False  # Flag set when turn monitor detects time exceeded and user stopped
         # _tts_active property (below) replaces old _tts_active / _tts_lock / _tts_sequence machinery
         self._estimated_remaining_tts: float = 0.0  # Seconds of TTS estimated still audible on client
-        self._polling_deadline: Optional[float] = None  # time.time() deadline; extended on repeat
-        self._ack_already_spoken: bool = False  # True when polling loop already spoke the ack
-        self._prewarmed_ack_text: Optional[str] = None  # Pre-computed ack text for concurrent TTS
-        self._gentle_warning_in_progress: bool = False  # True while gentle warning TTS is playing; prevents premature response capture
-        self._gentle_warning_started_at: Optional[float] = None  # time.time() when warning flag was set; watchdog clears if stuck > 8s
-        self._analysis_in_progress: bool = False  # True while LLM analysis is running; prevents capture from overwriting the snapshot
-        self._last_avatar_disconnect_notice: float = 0.0  # time.time() of last avatar disconnect TTS; dedupe cooldown
-        self._first_fragment_time: Optional[datetime] = None  # When first STT fragment arrived for current question; used for stabilization delay
-        self._user_stopped_speaking_at: Optional[datetime] = None  # Timestamp when user last transitioned from speaking to listening; used for pause cooldown
-        self._stt_nudge_given: bool = False  # True after we've nudged the participant due to no STT transcripts
-        self._first_vad_speaking_time: Optional[datetime] = None  # When VAD first detected speech for this question; used for STT health check
-        self._shutting_down: bool = False  # Set True during survey completion/room teardown; stops all loops and TTS
-        self._tts_dedupe_spoken: Set[str] = set()  # Per-turn TTS dedupe keys; cleared on question/participant transitions
-        self._encouragement_followup_given: bool = False  # True after deterministic follow-up to a second uncertain response
-        self._last_transcript_progress_time: Optional[float] = None  # time.time() when latest_user_response last changed; silence watchdog
-        self._silence_watchdog_fired: bool = False  # True after silence watchdog has fired once for this turn
-        self._short_offtopic_count: int = 0  # Number of short off-topic responses this turn (for escalation)
-        self._last_short_offtopic_norm: Optional[str] = None  # Normalized text of last short off-topic response (for repeat detection)
-        self._had_stt_transcript_this_turn: bool = False  # True once any STT transcript has been received this turn; prevents false STT nudges
-        self._polling_start_time: Optional[float] = None  # time.time() when polling loop started; idle-no-VAD watchdog reference
-        self._idle_no_vad_nudge_fired: bool = False  # True after idle-no-VAD watchdog has fired once
+        # Deadline/watchdog state managed by self._deadline_mgr (DeadlineManager)
+        self._ack_already_spoken: bool = False
+        self._prewarmed_ack_text: Optional[str] = None
+        self._gentle_warning_in_progress: bool = False
+        self._gentle_warning_started_at: Optional[float] = None
+        self._analysis_in_progress: bool = False
+        self._last_avatar_disconnect_notice: float = 0.0
+        self._first_fragment_time: Optional[datetime] = None
+        self._user_stopped_speaking_at: Optional[datetime] = None
+        self._first_vad_speaking_time: Optional[datetime] = None
+        self._shutting_down: bool = False
+        self._tts_dedupe_spoken: Set[str] = set()
+        self._encouragement_followup_given: bool = False
+        self._last_transcript_progress_time: Optional[float] = None
+        self._short_offtopic_count: int = 0
+        self._last_short_offtopic_norm: Optional[str] = None
+        self._had_stt_transcript_this_turn: bool = False
 
         # ── Avatar lifecycle tracking ───────────────────────────────────────
         self._avatar_state: str = AVATAR_STATE_IDLE
@@ -1559,12 +471,10 @@ class CommunityModeratorAgent(Agent):
         logger.info("✅ All participants unmuted")
 
     def _delivery_key(self, question_num: int, participant_identity: str) -> Tuple[int, str]:
-        return (question_num, participant_identity)
+        return delivery_key(question_num, participant_identity)
 
     def _set_delivery_state(self, question_num: int, participant_identity: str, state: str, context: str = ""):
-        key = self._delivery_key(question_num, participant_identity)
-        old_state = self.question_delivery_state.get(key, "none")
-        self.question_delivery_state[key] = state
+        old_state = set_delivery_state(self.question_delivery_state, question_num, participant_identity, state)
         logger.debug(
             f"[delivery-state] q={question_num} participant={participant_identity} -> {state}"
             f"{f' ({context})' if context else ''}"
@@ -1576,15 +486,11 @@ class CommunityModeratorAgent(Agent):
 
     def _is_delivery_confirmed(self, question_num: int, participant_identity: str) -> bool:
         """True if question was delivered (fully or partially)."""
-        key = self._delivery_key(question_num, participant_identity)
-        return self.question_delivery_state.get(key) in ("delivered_full", "delivered_partial",
-                                                          # backward compat with old "delivered" state
-                                                          "delivered")
+        return is_delivery_confirmed(self.question_delivery_state, question_num, participant_identity)
 
     def _is_delivery_full(self, question_num: int, participant_identity: str) -> bool:
         """True only if TTS completed without truncation."""
-        key = self._delivery_key(question_num, participant_identity)
-        return self.question_delivery_state.get(key) in ("delivered_full", "delivered")
+        return is_delivery_full(self.question_delivery_state, question_num, participant_identity)
 
     def _record_turn_result(self, expected: str, actual: str, *, was_timeout: bool = False) -> TurnResult:
         """Create an immutable TurnResult and update last_respondent atomically.
@@ -1698,18 +604,13 @@ class CommunityModeratorAgent(Agent):
         # Flow control
         self._gentle_warning_in_progress = False
         self._gentle_warning_started_at = None
-        self._stt_nudge_given = False
         self._first_vad_speaking_time = None
         self.encouragement_given = False
         self._encouragement_followup_given = False
         self._last_transcript_progress_time = None
-        self._silence_watchdog_fired = False
         self._short_offtopic_count = 0
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
-        self._idle_no_vad_nudge_fired = False
-        self._first_nudge_given = False
-        self._post_nudge_extended = False
         self.question_repeated = False
         self.relevance_prompt_given = False
         self.partial_repeat_handled = False
@@ -1725,10 +626,10 @@ class CommunityModeratorAgent(Agent):
         # Timeout / turn monitoring
         self.waiting_for_response = True
         self.last_speech_time = None
-        self._polling_start_time = _time.time()
 
-        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
-        self._response_epoch += 1
+        # ── Deadline/watchdog reset: clears all watchdog flags + bumps epoch ──
+        self._deadline_mgr.reset_for_disfluency_retry()
+        self._deadline_mgr.bump_epoch()
 
     def _extend_post_nudge_window(self, participant: str) -> None:
         """Extend the response window after a timeout nudge when participant activity arrives.
@@ -1738,34 +639,19 @@ class CommunityModeratorAgent(Agent):
         Clears ``_first_nudge_given`` so the restarted timeout task runs its full
         two-phase cycle (nudge at 15s, give-up at 30s) instead of suppressing itself.
         """
-        if not self._first_nudge_given or self._post_nudge_extended:
+        if not self._deadline_mgr.try_post_nudge_extension(POST_NUDGE_EXTENSION_SECS):
             return
 
-        import time as _time
-        self._post_nudge_extended = True
-
-        # Extend polling deadline
-        if self._polling_deadline is not None:
-            fresh_deadline = _time.time() + POST_NUDGE_EXTENSION_SECS
-            if fresh_deadline > self._polling_deadline:
-                self._polling_deadline = fresh_deadline
-
-        # Clear _first_nudge_given so the restarted monitor_response_timeout
-        # won't suppress itself at line 3884 (single-owner guard)
-        self._first_nudge_given = False
-
-        # Bump epoch to invalidate any stale timeout task
-        self._response_epoch += 1
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
         )
 
         logger.info(
             f"POST-NUDGE EXTENSION: Extended polling deadline by "
             f"{POST_NUDGE_EXTENSION_SECS}s after participant activity detected "
-            f"(participant={participant}, epoch={self._response_epoch})"
+            f"(participant={participant}, epoch={self._deadline_mgr.epoch})"
         )
 
     async def _await_response(
@@ -1790,10 +676,10 @@ class CommunityModeratorAgent(Agent):
             self.response_timeout_task.cancel()
             self.response_timeout_task = None
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
         )
 
-        self._polling_deadline = _time.time() + polling_timeout
+        self._deadline_mgr.set_deadline(polling_timeout)
 
         # Observer STT switching task
         observer_stt_task: Optional[asyncio.Task] = None
@@ -1805,7 +691,7 @@ class CommunityModeratorAgent(Agent):
         try:
             while True:
                 # Wait on the event with a 2s granularity for watchdog checks
-                remaining = self._polling_deadline - _time.time()
+                remaining = self._deadline_mgr.remaining()
                 if remaining <= 0 and not self.user_currently_speaking and not self._gentle_warning_in_progress:
                     if self.captured_response is not None:
                         logger.info("Deadline reached but captured_response exists — processing")
@@ -1857,9 +743,9 @@ class CommunityModeratorAgent(Agent):
                         continue
 
                 # ── Deadline extension while speaking ──
-                if _time.time() > self._polling_deadline:
+                if self._deadline_mgr.is_expired():
                     if self.user_currently_speaking or self._gentle_warning_in_progress:
-                        self._polling_deadline = _time.time() + 5
+                        self._deadline_mgr.extend_deadline(5.0)
                         continue
                     if self.captured_response is None and self.latest_user_response is None:
                         logger.warning(f"Polling deadline reached ({polling_timeout}s effective)")
@@ -1952,124 +838,113 @@ class CommunityModeratorAgent(Agent):
 
     async def _check_stt_health(self, participant: str) -> None:
         """STT health check: nudge if VAD detected speech but no STT arrived."""
-        if (self.captured_response is None
-            and self.latest_user_response is None
-            and not self.response_captured
-            and not self._stt_nudge_given
-            and not self._had_stt_transcript_this_turn
-            and self._first_vad_speaking_time is not None
-            and not self.user_currently_speaking):
-            since_first_vad = (datetime.now() - self._first_vad_speaking_time).total_seconds()
-            if since_first_vad > 6:
-                self._stt_nudge_given = True
-                display_name = self.participant_manager.get_display_name(participant)
-                nudge_text = STT_NUDGE_TEMPLATE.format(name=display_name)
-                logger.warning(
-                    f"STT HEALTH CHECK: VAD detected speech {since_first_vad:.0f}s ago "
-                    f"but no STT transcripts received for {participant}! Nudging."
-                )
-                await self._safe_say(nudge_text, allow_interruptions=False, context="stt_nudge")
-                self.survey_transcript.add_acknowledgment(nudge_text)
+        first_vad_ago = (
+            (datetime.now() - self._first_vad_speaking_time).total_seconds()
+            if self._first_vad_speaking_time is not None else None
+        )
+        signal = self._deadline_mgr.check_stt_health(
+            has_response=bool(self.captured_response or self.latest_user_response or self.response_captured),
+            has_stt_transcript=self._had_stt_transcript_this_turn,
+            first_vad_seconds_ago=first_vad_ago,
+            user_speaking=self.user_currently_speaking,
+        )
+        if signal == WatchdogSignal.STT_NUDGE:
+            display_name = self.participant_manager.get_display_name(participant)
+            nudge_text = STT_NUDGE_TEMPLATE.format(name=display_name)
+            logger.warning(
+                f"STT HEALTH CHECK: VAD detected speech {first_vad_ago:.0f}s ago "
+                f"but no STT transcripts received for {participant}! Nudging."
+            )
+            await self._safe_say(nudge_text, allow_interruptions=False, context="stt_nudge")
+            self.survey_transcript.add_acknowledgment(nudge_text)
 
     async def _check_silence_watchdog(self, participant: str) -> None:
         """Silence watchdog: prompt if no transcript progress after encouragement."""
         import time as _time
-        if (not self._silence_watchdog_fired
-            and not self.user_currently_speaking
-            and not self._gentle_warning_in_progress
-            and self.encouragement_given
-            and self.captured_response is None
-            and self.latest_user_response is None
-            and self._last_transcript_progress_time is not None):
-            silence_elapsed = _time.time() - self._last_transcript_progress_time
-            if silence_elapsed > SILENCE_WATCHDOG_TIMEOUT:
-                self._silence_watchdog_fired = True
-                display_name = self.participant_manager.get_display_name(participant)
-                watchdog_text = SILENCE_WATCHDOG_PROMPT_TEMPLATE.format(name=display_name)
-                logger.warning(
-                    f"SILENCE WATCHDOG: No transcript progression for "
-                    f"{silence_elapsed:.0f}s after encouragement — prompting {participant}"
-                )
-                await self._safe_say(watchdog_text, allow_interruptions=True, context="silence_watchdog")
-                self.survey_transcript.add_acknowledgment(watchdog_text)
-                if self._polling_deadline is not None:
-                    new_deadline = _time.time() + 8.0
-                    if new_deadline > self._polling_deadline:
-                        self._polling_deadline = new_deadline
+        last_progress_ago = (
+            (_time.time() - self._last_transcript_progress_time)
+            if self._last_transcript_progress_time is not None else None
+        )
+        signal = self._deadline_mgr.check_silence_watchdog(
+            encouragement_given=self.encouragement_given,
+            has_response=bool(self.captured_response or self.latest_user_response),
+            user_speaking=self.user_currently_speaking,
+            warning_in_progress=self._gentle_warning_in_progress,
+            last_progress_seconds_ago=last_progress_ago,
+        )
+        if signal == WatchdogSignal.SILENCE_PROMPT:
+            display_name = self.participant_manager.get_display_name(participant)
+            watchdog_text = SILENCE_WATCHDOG_PROMPT_TEMPLATE.format(name=display_name)
+            logger.warning(
+                f"SILENCE WATCHDOG: No transcript progression for "
+                f"{last_progress_ago:.0f}s after encouragement — prompting {participant}"
+            )
+            await self._safe_say(watchdog_text, allow_interruptions=True, context="silence_watchdog")
+            self.survey_transcript.add_acknowledgment(watchdog_text)
+            self._deadline_mgr.extend_deadline(8.0)
 
     async def _check_idle_no_vad(self, participant: str, tts_fully_spoken: bool) -> None:
         """Idle-no-VAD watchdog: re-prompt if no VAD/STT activity at all."""
         import time as _time
-        if (not self._idle_no_vad_nudge_fired
-            and not self.user_currently_speaking
-            and not self._gentle_warning_in_progress
-            and self._first_vad_speaking_time is None
-            and not self._had_stt_transcript_this_turn
-            and self.captured_response is None
-            and self.latest_user_response is None
-            and self._polling_start_time is not None):
-            _idle_elapsed = _time.time() - self._polling_start_time
-            _remaining_tts = getattr(self, '_estimated_remaining_tts', 0.0)
-            _tts_offset = _remaining_tts + TTS_SAFETY_MARGIN if _remaining_tts > 0 else 0.0
-            if _idle_elapsed - _tts_offset > IDLE_NO_VAD_TIMEOUT:
-                self._idle_no_vad_nudge_fired = True
-                logger.warning(
-                    f"IDLE-NO-VAD WATCHDOG: {_idle_elapsed:.0f}s since polling start "
-                    f"with no VAD/STT activity"
+        _elapsed = (
+            (_time.time() - self._deadline_mgr.start_time)
+            if self._deadline_mgr.start_time is not None else None
+        )
+        signal = self._deadline_mgr.check_idle_no_vad(
+            has_vad=(self._first_vad_speaking_time is not None),
+            has_stt_transcript=self._had_stt_transcript_this_turn,
+            has_response=bool(self.captured_response or self.latest_user_response),
+            user_speaking=self.user_currently_speaking,
+            warning_in_progress=self._gentle_warning_in_progress,
+            tts_remaining=getattr(self, '_estimated_remaining_tts', 0.0),
+            elapsed_since_start=_elapsed,
+        )
+        if signal == WatchdogSignal.IDLE_REPROMPT:
+            logger.warning(
+                f"IDLE-NO-VAD WATCHDOG: {_elapsed:.0f}s since polling start "
+                f"with no VAD/STT activity"
+            )
+
+            if self.response_timeout_task:
+                self.response_timeout_task.cancel()
+                self.response_timeout_task = None
+
+            if not tts_fully_spoken:
+                await self._safe_say(
+                    PARTIAL_DELIVERY_NUDGE_TEXT,
+                    allow_interruptions=False,
+                    context="idle_no_vad_partial_reprompt",
                 )
-
-                if self.response_timeout_task:
-                    self.response_timeout_task.cancel()
-                    self.response_timeout_task = None
-
-                # ── Single-owner guard: only one first nudge per turn ─
-                if self._first_nudge_given:
-                    logger.info(
-                        "idle-no-VAD: suppressing nudge — "
-                        "_first_nudge_given already set by timeout monitor"
-                    )
-                    return
-                self._first_nudge_given = True
-
-                if not tts_fully_spoken:
-                    await self._safe_say(
-                        PARTIAL_DELIVERY_NUDGE_TEXT,
-                        allow_interruptions=False,
-                        context="idle_no_vad_partial_reprompt",
-                    )
-                    question_text = self.current_question_object.question if self.current_question_object else self.current_question
-                    if question_text and not self._shutting_down and self.agent_session:
+                question_text = self.current_question_object.question if self.current_question_object else self.current_question
+                if question_text and not self._shutting_down and self.agent_session:
+                    try:
+                        _rq_tts_start = _time.time()
+                        rq_handle = self.agent_session.say(question_text, allow_interruptions=True)
+                        await rq_handle
                         try:
-                            _rq_tts_start = _time.time()
-                            rq_handle = self.agent_session.say(question_text, allow_interruptions=True)
-                            await rq_handle
-                            try:
-                                await asyncio.wait_for(rq_handle.wait_for_playout(), timeout=120.0)
-                            except asyncio.TimeoutError:
-                                logger.warning("Idle-no-VAD repeat playout timed out")
-                            _rq_elapsed = _time.time() - _rq_tts_start
-                            _rq_est = _estimate_tts_duration(question_text)
-                            self._estimated_remaining_tts = max(_rq_est - _rq_elapsed, 0.0)
-                        except (asyncio.CancelledError, RuntimeError) as e:
-                            logger.warning(f"Idle-no-VAD repeat TTS failed: {e}")
-                else:
-                    await self._safe_say(
-                        TIMEOUT_NUDGE_TEXT,
-                        allow_interruptions=False,
-                        context="idle_no_vad_nudge",
-                    )
-
-                self.last_speech_time = None
-                self._response_epoch += 1
-                self.response_timeout_task = asyncio.create_task(
-                    self.monitor_response_timeout(participant, epoch=self._response_epoch)
+                            await asyncio.wait_for(rq_handle.wait_for_playout(), timeout=120.0)
+                        except asyncio.TimeoutError:
+                            logger.warning("Idle-no-VAD repeat playout timed out")
+                        _rq_elapsed = _time.time() - _rq_tts_start
+                        _rq_est = _estimate_tts_duration(question_text)
+                        self._estimated_remaining_tts = max(_rq_est - _rq_elapsed, 0.0)
+                    except (asyncio.CancelledError, RuntimeError) as e:
+                        logger.warning(f"Idle-no-VAD repeat TTS failed: {e}")
+            else:
+                await self._safe_say(
+                    TIMEOUT_NUDGE_TEXT,
+                    allow_interruptions=False,
+                    context="idle_no_vad_nudge",
                 )
-                logger.info("Restarted timeout monitor after idle-no-VAD re-prompt")
 
-                if self._polling_deadline is not None:
-                    new_deadline = _time.time() + 15.0
-                    if new_deadline > self._polling_deadline:
-                        self._polling_deadline = new_deadline
+            self.last_speech_time = None
+            self._deadline_mgr.bump_epoch()
+            self.response_timeout_task = asyncio.create_task(
+                self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
+            )
+            logger.info("Restarted timeout monitor after idle-no-VAD re-prompt")
+
+            self._deadline_mgr.extend_deadline(15.0)
 
     async def _observer_stt_polling(self, participant: str) -> None:
         """Standalone task: periodically switch STT to observer for commands."""
@@ -2097,6 +972,7 @@ class CommunityModeratorAgent(Agent):
         """Consolidated response processing. Returns 'accepted', 'retry', or 'move_on'."""
         import time as _time
 
+        self._turn_phase.transition_to(TurnPhase.PROCESSING_RESPONSE)
         # LATENCY TRACKING
         response_processing_start = datetime.now()
         self._response_processing_start = response_processing_start
@@ -2146,8 +1022,8 @@ class CommunityModeratorAgent(Agent):
                and not self.encouragement_given
                and not self.relevance_prompt_given
                and self._short_offtopic_count == 0):
-            if not _disfluency_budget_used and self._polling_deadline is not None:
-                self._polling_deadline += DISFLUENCY_EXTENSION_BUDGET
+            if not _disfluency_budget_used and self._deadline_mgr.deadline is not None:
+                self._deadline_mgr.extend_deadline_to(self._deadline_mgr.deadline + DISFLUENCY_EXTENSION_BUDGET)
                 _disfluency_budget_used = True
                 logger.info(
                     f"[{question_context}] Disfluent starter — extended polling deadline "
@@ -2156,7 +1032,7 @@ class CommunityModeratorAgent(Agent):
             # Local deadline: min of budget window and polling deadline
             import time as _time
             _budget_deadline = _time.time() + DISFLUENCY_EXTENSION_BUDGET
-            _disfluency_deadline = min(_budget_deadline, self._polling_deadline) if self._polling_deadline else _budget_deadline
+            _disfluency_deadline = min(_budget_deadline, self._deadline_mgr.deadline) if self._deadline_mgr.deadline else _budget_deadline
 
             self.captured_response = None
             self._response_ready.clear()
@@ -2211,15 +1087,11 @@ class CommunityModeratorAgent(Agent):
                 f"[{question_context}] First-utterance greeting guard — treating as "
                 f"non-substantive turn-start chatter: '{captured_text[:60]}'"
             )
-            if self._polling_deadline is not None:
-                import time as _time
-                new_deadline = _time.time() + DISFLUENCY_EXTENSION_BUDGET
-                if new_deadline > self._polling_deadline:
-                    self._polling_deadline = new_deadline
-                    logger.info(
-                        f"[{question_context}] Extended polling deadline by "
-                        f"{DISFLUENCY_EXTENSION_BUDGET}s after greeting guard"
-                    )
+            if self._deadline_mgr.extend_deadline(DISFLUENCY_EXTENSION_BUDGET):
+                logger.info(
+                    f"[{question_context}] Extended polling deadline by "
+                    f"{DISFLUENCY_EXTENSION_BUDGET}s after greeting guard"
+                )
             # ── Inline reset (greeting guard) ──────────────────────────────
             # Resembles _nudge_for_short_offtopic_retry but intentionally
             # preserves: encouragement_given, _encouragement_followup_given,
@@ -2240,13 +1112,9 @@ class CommunityModeratorAgent(Agent):
             self.waiting_for_response = True
             self.last_speech_time = None
             self._had_stt_transcript_this_turn = False
-            self._idle_no_vad_nudge_fired = False
-            self._first_nudge_given = False
-            self._post_nudge_extended = False
-            self._stt_nudge_given = False
+            self._deadline_mgr.reset_for_disfluency_retry()
             self._first_fragment_time = None
             self._user_stopped_speaking_at = None
-            self._silence_watchdog_fired = False
             if not self.user_currently_speaking:
                 self._first_vad_speaking_time = None
             return "retry"
@@ -2311,11 +1179,11 @@ class CommunityModeratorAgent(Agent):
             self.encouragement_given = False
             self.waiting_for_response = True
             self.last_speech_time = None
-            self._response_epoch += 1
+            self._deadline_mgr.bump_epoch()
             if self.response_timeout_task:
                 self.response_timeout_task.cancel()
             self.response_timeout_task = asyncio.create_task(
-                self.monitor_response_timeout(participant, epoch=self._response_epoch)
+                self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
             )
             if self.turn_monitor_task:
                 self.turn_monitor_task.cancel()
@@ -2377,11 +1245,11 @@ class CommunityModeratorAgent(Agent):
             self.last_stt_fragment = ""
             self.waiting_for_response = True
             self.last_speech_time = None
-            self._response_epoch += 1
+            self._deadline_mgr.bump_epoch()
             if self.response_timeout_task:
                 self.response_timeout_task.cancel()
             self.response_timeout_task = asyncio.create_task(
-                self.monitor_response_timeout(participant, epoch=self._response_epoch)
+                self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
             )
             if self.turn_monitor_task:
                 self.turn_monitor_task.cancel()
@@ -2712,13 +1580,9 @@ class CommunityModeratorAgent(Agent):
         self.encouragement_given = False
         self._encouragement_followup_given = False
         self._last_transcript_progress_time = None
-        self._silence_watchdog_fired = False
         self._short_offtopic_count = 0
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
-        self._idle_no_vad_nudge_fired = False
-        self._first_nudge_given = False
-        self._post_nudge_extended = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -2728,27 +1592,30 @@ class CommunityModeratorAgent(Agent):
 
         # ── STT health-check state ────────────────────────────────────
         self._first_vad_speaking_time = None
-        self._stt_nudge_given = False
 
-        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
-        self._response_epoch += 1
+        # ── Deadline/watchdog reset: clears watchdog flags, bumps epoch, sets deadline ──
+        polling_timeout = (
+            self.max_turn_duration
+            + self.first_interrupt_grace
+            + self.second_interrupt_grace
+            + 10
+        )
+        self._deadline_mgr.reset_for_retry(polling_timeout)
+        logger.info(f"⏱️  Polling deadline extended by {polling_timeout}s after repeat")
 
         # ── Timeout monitoring ─────────────────────────────────────────
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
         )
 
         # ── Turn monitoring ────────────────────────────────────────────
         if self.turn_monitor_task:
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
-        # NOTE: Do NOT reset user_currently_speaking — let VAD events drive it.
-        # If the user is already speaking when this reset runs, forcing False
-        # causes the polling loop to capture a partial fragment immediately.
-        self._first_fragment_time = None  # Reset stabilization timer
-        self._user_stopped_speaking_at = None  # Reset pause cooldown
+        self._first_fragment_time = None
+        self._user_stopped_speaking_at = None
         self.turn_time_exceeded = False
         self.current_turn = TurnInfo(
             participant_identity=participant,
@@ -2760,17 +1627,6 @@ class CommunityModeratorAgent(Agent):
 
         # ── Spillover guard timestamp ──────────────────────────────────
         self.turn_transition_time = datetime.now()
-
-        # ── Extend polling deadline so user gets full time after repeat ─
-        import time as _time
-        polling_timeout = (
-            self.max_turn_duration
-            + self.first_interrupt_grace
-            + self.second_interrupt_grace
-            + 10
-        )
-        self._polling_deadline = _time.time() + polling_timeout
-        logger.info(f"⏱️  Polling deadline extended by {polling_timeout}s after repeat")
 
         # ── Invariant: expected_respondent MUST NOT change ─────────────
         assert self.expected_respondent == saved_expected, (
@@ -2823,11 +1679,11 @@ class CommunityModeratorAgent(Agent):
             self.pending_stt_transcript = None
             if not self.user_currently_speaking:
                 self._first_vad_speaking_time = None
-            self._stt_nudge_given = False
             self._first_fragment_time = None
             self._user_stopped_speaking_at = None
             self._last_transcript_progress_time = _time.time()
-            self._silence_watchdog_fired = False
+            # Deadline/watchdog: clears stt_nudge + silence_watchdog, extends deadline
+            self._deadline_mgr.reset_for_encouragement(15.0)
             if self.turn_monitor_task:
                 self.turn_monitor_task.cancel()
                 self.turn_monitor_task = None
@@ -2835,12 +1691,6 @@ class CommunityModeratorAgent(Agent):
             self.current_turn = TurnInfo(participant_identity=participant, start_time=datetime.now())
             self.turn_monitor_task = asyncio.create_task(self.monitor_turn_duration(self.agent_session))
             logger.info(f"🔄 Reset turn monitoring after encouragement ({loop_label})")
-            # Bounded wait: extend polling deadline by 15s max
-            if self._polling_deadline is not None:
-                new_deadline = _time.time() + 15.0
-                if new_deadline > self._polling_deadline:
-                    self._polling_deadline = new_deadline
-                    logger.info(f"⏱️  Extended polling deadline by 15s for post-encouragement wait")
             return "encouraged"
 
         # ── SECOND uncertain response: deterministic follow-up ────────────
@@ -2921,22 +1771,19 @@ class CommunityModeratorAgent(Agent):
         self.waiting_for_response = True
         self.last_speech_time = None
         self._had_stt_transcript_this_turn = False
-        self._idle_no_vad_nudge_fired = False
-        self._first_nudge_given = False
-        self._post_nudge_extended = False
-        self._stt_nudge_given = False
         self._first_fragment_time = None
         self._user_stopped_speaking_at = None
         self._last_transcript_progress_time = _time.time()
-        self._silence_watchdog_fired = False
         if not self.user_currently_speaking:
             self._first_vad_speaking_time = None
 
-        self._response_epoch += 1
+        # Deadline/watchdog: clears watchdog flags, bumps epoch, extends deadline
+        self._deadline_mgr.reset_for_short_offtopic(15.0)
+
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
         )
 
         if self.turn_monitor_task:
@@ -2950,14 +1797,6 @@ class CommunityModeratorAgent(Agent):
         self.turn_monitor_task = asyncio.create_task(
             self.monitor_turn_duration(self.agent_session)
         )
-
-        if self._polling_deadline is not None:
-            new_deadline = _time.time() + 15.0
-            if new_deadline > self._polling_deadline:
-                self._polling_deadline = new_deadline
-                logger.info(
-                    f"⏱️  Extended polling deadline by 15s after short off-topic nudge ({loop_label})"
-                )
 
     def _reset_for_off_topic(self, participant: str, *, context: str = "") -> None:
         """Reset all mutable state after an off-topic redirect so the participant
@@ -2988,16 +1827,12 @@ class CommunityModeratorAgent(Agent):
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
-        self._encouragement_followup_given = False  # Fixed: was missing — silence watchdog needs fresh state
-        self._last_transcript_progress_time = None  # Fixed: was missing — silence watchdog reference point
-        self._silence_watchdog_fired = False  # Fixed: was missing — re-arms silence watchdog
+        self._encouragement_followup_given = False
+        self._last_transcript_progress_time = None
         self.question_repeated = False
         self._short_offtopic_count = 0
         self._last_short_offtopic_norm = None
         self._had_stt_transcript_this_turn = False
-        self._idle_no_vad_nudge_fired = False
-        self._first_nudge_given = False
-        self._post_nudge_extended = False
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
@@ -3006,26 +1841,28 @@ class CommunityModeratorAgent(Agent):
 
         # ── STT health-check state ────────────────────────────────────
         self._first_vad_speaking_time = None
-        self._stt_nudge_given = False
 
-        # ── Epoch bump: invalidates any stale timeout/watchdog tasks ──
-        self._response_epoch += 1
+        # ── Deadline/watchdog reset: clears watchdog flags, bumps epoch, sets deadline ──
+        max_turn_time = (
+            self.max_turn_duration
+            + self.first_interrupt_grace
+            + self.second_interrupt_grace
+        )
+        off_topic_extension = max_turn_time + 10
+        self._deadline_mgr.reset_for_off_topic(off_topic_extension)
+        logger.info(f"⏱️  Polling deadline extended by {off_topic_extension}s after off-topic reset")
 
         # ── Timeout monitoring ─────────────────────────────────────────
         if self.response_timeout_task:
             self.response_timeout_task.cancel()
         self.response_timeout_task = asyncio.create_task(
-            self.monitor_response_timeout(participant, epoch=self._response_epoch)
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
         )
 
         # ── Turn monitoring ────────────────────────────────────────────
         if self.turn_monitor_task:
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
-        # NOTE: Do NOT reset user_currently_speaking — let VAD events drive it.
-        # If the user is already speaking when this reset runs, forcing False
-        # causes the polling loop to capture a partial fragment immediately
-        # (the user never triggers a new 'speaking' event).
         self.current_speaking_duration = 0.0
         self.accumulated_pause_duration = 0.0
         self._first_fragment_time = None
@@ -3041,16 +1878,6 @@ class CommunityModeratorAgent(Agent):
 
         # ── Spillover guard timestamp ──────────────────────────────────
         self.turn_transition_time = datetime.now()
-
-        # ── Extend polling deadline so user gets full time after redirect ─
-        max_turn_time = (
-            self.max_turn_duration
-            + self.first_interrupt_grace
-            + self.second_interrupt_grace
-        )
-        off_topic_extension = max_turn_time + 10
-        self._polling_deadline = _time.time() + off_topic_extension
-        logger.info(f"⏱️  Polling deadline extended by {off_topic_extension}s after off-topic reset")
 
         logger.critical(
             f"🔄 OFF-TOPIC RESET COMPLETE (ctx={context}) — "
@@ -3500,15 +2327,8 @@ class CommunityModeratorAgent(Agent):
 
     @staticmethod
     def _is_avatar_identity(identity: str) -> bool:
-        """Return True if the identity belongs to the Anam avatar agent.
-
-        Centralised check so all event handlers use the same logic.
-        Matches the constant ``ANAM_AVATAR_IDENTITY`` ("anam-avatar-agent")
-        and any identity containing "avatar-agent" (handles suffixed variants).
-        """
-        if not identity:
-            return False
-        return identity == ANAM_AVATAR_IDENTITY or "avatar-agent" in identity
+        """Delegate to domain.text_analysis.is_avatar_identity."""
+        return _is_avatar_identity_fn(identity)
 
     def _set_avatar_state(self, new_state: str, *, reason: Optional[str] = None):
         """Transition avatar state with structured logging."""
@@ -3702,7 +2522,7 @@ class CommunityModeratorAgent(Agent):
                         self.response_captured = False
                         self._first_vad_speaking_time = None
                         # Keep _stt_nudge_given = True to suppress echo-triggered nudges
-                        self._stt_nudge_given = True
+                        self._deadline_mgr.suppress_stt_nudge()
 
                         warning_start_time = datetime.now()
                         await session.say(warning_text, allow_interruptions=False)
@@ -3735,7 +2555,7 @@ class CommunityModeratorAgent(Agent):
                         # "speech" without real STT transcripts.  If we reset the
                         # nudge flag, the STT health-check fires "I didn't hear you"
                         # immediately after the warning — confusing the participant.
-                        self._stt_nudge_given = True
+                        self._deadline_mgr.suppress_stt_nudge()
 
                         # CRITICAL FIX (Bug 2): Extend the polling deadline so the
                         # polling loop does not timeout while the user is wrapping up.
@@ -3743,8 +2563,7 @@ class CommunityModeratorAgent(Agent):
                         # fires immediately after the warning, discarding wrap-up speech.
                         wrap_up_extension = self.second_interrupt_grace + 10  # wrap-up window + buffer
                         new_deadline = _time.time() + wrap_up_extension
-                        if self._polling_deadline is None or new_deadline > self._polling_deadline:
-                            self._polling_deadline = new_deadline
+                        self._deadline_mgr.extend_deadline_to(new_deadline)
                         logger.info(f"⏱️  Polling deadline extended by {wrap_up_extension}s after gentle warning")
 
                         logger.critical(
@@ -3782,6 +2601,7 @@ class CommunityModeratorAgent(Agent):
 
                     turn_info.force_interrupted = True
                     turn_info.interruption_count += 1
+                    self._turn_phase.transition_to(TurnPhase.TURN_FORCE_ENDED)
 
                     logger.error(
                         f"🛑 FORCE ENDING TURN: {participant_id} "
@@ -3938,7 +2758,7 @@ class CommunityModeratorAgent(Agent):
         watchdog so only one first-nudge fires per turn.
 
         The *epoch* parameter ties this task to a specific response-collection
-        window.  If ``self._response_epoch`` has moved on (repeat, re-prompt,
+        window.  If the deadline manager epoch has moved on (repeat, re-prompt,
         off-topic reset …), this task silently exits instead of mutating
         state that now belongs to a newer window.
         """
@@ -3957,10 +2777,10 @@ class CommunityModeratorAgent(Agent):
             await asyncio.sleep(_effective_nudge)
 
             # ── Stale-epoch guard (post first sleep) ─────────────────
-            if self._response_epoch != epoch:
+            if self._deadline_mgr.is_stale(epoch):
                 logger.info(
                     f"monitor_response_timeout(epoch={epoch}): stale — "
-                    f"current epoch is {self._response_epoch}, exiting"
+                    f"current epoch is {self._deadline_mgr.epoch}, exiting"
                 )
                 return
 
@@ -3977,10 +2797,10 @@ class CommunityModeratorAgent(Agent):
             # Check if they started speaking
             if self.last_speech_time is None and self.waiting_for_response:
                 # ── Single-owner guard: only one first nudge per turn ─
-                if self._first_nudge_given:
+                if self._deadline_mgr.first_nudge_given:
                     logger.info(
                         "monitor_response_timeout: suppressing nudge — "
-                        "_first_nudge_given already set by another watchdog"
+                        "first_nudge_given already set by another watchdog"
                     )
                     return
 
@@ -4001,14 +2821,14 @@ class CommunityModeratorAgent(Agent):
                         return
 
                 # ── Stale-epoch guard (pre nudge mutation) ───────────
-                if self._response_epoch != epoch:
+                if self._deadline_mgr.is_stale(epoch):
                     logger.info(
                         f"monitor_response_timeout(epoch={epoch}): stale before nudge — "
-                        f"current epoch is {self._response_epoch}, exiting"
+                        f"current epoch is {self._deadline_mgr.epoch}, exiting"
                     )
                     return
 
-                self._first_nudge_given = True
+                self._deadline_mgr.mark_nudge_given()
                 logger.warning(f"No response from {participant} after {_effective_nudge:.0f}s (base={nudge_timeout}s + TTS={_tts_remaining:.1f}s), prompting...")
                 await self._safe_say(TIMEOUT_NUDGE_TEXT, allow_interruptions=False, context="timeout_nudge")
                 logger.info(f"🔊 Prompted participant with direct TTS: '{TIMEOUT_NUDGE_TEXT}'")
@@ -4016,10 +2836,10 @@ class CommunityModeratorAgent(Agent):
                 await asyncio.sleep(skip_timeout - nudge_timeout)
 
                 # ── Stale-epoch guard (post second sleep) ────────────
-                if self._response_epoch != epoch:
+                if self._deadline_mgr.is_stale(epoch):
                     logger.info(
                         f"monitor_response_timeout(epoch={epoch}): stale after skip sleep — "
-                        f"current epoch is {self._response_epoch}, exiting"
+                        f"current epoch is {self._deadline_mgr.epoch}, exiting"
                     )
                     return
 
@@ -4048,6 +2868,7 @@ class CommunityModeratorAgent(Agent):
             reason: Reason for early termination (for logging)
         """
         logger.warning(f"🚪 Ending survey early: {reason}")
+        self._turn_phase.force_to(TurnPhase.IDLE)
 
         # Generate STT debug report
         try:
@@ -4434,9 +3255,7 @@ class CommunityModeratorAgent(Agent):
         await self._route_audio_to_participant(participant, context="ask_next_question")
 
         # DIRECT TTS - Speak the question with truncation detection + retry.
-        # Change 1: retry_text omits participant name to avoid repeated name playback.
-        # Change 2: dedupe_key prevents re-speaking the same prompt on redelivery.
-        # Change 4: _speak_question_safely now has 2 retries with backoff internally.
+        self._turn_phase.transition_to(TurnPhase.MODERATOR_SPEAKING)
         _dedupe = f"ask_Q{self.current_question_num}_{participant}"
         tts_fully_spoken = await self._speak_question_safely(
             exact_text_to_say,
@@ -4486,6 +3305,7 @@ class CommunityModeratorAgent(Agent):
         logger.critical(f"Question #{self.current_question_num} spoken via DIRECT TTS")
 
         # ── Phase 1: Event-driven response capture ──
+        self._turn_phase.transition_to(TurnPhase.AWAITING_RESPONSE)
         max_turn_time = self.max_turn_duration + self.first_interrupt_grace + self.second_interrupt_grace
         polling_timeout = max_turn_time + 10
 
@@ -4525,10 +3345,13 @@ class CommunityModeratorAgent(Agent):
                     participant, response_text, question_context)
 
                 if result == "accepted" or result == "move_on":
+                    self._turn_phase.transition_to(TurnPhase.TURN_COMPLETED)
                     self._record_response_to_exports(participant, response_text, question_id)
                     user_responded = True
                     break
                 elif result == "retry":
+                    self._turn_phase.transition_to(TurnPhase.MODERATOR_FOLLOWUP)
+                    self._turn_phase.transition_to(TurnPhase.AWAITING_RESPONSE)
                     # Wait for new response
                     response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
                     if response_text == "PAUSED":
@@ -4540,6 +3363,7 @@ class CommunityModeratorAgent(Agent):
                     break
 
         if not user_responded:
+            self._turn_phase.transition_to(TurnPhase.TURN_TIMED_OUT)
             logger.warning(f"Max wait time reached ({polling_timeout}s), no response detected")
 
             # Audible timeout message
@@ -4561,6 +3385,7 @@ class CommunityModeratorAgent(Agent):
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
         self.current_turn = None
+        self._turn_phase.force_to(TurnPhase.IDLE)
 
         # Move to next participant/question
         return "move"
@@ -4775,10 +3600,8 @@ class CommunityModeratorAgent(Agent):
         # skip_muting=True because muting is already kicked off earlier in this method
         await self._route_audio_to_participant(participant, context="move_to_next_participant", skip_muting=True)
 
-        # DIRECT TTS - Speak the question with truncation detection + retry.
-        # Change 1: retry_text omits participant name to avoid repeated name playback.
-        # Change 2: dedupe_key prevents re-speaking the same prompt.
-        # Change 4: _speak_question_safely now has 2 retries with backoff internally.
+        # DIRECT TTS - Speak the question for next participant.
+        self._turn_phase.transition_to(TurnPhase.MODERATOR_SPEAKING)
         _dedupe = f"move_Q{self.current_question_num}_{participant}"
         tts_fully_spoken = await self._speak_question_safely(
             exact_text_to_say,
@@ -4839,6 +3662,7 @@ class CommunityModeratorAgent(Agent):
         question_id = self.current_question_object.id if self.current_question_object else f"Q{self.current_question_num}"
         question_context = f"Q#{self.current_question_num} ({question_id})"
 
+        self._turn_phase.transition_to(TurnPhase.AWAITING_RESPONSE)
         response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
 
         if response_text == "PAUSED":
@@ -4853,10 +3677,13 @@ class CommunityModeratorAgent(Agent):
                     participant, response_text, question_context)
 
                 if result == "accepted" or result == "move_on":
+                    self._turn_phase.transition_to(TurnPhase.TURN_COMPLETED)
                     self._record_response_to_exports(participant, response_text, question_id)
                     user_responded = True
                     break
                 elif result == "retry":
+                    self._turn_phase.transition_to(TurnPhase.MODERATOR_FOLLOWUP)
+                    self._turn_phase.transition_to(TurnPhase.AWAITING_RESPONSE)
                     response_text = await self._await_response(participant, polling_timeout, tts_fully_spoken)
                     if response_text == "PAUSED":
                         return
@@ -4866,6 +3693,7 @@ class CommunityModeratorAgent(Agent):
                     break
 
         if not user_responded:
+            self._turn_phase.transition_to(TurnPhase.TURN_TIMED_OUT)
             logger.warning(f"Max wait time reached ({polling_timeout}s), no response detected (2nd)")
 
             try:
@@ -4883,6 +3711,7 @@ class CommunityModeratorAgent(Agent):
             self.turn_monitor_task.cancel()
             self.turn_monitor_task = None
         self.current_turn = None
+        self._turn_phase.force_to(TurnPhase.IDLE)
 
         # After response (or timeout), continue the survey loop
         return "move"
@@ -6076,11 +4905,21 @@ async def create_moderator_session(
         # Track speaking state for polling
         if event.new_state == "speaking":
             moderator.user_currently_speaking = True
+            # Only transition phase during an active turn (not during welcome,
+            # between turns, or after cleanup — participants can speak at any time)
+            if moderator._turn_phase.is_in(
+                TurnPhase.AWAITING_RESPONSE,
+                TurnPhase.PARTICIPANT_PAUSED,
+                TurnPhase.MODERATOR_SPEAKING,
+            ):
+                moderator._turn_phase.transition_to(TurnPhase.PARTICIPANT_SPEAKING)
             # Record when this speaking segment started (for VAD-based duration)
             moderator._vad_speaking_segment_start = datetime.now()
         elif event.old_state == "speaking":
             # User stopped speaking (moved to listening or away)
             moderator.user_currently_speaking = False
+            if moderator._turn_phase.is_in(TurnPhase.PARTICIPANT_SPEAKING):
+                moderator._turn_phase.transition_to(TurnPhase.PARTICIPANT_PAUSED)
             moderator._user_stopped_speaking_at = datetime.now()
 
             # ACCUMULATE actual VAD speaking duration (not wall-clock from turn start)

@@ -12,48 +12,16 @@ Source of truth: src/moderator_agent.py
 
 import unittest
 
-
-# ── Mirrored constants from moderator_agent.py ────────────────────────────────
-
-DISFLUENCY_EXTENSION_BUDGET = 10.0
-IDLE_NO_VAD_TIMEOUT = 12.0
-TTS_SAFETY_MARGIN = 3.0
-
-_DISFLUENT_STARTER_TOKENS = frozenset({
-    "well", "um", "uh", "uhm", "erm", "hmm", "ah", "oh",
-    "like", "so", "i", "think", "guess", "mean",
-    "you", "know", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "that", "the", "a",
-    "it", "its", "is", "was", "not", "really",
-    "hi", "hello", "hey",
-})
-
-_FIRST_UTTERANCE_GREETING_TOKENS = frozenset({
-    "sure", "thanks", "thank", "morning", "evening", "afternoon",
-    "good", "nice", "meet", "to", "how", "are", "doing", "fine",
-    "great", "welcome", "greetings",
-})
-
-
-def _is_disfluent_starter(text: str) -> bool:
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return True
-    return all(w in _DISFLUENT_STARTER_TOKENS for w in words)
-
-
-def _is_first_utterance_greeting(text: str) -> bool:
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return False
-    allowed = _DISFLUENT_STARTER_TOKENS | _FIRST_UTTERANCE_GREETING_TOKENS
-    return all(w in allowed for w in words)
-
-
-def _estimate_tts_duration(text: str) -> float:
-    return max(len(text) / 15.0, 1.0)
+from src.domain.constants import (
+    DISFLUENCY_EXTENSION_BUDGET,
+    IDLE_NO_VAD_TIMEOUT,
+    TTS_SAFETY_MARGIN,
+)
+from src.domain.text_analysis import (
+    _is_disfluent_starter,
+    _is_first_utterance_greeting,
+    _estimate_tts_duration,
+)
 
 
 # ── Bug 1: Disfluency + greeting guard cascade ──────────────────────────────

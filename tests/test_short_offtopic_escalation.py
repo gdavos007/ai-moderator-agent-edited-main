@@ -11,65 +11,19 @@ Covers:
   5. Acceptance scenarios:
      - Q2: "I don't know" → encouragement → "I love cheese" → immediate escalation
      - Q3: partial delivery → silence → idle watchdog fires
-
-NOTE: Mirrors logic from src/moderator_agent.py rather than importing it
-directly (heavy LiveKit dependencies).
 """
 
-import re
 import time
 
 import pytest
 
-
-# ── Mirrored helpers ──────────────────────────────────────────────────────────
-
-_FILLER_TOKENS = frozenset({
-    "um", "uh", "uhm", "erm", "hmm", "hm", "ah", "oh",
-    "like", "so", "well", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "you", "know", "mean",
-    "i", "a", "the", "is", "it", "that", "this",
-})
-
-MIN_OFFTOPIC_WORDS = 3
-MIN_OFFTOPIC_CHARS = 40
-_BLATANT_OFFTOPIC_KEYWORDS = frozenset({
-    "basketball", "breakfast", "cat", "cheese", "dinner", "dog",
-    "football", "lunch", "movie", "movies", "music", "pizza",
-    "soccer", "sport", "sports", "weather", "weekend",
-})
-_BLATANT_OFFTOPIC_PHRASES = (
-    "mind your own business",
-    "none of your business",
+from src.domain.text_analysis import (
+    _substantive_word_count,
+    _is_too_short_for_offtopic,
+    _normalize_for_offtopic_compare,
+    _has_blatant_offtopic_keywords,
 )
-
-IDLE_NO_VAD_TIMEOUT = 12.0
-
-
-def _substantive_word_count(text: str) -> int:
-    return sum(1 for w in text.lower().split() if w.strip(".,!?…") not in _FILLER_TOKENS)
-
-
-def _is_too_short_for_offtopic(text: str) -> bool:
-    words = len(text.split())
-    chars = len(text)
-    substantive = _substantive_word_count(text)
-    if words < MIN_OFFTOPIC_WORDS or chars < MIN_OFFTOPIC_CHARS or substantive < 4:
-        return True
-    return False
-
-
-def _normalize_for_offtopic_compare(text: str) -> str:
-    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text.lower())).strip()
-
-
-def _has_blatant_offtopic_keywords(text: str) -> bool:
-    normalized = _normalize_for_offtopic_compare(text)
-    if not normalized:
-        return False
-    if any(phrase in normalized for phrase in _BLATANT_OFFTOPIC_PHRASES):
-        return True
-    return bool(set(normalized.split()) & _BLATANT_OFFTOPIC_KEYWORDS)
+from src.domain.constants import IDLE_NO_VAD_TIMEOUT
 
 
 # ── Simulated state ──────────────────────────────────────────────────────────

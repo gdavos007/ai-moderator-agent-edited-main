@@ -4,25 +4,11 @@ Tests for the _say_and_wait_for_playback() TTS playback helper.
 Verifies the duration estimation and sleep logic that compensates for
 wait_for_playout() resolving when frames are queued (~0.5s) rather than
 when the client finishes playback.
-
-Source of truth: src/moderator_agent.py — _say_and_wait_for_playback(),
-_estimate_tts_duration().
 """
 
 import unittest
 
-
-# ── Mirror _estimate_tts_duration from moderator_agent.py ──
-
-def _estimate_tts_duration(text: str) -> float:
-    """Estimate TTS audio duration from character count.
-
-    ElevenLabs / OpenAI TTS speak at approximately 150 words per minute,
-    which is roughly 15 characters per second including spaces.
-    Intentionally conservative (slightly slow) so we overestimate rather
-    than underestimate.
-    """
-    return max(len(text) / 15.0, 1.0)
+from src.domain.text_analysis import _estimate_tts_duration
 
 
 def _compute_remaining_sleep(text: str, elapsed: float) -> float:

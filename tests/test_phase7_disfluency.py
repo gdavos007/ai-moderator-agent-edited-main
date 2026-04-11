@@ -10,34 +10,12 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
-
-# ── Mirror constants / helpers from moderator_agent.py ──
-
-_DISFLUENT_STARTER_TOKENS = frozenset({
-    "well", "um", "uh", "uhm", "erm", "hmm", "ah", "oh",
-    "like", "so", "i", "think", "guess", "mean",
-    "you", "know", "yeah", "yes", "no", "okay", "ok",
-    "right", "and", "but", "just", "that", "the", "a",
-    "it", "its", "is", "was", "not", "really",
-    "hi", "hello", "hey",
-})
-
-DISFLUENCY_EXTENSION_BUDGET = 10.0
-IDLE_NO_VAD_TIMEOUT = 12.0
-TTS_SAFETY_MARGIN = 3.0
-
-
-def _is_disfluent_starter(text: str) -> bool:
-    """Return True if text consists entirely of disfluent/filler tokens."""
-    words = [w.strip(".,!?…'\"") for w in text.lower().split()]
-    words = [w for w in words if w]
-    if not words:
-        return True
-    return all(w in _DISFLUENT_STARTER_TOKENS for w in words)
-
-
-def _estimate_tts_duration(text: str) -> float:
-    return max(len(text) / 15.0, 1.0)
+from src.domain.constants import (
+    DISFLUENCY_EXTENSION_BUDGET,
+    IDLE_NO_VAD_TIMEOUT,
+    TTS_SAFETY_MARGIN,
+)
+from src.domain.text_analysis import _is_disfluent_starter, _estimate_tts_duration
 
 
 # ── Test 1: _is_disfluent_starter classification ──
