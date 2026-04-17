@@ -3570,15 +3570,18 @@ class CommunityModeratorAgent(Agent):
         # Call on participant by name if full question already spoken to the group;
         # otherwise speak the full question (e.g. after a partial first delivery).
         if self._question_spoken_to_group:
-            _callout_idx = self._question_callout_counter % 4
-            _callout_templates = [
-                "{name}, what are your thoughts on this?",
-                "How about you, {name}?",
-                "{name}, what do you think?",
-                "And {name}, what's your take?",
-            ]
-            exact_text_to_say = _callout_templates[_callout_idx].format(name=participant_display_name)
-            self._question_callout_counter += 1
+            if self.current_question_object and self.current_question_object.id == "W1":
+                exact_text_to_say = f"{participant_display_name}, what about you?"
+            else:
+                _callout_idx = self._question_callout_counter % 4
+                _callout_templates = [
+                    "{name}, what are your thoughts on this?",
+                    "How about you, {name}?",
+                    "{name}, what do you think?",
+                    "And {name}, what's your take?",
+                ]
+                exact_text_to_say = _callout_templates[_callout_idx].format(name=participant_display_name)
+                self._question_callout_counter += 1
         else:
             exact_text_to_say = f"{participant_display_name}, {self.current_question}"
 

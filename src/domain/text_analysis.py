@@ -192,9 +192,9 @@ def is_uncertain_response(text: str) -> bool:
 
     # Filler words that can appear around uncertain phrases without adding substance
     filler_words = {
-        "um", "uh", "well", "like", "you know", "i mean", "honestly",
+        "um", "uh", "umm", "well", "like", "you know", "i mean", "honestly",
         "actually", "really", "just", "so", "yeah", "hmm", "oh", "ah",
-        "let me think", "let me see", "i guess", "i think", "maybe",
+        "let me think", "let me see", "i guess", "i think", "think", "maybe",
         "probably", "perhaps", "sorry", "i'm sorry", "to be honest",
         "tbh", "right", "okay", "ok", "man", "dude", "huh", "er",
         "have", "got", "do", "did", "am", "is", "was",

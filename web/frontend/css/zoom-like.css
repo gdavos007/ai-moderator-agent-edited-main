@@ -867,7 +867,13 @@ body {
 .video-grid[data-tiles="4"] {
     grid-template-columns: repeat(2, 1fr);
     /* Cap each row so two 16:9 rows + gap never exceed the grid height */
-    grid-template-rows: repeat(2, minmax(0, calc((100% - 12px) / 2)));
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+/* In a 4-tile grid the row height is the constraint, not the aspect-ratio.
+   Setting height:100% forces the tile to fill (not overflow) its grid cell
+   and aspect-ratio becomes a suggestion the browser can shrink. */
+.video-grid[data-tiles="4"] .video-tile {
+    height: 100%;
 }
 .video-grid[data-tiles="5"],
 .video-grid[data-tiles="6"] { grid-template-columns: repeat(3, 1fr); }
@@ -1458,29 +1464,38 @@ body {
 @media (max-width: 768px) {
     .video-grid {
         grid-template-columns: 1fr !important;
+        grid-auto-rows: minmax(0, 1fr);
         max-width: 600px !important;
         padding: 0 10px;
     }
 
-    /* 4-tile override: keep 2x2 on tablet instead of stacking */
-    .video-grid[data-tiles="4"] {
-        grid-template-columns: repeat(2, 1fr) !important;
-        grid-template-rows: repeat(2, minmax(0, calc((100% - 12px) / 2)));
-        max-width: 100% !important;
-    }
-
+    /* When stacked in a single column, drop aspect-ratio so tiles
+       share available height equally without overflowing */
     .video-tile {
-        aspect-ratio: 4 / 3;
+        aspect-ratio: auto;
+        height: 100%;
     }
 
-    /* Preserve 16:9 for 4-tile 2x2 so tiles fill rows without squishing */
-    .video-grid[data-tiles="4"] .video-tile {
-        aspect-ratio: 16 / 9;
+    .video-tile video {
+        object-fit: cover;
     }
 
-    /* Contain video within constrained rows — prevents crop/squish */
-    .video-grid[data-tiles="4"] .video-tile video {
-        object-fit: contain;
+    /* 4-tile override: keep 2x2 on tablet (min 600px wide) */
+    @media (min-width: 481px) {
+        .video-grid[data-tiles="4"] {
+            grid-template-columns: repeat(2, 1fr) !important;
+            grid-template-rows: repeat(2, minmax(0, 1fr));
+            max-width: 100% !important;
+        }
+
+        .video-grid[data-tiles="4"] .video-tile {
+            aspect-ratio: 16 / 9;
+            height: 100%;
+        }
+
+        .video-grid[data-tiles="4"] .video-tile video {
+            object-fit: contain;
+        }
     }
 }
 
@@ -1519,20 +1534,21 @@ body {
         gap: 8px;
     }
 
-    /* 4-tile: 2x2 with tighter gap on small screens */
+    /* 4-tile on phone: single column, equal-height rows, no aspect-ratio overflow */
     .video-grid[data-tiles="4"] {
-        grid-template-columns: repeat(2, 1fr) !important;
-        grid-template-rows: repeat(2, minmax(0, calc((100% - 8px) / 2)));
+        grid-template-columns: 1fr !important;
+        grid-template-rows: repeat(4, minmax(0, 1fr));
         gap: 8px;
         max-width: 100% !important;
     }
 
     .video-grid[data-tiles="4"] .video-tile {
-        aspect-ratio: 16 / 9;
+        aspect-ratio: auto;
+        height: 100%;
     }
 
     .video-grid[data-tiles="4"] .video-tile video {
-        object-fit: contain;
+        object-fit: cover;
     }
 
     .agent-avatar-animated {

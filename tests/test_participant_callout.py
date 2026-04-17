@@ -18,6 +18,7 @@ CALLOUT_TEMPLATES = [
 ]
 
 SAMPLE_QUESTION = "What is your role? The options are: Manager, Individual Contributor, or Other."
+W1_QUESTION = "Please tell me where you live and what you do for a living, or are you a student or retired?"
 
 
 # ---------------------------------------------------------------------------
@@ -31,18 +32,23 @@ class CalloutMixin:
         self._question_callout_counter: int = 0
         self.current_question_num: int = 0
         self.current_question: str = SAMPLE_QUESTION
+        self.current_question_id: str = None
 
-    def advance_question(self, q_num: int, q_text: str):
+    def advance_question(self, q_num: int, q_text: str, question_id: str = None):
         self.current_question_num = q_num
         self.current_question = q_text
+        self.current_question_id = question_id
         self._question_spoken_to_group = False
 
     def build_text_for_participant(self, name: str) -> str:
         """Simulate exact_text_to_say construction."""
         if self._question_spoken_to_group:
-            idx = self._question_callout_counter % len(CALLOUT_TEMPLATES)
-            text = CALLOUT_TEMPLATES[idx].format(name=name)
-            self._question_callout_counter += 1
+            if self.current_question_id == "W1":
+                text = f"{name}, what about you?"
+            else:
+                idx = self._question_callout_counter % len(CALLOUT_TEMPLATES)
+                text = CALLOUT_TEMPLATES[idx].format(name=name)
+                self._question_callout_counter += 1
         else:
             text = f"{name}, {self.current_question}"
         return text
@@ -131,3 +137,20 @@ class TestRepeatRequestStillUsesFullQuestion:
         # Callout mode doesn't mutate current_question
         mod.build_text_for_participant("Bob")
         assert mod.current_question == SAMPLE_QUESTION
+
+
+class TestW1UsesFixedCallout:
+    def test_w1_subsequent_participants_get_what_about_you(self):
+        mod = CalloutMixin()
+        mod.advance_question(1, W1_QUESTION, question_id="W1")
+        # First participant — full question
+        text = mod.build_text_for_participant("Alice")
+        assert text == f"Alice, {W1_QUESTION}"
+        mod.mark_delivered(tts_fully_spoken=True)
+        # Second and third participants — fixed W1 callout
+        assert mod.build_text_for_participant("Bob") == "Bob, what about you?"
+        assert mod.build_text_for_participant("Charlie") == "Charlie, what about you?"
+        # Counter should NOT have incremented (W1 doesn't use rotating templates)
+        assert mod._question_callout_counter == 0
+
+

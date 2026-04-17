@@ -302,3 +302,26 @@ class TestBoundedWaitAfterEncouragement:
         """After silence watchdog fires, additional time is at most 8s."""
         MAX_WATCHDOG_EXTENSION = 8.0
         assert MAX_WATCHDOG_EXTENSION <= 10.0, "Watchdog extension should be bounded"
+
+
+class TestDisfluentUncertainResponse:
+    """Regression: hedged/disfluent uncertain phrases must route to encouragement."""
+
+    @pytest.mark.parametrize("text", [
+        "Well umm...I think I....I don't know",   # exact reported bug
+        "umm, I think, I don't know",             # shorter disfluent variant
+        "I think I don't know",                   # hedge + uncertain
+    ])
+    def test_disfluent_uncertain_is_detected(self, text):
+        assert is_uncertain_response(text), (
+            f"Disfluent uncertain phrase should be flagged: '{text}'"
+        )
+
+    @pytest.mark.parametrize("text", [
+        "I like the product but I'm not sure about pricing",
+        "I think it's good, don't know",
+    ])
+    def test_substantive_answers_still_accepted(self, text):
+        assert not is_uncertain_response(text), (
+            f"Answer with real content must NOT be flagged uncertain: '{text}'"
+        )
