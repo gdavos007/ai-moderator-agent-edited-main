@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sessions — Admin Portal</title>
+    <link rel="stylesheet" href="/static/css/admin.css">
+</head>
+<body class="admin-body">
+
+<nav class="admin-nav">
+    <h1>📋 Focus Group Admin</h1>
+    <div>
+        <a href="/admin">← Admin Home</a>
+    </div>
+</nav>
+
+<div class="admin-container">
+    <h1 class="admin-page-title">Completed Sessions</h1>
+    <p class="admin-page-subtitle">
+        Every focus group that has uploaded a transcript. Click a row to view its report.
+    </p>
+
+    {% if sessions %}
+    <table class="sessions-table" role="table">
+        <thead>
+            <tr>
+                <th>Session</th>
+                <th>Title</th>
+                <th>Started</th>
+                <th>Ended</th>
+                <th>Status</th>
+                <th>Versions</th>
+                <th style="text-align:right;">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sessions %}
+            <tr>
+                <td class="session-id">{{ s.session_id }}</td>
+                <td>{{ s.title or "—" }}</td>
+                <td>{{ s.started_at[:19] if s.started_at else "—" }}</td>
+                <td>{{ s.ended_at[:19] if s.ended_at else "—" }}</td>
+                <td>
+                    <span class="status-badge status-{{ s.status }}">{{ s.status }}</span>
+                </td>
+                <td>{{ s.latest_version if s.latest_version else "—" }}</td>
+                <td style="text-align:right;">
+                    <a href="/admin/sessions/{{ s.session_id }}/report" class="btn">View Report</a>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <div class="empty-state">
+        <h2>No sessions yet</h2>
+        <p>When a focus group ends, its transcript will appear here automatically.</p>
+    </div>
+    {% endif %}
+</div>
+
+</body>
+</html>

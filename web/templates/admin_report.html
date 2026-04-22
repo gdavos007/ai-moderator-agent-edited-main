@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Report — {{ session_id }}</title>
+    <link rel="stylesheet" href="/static/css/admin.css">
+</head>
+<body class="admin-body">
+
+<nav class="admin-nav">
+    <h1>📊 Session Report</h1>
+    <div>
+        <a href="/admin/sessions">← All Sessions</a>
+    </div>
+</nav>
+
+<div class="admin-container">
+
+<div class="report-header">
+    <div class="report-header-left">
+        <h1 id="report-title">Loading…</h1>
+        <div class="session-id">{{ session_id }} · <span id="report-status-badge" class="status-badge status-{{ meta.status }}">{{ meta.status }}</span></div>
+    </div>
+    <div>
+        <button id="btn-regenerate" class="btn btn-ghost" onclick="regenerateReport()">↻ Regenerate</button>
+    </div>
+</div>
+
+<div id="loader" class="loader">
+    <div class="loader-spinner"></div>
+    <div class="loader-label" id="loader-label">Generating report…</div>
+</div>
+
+<div id="error" class="error-state hidden">
+    <h3>Report generation failed</h3>
+    <p id="error-text"></p>
+</div>
+
+<div id="report-body" class="hidden">
+
+    <!-- Top metric cards -->
+    <div class="metric-cards">
+        <div class="metric-card">
+            <div class="label">Participants</div>
+            <div class="value" id="m-participants">—</div>
+        </div>
+        <div class="metric-card">
+            <div class="label">Duration</div>
+            <div class="value" id="m-duration">—</div>
+        </div>
+        <div class="metric-card">
+            <div class="label">Date</div>
+            <div class="value" id="m-date">—</div>
+        </div>
+        <div class="metric-card">
+            <div class="label">Version</div>
+            <div class="value" id="m-version">v—</div>
+        </div>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs" role="tablist">
+        <button class="tab active" data-panel="overview">Overview</button>
+        <button class="tab" data-panel="findings">Key Findings</button>
+        <button class="tab" data-panel="questions">Questions</button>
+        <button class="tab" data-panel="quotes">Quotes</button>
+        <button class="tab" data-panel="transcript">Transcript</button>
+    </div>
+
+    <!-- Overview -->
+    <div class="tab-panel active" id="panel-overview">
+        <div class="card">
+            <h3>Summary <span id="sentiment-chip" class="sentiment-chip">—</span></h3>
+            <p class="description" id="synopsis-summary">—</p>
+        </div>
+        <div class="card">
+            <h3>Top Takeaways</h3>
+            <ul class="takeaway-list" id="takeaways-list"></ul>
+        </div>
+    </div>
+
+    <!-- Key Findings -->
+    <div class="tab-panel" id="panel-findings">
+        <div id="findings-list"></div>
+    </div>
+
+    <!-- Question-by-Question -->
+    <div class="tab-panel" id="panel-questions">
+        <div id="questions-list"></div>
+    </div>
+
+    <!-- Quotes -->
+    <div class="tab-panel" id="panel-quotes">
+        <input type="text" class="search-box" id="quote-search" placeholder="Search quotes…">
+        <div id="quotes-list"></div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="tab-panel" id="panel-transcript">
+        <input type="text" class="search-box" id="transcript-search" placeholder="Search transcript…">
+        <div id="transcript-list"></div>
+    </div>
+
+</div>  <!-- /report-body -->
+
+</div>  <!-- /admin-container -->
+
+<script>
+const SESSION_ID = {{ session_id | tojson }};
+const INITIAL_STATUS = {{ meta.status | tojson }};
+
+// -- Polling ---------------------------------------------------------------
+let pollTimer = null;
+
+async function pollStatus() {
+    const r = await fetch(`/api/sessions/${SESSION_ID}/report/status`);
+    if (!r.ok) return null;
+    return r.json();
+}
+
+async function loadReport() {
+    const r = await fetch(`/api/sessions/${SESSION_ID}/report`);
+    if (!r.ok) return null;
+    return r.json();
+}
+
+function setBadge(status) {
+    const el = document.getElementById('report-status-badge');
+    el.className = 'status-badge status-' + status;
+    el.textContent = status;
+}
+
+function showReport(report) {
+    document.getElementById('loader').classList.add('hidden');
+    document.getElementById('error').classList.add('hidden');
+    document.getElementById('report-body').classList.remove('hidden');
+    renderReport(report);
+}
+
+function showError(message) {
+    document.getElementById('loader').classList.add('hidden');
+    document.getElementById('report-body').classList.add('hidden');
+    document.getElementById('error').classList.remove('hidden');
+    document.getElementById('error-text').textContent = message || 'Unknown error';
+}
+
+async function checkAndMaybeLoad() {
+    const meta = await pollStatus();
+    if (!meta) return;
+    setBadge(meta.status);
+    if (meta.status === 'complete') {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        const report = await loadReport();
+        if (report) showReport(report);
+        else showError('Report marked complete but payload could not be loaded.');
+    } else if (meta.status === 'failed') {
+        if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        showError(meta.last_error || 'Generation failed.');
+    }
+}
+
+// Kick off on load
+(async function init() {
+    if (INITIAL_STATUS === 'complete') {
+        const report = await loadReport();
+        if (report) {
+            showReport(report);
+            return;
+        }
+    }
+    if (INITIAL_STATUS === 'failed') {
+        const meta = await pollStatus();
+        showError(meta?.last_error || 'Generation previously failed.');
+        return;
+    }
+    document.getElementById('loader-label').textContent =
+        INITIAL_STATUS === 'processing' ? 'Generating report…' : 'Waiting to start…';
+    await checkAndMaybeLoad();  // in case it completed between page load and poll
+    if (!pollTimer) pollTimer = setInterval(checkAndMaybeLoad, 3000);
+})();
+
+// -- Rendering -------------------------------------------------------------
+function renderReport(r) {
+    document.getElementById('report-title').textContent =
+        (r.session && r.session.title) || 'Focus Group Session';
+    document.getElementById('m-participants').textContent =
+        (r.session && r.session.participant_count) ?? '—';
+    document.getElementById('m-duration').textContent =
+        (r.session && r.session.duration_minutes != null)
+            ? `${r.session.duration_minutes} min` : '—';
+    document.getElementById('m-date').textContent =
+        (r.session && r.session.date) ? r.session.date.slice(0, 10) : '—';
+
+    // Overview
+    const syn = r.synopsis || {};
+    document.getElementById('synopsis-summary').textContent = syn.summary || '—';
+    const sChip = document.getElementById('sentiment-chip');
+    const sentiment = (syn.overall_sentiment || 'neutral').toLowerCase();
+    sChip.className = 'sentiment-chip sentiment-' + sentiment;
+    sChip.textContent = sentiment;
+
+    const takeaways = document.getElementById('takeaways-list');
+    takeaways.innerHTML = '';
+    (syn.top_takeaways || []).forEach(t => {
+        const li = document.createElement('li');
+        li.textContent = t;
+        takeaways.appendChild(li);
+    });
+    if ((syn.top_takeaways || []).length === 0) {
+        const li = document.createElement('li');
+        li.textContent = 'No takeaways extracted.';
+        li.style.color = 'var(--admin-text-muted)';
+        takeaways.appendChild(li);
+    }
+
+    // Key findings
+    const findings = document.getElementById('findings-list');
+    findings.innerHTML = '';
+    (r.key_findings || []).forEach(f => {
+        const card = document.createElement('div');
+        card.className = 'card';
+        card.innerHTML = `
+            <h3>${escapeHtml(f.title || '')}</h3>
+            <p class="description">${escapeHtml(f.description || '')}</p>
+        `;
+        (f.supporting_quotes || []).forEach(q => {
+            card.appendChild(renderQuote(q));
+        });
+        findings.appendChild(card);
+    });
+    if ((r.key_findings || []).length === 0) {
+        findings.innerHTML =
+            '<div class="empty-state"><p>No key findings extracted for this session.</p></div>';
+    }
+
+    // Questions
+    const questions = document.getElementById('questions-list');
+    questions.innerHTML = '';
+    (r.question_analysis || []).forEach(q => {
+        const item = document.createElement('details');
+        item.className = 'question-item';
+        const summary = document.createElement('summary');
+        summary.innerHTML = `
+            <span class="qid">${escapeHtml(q.question_id || '—')}</span>
+            <span>${escapeHtml(q.question_text || '')}</span>
+        `;
+        item.appendChild(summary);
+        const content = document.createElement('div');
+        content.className = 'content';
+        let html = `<p class="summary-text">${escapeHtml(q.summary || '')}</p>`;
+        if ((q.themes || []).length) {
+            html += '<div class="chips">';
+            html += (q.themes || []).map(t => `<span class="chip">${escapeHtml(t)}</span>`).join('');
+            html += '</div>';
+        }
+        content.innerHTML = html;
+        (q.quotes || []).forEach(qq => content.appendChild(renderQuote(qq)));
+        item.appendChild(content);
+        questions.appendChild(item);
+    });
+    if ((r.question_analysis || []).length === 0) {
+        questions.innerHTML =
+            '<div class="empty-state"><p>No questions analyzed.</p></div>';
+    }
+
+    // Quotes (flat, searchable)
+    const quotes = document.getElementById('quotes-list');
+    quotes.innerHTML = '';
+    const allQuotes = [];
+    (r.key_findings || []).forEach(f => (f.supporting_quotes || []).forEach(q => allQuotes.push(q)));
+    (r.question_analysis || []).forEach(q => (q.quotes || []).forEach(qq => allQuotes.push(qq)));
+    // Dedupe by speaker|timestamp|quote
+    const seen = new Set();
+    allQuotes
+        .filter(q => {
+            const key = `${q.speaker}|${q.timestamp}|${q.quote}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        })
+        .forEach(q => quotes.appendChild(renderQuote(q)));
+    if (quotes.children.length === 0) {
+        quotes.innerHTML =
+            '<div class="empty-state"><p>No quotes extracted.</p></div>';
+    }
+    hookSearch('quote-search', quotes);
+
+    // Transcript
+    const transcript = document.getElementById('transcript-list');
+    transcript.innerHTML = '';
+    (r.transcript || []).forEach(t => {
+        const el = document.createElement('div');
+        const isAgent = /agent|moderator/i.test(t.speaker || '');
+        el.className = 'transcript-entry ' + (isAgent ? 'agent' : 'participant');
+        el.innerHTML = `
+            <div>
+                <span class="speaker">${escapeHtml(t.speaker || '')}</span>
+                <span class="timestamp">${escapeHtml((t.timestamp || '').slice(11, 19))}</span>
+            </div>
+            <div class="text">${escapeHtml(t.text || '')}</div>
+        `;
+        transcript.appendChild(el);
+    });
+    if ((r.transcript || []).length === 0) {
+        transcript.innerHTML =
+            '<div class="empty-state"><p>Transcript empty.</p></div>';
+    }
+    hookSearch('transcript-search', transcript);
+
+    // fetch fresh meta for version display
+    pollStatus().then(meta => {
+        if (meta && meta.latest_version) {
+            document.getElementById('m-version').textContent = 'v' + meta.latest_version;
+        }
+    });
+}
+
+function renderQuote(q) {
+    const el = document.createElement('div');
+    el.className = 'quote';
+    el.innerHTML = `
+        <div class="quote-text">"${escapeHtml(q.quote || '')}"</div>
+        <div class="quote-meta">— ${escapeHtml(q.speaker || '')} · ${escapeHtml((q.timestamp || '').slice(11, 19))}</div>
+    `;
+    return el;
+}
+
+function hookSearch(inputId, container) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    input.oninput = () => {
+        const q = input.value.toLowerCase();
+        Array.from(container.children).forEach(el => {
+            const text = (el.textContent || '').toLowerCase();
+            el.style.display = (!q || text.includes(q)) ? '' : 'none';
+        });
+    };
+}
+
+function escapeHtml(s) {
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Tab switching
+document.querySelectorAll('.tab').forEach(tab => {
+    tab.onclick = () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('panel-' + tab.dataset.panel).classList.add('active');
+    };
+});
+
+// Regenerate
+async function regenerateReport() {
+    if (!confirm('Regenerate this report? A new version will be created.')) return;
+    const btn = document.getElementById('btn-regenerate');
+    btn.disabled = true;
+    btn.textContent = '↻ Regenerating…';
+
+    const r = await fetch(`/api/sessions/${SESSION_ID}/report/regenerate`, { method: 'POST' });
+    if (!r.ok) {
+        alert('Failed to queue regeneration (HTTP ' + r.status + ')');
+        btn.disabled = false;
+        btn.textContent = '↻ Regenerate';
+        return;
+    }
+    // Reset UI to loading state and resume polling
+    document.getElementById('report-body').classList.add('hidden');
+    document.getElementById('error').classList.add('hidden');
+    document.getElementById('loader').classList.remove('hidden');
+    document.getElementById('loader-label').textContent = 'Generating new version…';
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(async () => {
+        await checkAndMaybeLoad();
+        if (document.getElementById('report-body').classList.contains('hidden') === false) {
+            btn.disabled = false;
+            btn.textContent = '↻ Regenerate';
+        }
+    }, 3000);
+}
+</script>
+
+</body>
+</html>

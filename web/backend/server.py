@@ -917,6 +917,197 @@ async def room_page(request: Request, session_id: str, participant: str = "Anony
     """
     return HTMLResponse(content=html_content)
 
+
+# ============================================================
+# Post-Session Report Portal
+# ============================================================
+# Keep this block self-contained so it is easy to diff / port to production.
+# See plan: /Users/ganeshkrishnan/.claude/plans/virtual-strolling-lerdorf.md
+
+from fastapi import BackgroundTasks, Depends
+from fastapi.responses import Response
+
+# Ensure our sibling modules import regardless of how the server is launched
+# (cd web && python backend/server.py  vs  uvicorn web.backend.server:app  vs
+#  docker CMD "python backend/server.py").  We add web/ to sys.path so the
+# top-level package "backend" is findable.
+if str(WEB_DIR) not in sys.path:
+    sys.path.insert(0, str(WEB_DIR))
+
+from backend import report_store as _report_store
+from backend import report_generator as _report_generator
+from backend.auth import require_admin as _require_admin
+from backend.auth import require_upload_secret as _require_upload_secret
+
+
+@app.on_event("startup")
+async def _report_portal_startup():
+    """Create /data/transcripts and /data/reports if they don't exist."""
+    _report_store.ensure_dirs()
+    logger.info(f"Report portal ready. Data dir: {_report_store._DEFAULT_DATA_DIR}")
+
+
+async def _run_report_generation(session_id: str, payload: dict):
+    """Background task: generate + persist a report for this session."""
+    try:
+        _report_store.set_status(session_id, _report_store.STATUS_PROCESSING)
+        logger.info(f"[report] Generating for session_id={session_id}")
+        report = await _report_generator.generate_report(session_id, payload)
+        version = _report_store.save_report(session_id, report)
+        logger.info(f"[report] Saved v{version} for session_id={session_id}")
+    except Exception as e:
+        logger.exception(f"[report] Generation failed for session_id={session_id}: {e}")
+        try:
+            _report_store.set_status(
+                session_id, _report_store.STATUS_FAILED, error=str(e)[:500]
+            )
+        except Exception:
+            pass
+
+
+@app.post("/api/sessions/{session_id}/transcript")
+async def upload_transcript(
+    session_id: str,
+    request: Request,
+    background: BackgroundTasks,
+    _: None = Depends(_require_upload_secret),
+):
+    """Agent uploads the finalized transcript at session end.
+
+    Saves to /data/transcripts/{session_id}.json, initializes meta, and
+    kicks off report generation in the background.  Returns immediately
+    so the agent's shutdown path isn't blocked.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Body must be valid JSON")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+    # session_id in URL is authoritative — rewrite into payload for consistency
+    payload["session_id"] = session_id
+
+    try:
+        _report_store.save_transcript(session_id, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    transcript = payload.get("transcript") or {}
+    meta = _report_store.init_meta(
+        session_id,
+        title=payload.get("title"),
+        started_at=payload.get("started_at") or transcript.get("session_start"),
+        ended_at=payload.get("ended_at") or transcript.get("session_end"),
+    )
+    # Ensure we re-generate if this is a second upload for the same session
+    _report_store.set_status(session_id, _report_store.STATUS_PENDING)
+
+    background.add_task(_run_report_generation, session_id, payload)
+    logger.info(f"[report] Transcript accepted for {session_id}; generation queued")
+    return JSONResponse(
+        {"success": True, "session_id": session_id, "status": meta.status},
+        status_code=202,
+    )
+
+
+@app.get("/api/sessions/{session_id}/report/status")
+async def get_report_status(
+    session_id: str,
+    _: str = Depends(_require_admin),
+):
+    """Return the meta JSON for polling.  404 if no such session."""
+    try:
+        meta = _report_store.get_meta(session_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return JSONResponse(meta.to_dict())
+
+
+@app.get("/api/sessions/{session_id}/report")
+async def get_report(
+    session_id: str,
+    version: Optional[int] = None,
+    _: str = Depends(_require_admin),
+):
+    """Return the generated report JSON.  404 if not ready yet."""
+    try:
+        report = _report_store.load_report(session_id, version=version)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if report is None:
+        meta = _report_store.get_meta(session_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        # Meta exists but no report yet
+        raise HTTPException(
+            status_code=404,
+            detail=f"Report not ready (status={meta.status})",
+        )
+    return JSONResponse(report)
+
+
+@app.post("/api/sessions/{session_id}/report/regenerate")
+async def regenerate_report(
+    session_id: str,
+    background: BackgroundTasks,
+    _: str = Depends(_require_admin),
+):
+    """Re-run LLM on the existing transcript and save as the next version."""
+    payload = _report_store.load_transcript(session_id)
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No transcript on file for this session",
+        )
+    _report_store.set_status(session_id, _report_store.STATUS_PENDING)
+    background.add_task(_run_report_generation, session_id, payload)
+    logger.info(f"[report] Regeneration queued for {session_id}")
+    return JSONResponse({"success": True, "session_id": session_id, "status": "pending"})
+
+
+# Admin HTML routes — render Jinja templates for the portal UI
+@app.get("/admin/sessions", response_class=HTMLResponse)
+async def admin_sessions_page(
+    request: Request,
+    _: str = Depends(_require_admin),
+):
+    """List all sessions with report status."""
+    sessions = [m.to_dict() for m in _report_store.list_sessions()]
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_sessions.html",
+        context={"sessions": sessions},
+    )
+
+
+@app.get("/admin/sessions/{session_id}/report", response_class=HTMLResponse)
+async def admin_report_page(
+    request: Request,
+    session_id: str,
+    _: str = Depends(_require_admin),
+):
+    """Render the report detail page (tabbed layout)."""
+    meta = _report_store.get_meta(session_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return templates.TemplateResponse(
+        request=request,
+        name="admin_report.html",
+        context={
+            "session_id": session_id,
+            "meta": meta.to_dict(),
+        },
+    )
+
+# ============================================================
+# End Post-Session Report Portal
+# ============================================================
+
+
 if __name__ == "__main__":
     import argparse
 
