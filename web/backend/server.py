@@ -543,7 +543,7 @@ async def admin_page(request: Request):
                 
                 <button type="submit" class="button"> Start New Focus Group</button>
             </form>
-            
+            <button onclick="cleanupRooms()" style="background: #dc3545; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; display: inline-block; margin: 20px 0; border: none; cursor: pointer;">🧹 Clean Up Old Sessions</button>
             <div class="info">
                 <strong>How it works:</strong><br>
                 1. Click "Start New Focus Group" toreate a LiveKit room<br>
@@ -552,6 +552,24 @@ async def admin_page(request: Request):
             </div>
         </div>
     </body>
+    <script>
+    async function cleanupRooms() {
+         if (!confirm('This will delete all active LiveKit rooms. Continue?')) return;
+    
+         try {
+              const response = await fetch('/cleanup-rooms', { method: 'POST' });
+              const result = await response.json();
+        
+              if (result.success) {
+                  alert(`✅ ${result.message}`);
+              } else {
+                  alert(`❌ ${result.message}`);
+              }
+         } catch (error) {
+             alert('❌ Cleanup failed: ' + error.message);
+         }
+    }
+    </script>
     </html>
     """
     return HTMLResponse(content=html_content)
@@ -658,6 +676,37 @@ async def create_session(request: Request):
         </html>
         """
         return HTMLResponse(content=html_content)
+
+@app.post("/cleanup-rooms")
+async def cleanup_rooms():
+    """Clean up all LiveKit rooms"""
+    try:
+        url, api_key, api_secret = get_livekit_credentials()
+        livekit_api = api.LiveKitAPI(url, api_key, api_secret)
+        
+        # List and delete all rooms
+        rooms = await livekit_api.room.list_rooms(api.ListRoomsRequest())
+        deleted_count = 0
+        
+        for room in rooms.rooms:
+            await livekit_api.room.delete_room(api.DeleteRoomRequest(room=room.name))
+            deleted_count += 1
+        
+        # Clear the in-memory active surveys too
+        active_surveys.clear()
+        
+        return JSONResponse({
+            "success": True,
+            "message": f"Cleaned up {deleted_count} room(s)",
+            "rooms_deleted": deleted_count
+        })
+        
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "message": f"Cleanup failed: {str(e)}"
+        }, status_code=500)
+
 
 @app.get("/join/{session_id}")
 async def join_session_simple(request: Request, session_id: str):
