@@ -1369,6 +1369,19 @@ body {
     background: #DC2626;
 }
 
+/* Diagnostic-logs button (hidden unless ?debug=1) */
+.control-button.debug-download {
+    background: rgba(251, 191, 36, 0.15);
+    color: #fbbf24;
+    border: 1px solid rgba(251, 191, 36, 0.4);
+}
+.control-button.debug-download:hover {
+    background: rgba(251, 191, 36, 0.25);
+}
+.control-button.hidden {
+    display: none !important;
+}
+
 .control-icon {
     width: 24px;
     height: 24px;

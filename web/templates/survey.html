@@ -146,6 +146,12 @@
             </div>
 
             <div class="controls-right">
+                <!-- Diagnostic logs button (hidden unless ?debug=1) -->
+                <button id="btn-download-logs" class="control-button debug-download hidden"
+                        onclick="downloadLogs()" title="Download diagnostic logs (debug mode)">
+                    <div class="control-icon">📥</div>
+                    <span class="control-label">Logs</span>
+                </button>
                 <button class="control-button leave-button" onclick="leaveSurvey()">
                     <div class="control-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -202,7 +208,200 @@
         </div>
     </div>
 
+    <!-- =====================================================================
+         LiveKit client diagnostic logging (MUST load before livekit-client.umd
+         so our navigator.mediaDevices.getUserMedia wrapper is installed BEFORE
+         the SDK captures a direct reference to the native method).
+         Plan: /Users/ganeshkrishnan/.claude/plans/virtual-strolling-lerdorf.md
+         ===================================================================== -->
+    <script>
+        // ── Debug flag: ?debug=1 URL param, persisted to sessionStorage ─────
+        const DEBUG_ENABLED = (() => {
+            const url = new URLSearchParams(location.search);
+            if (url.has('debug')) {
+                const v = url.get('debug');
+                if (v === '0' || v === 'false') {
+                    sessionStorage.removeItem('livekit_debug');
+                    return false;
+                }
+                sessionStorage.setItem('livekit_debug', '1');
+                return true;
+            }
+            return sessionStorage.getItem('livekit_debug') === '1';
+        })();
+
+        // ── Ring buffer: circular, O(1) writes, caps memory ─────────────────
+        const DEBUG_LOG = (() => {
+            const MAX_ENTRIES = 5000;
+            const buf = new Array(MAX_ENTRIES);
+            let head = 0;
+            let count = 0;
+            const navStart = (performance.timeOrigin || (Date.now() - performance.now()));
+            return {
+                push(type, payload) {
+                    const now = Date.now();
+                    buf[head] = {
+                        iso: new Date(now).toISOString(),
+                        epoch_ms: now,
+                        perf_ms: performance.now(),
+                        type,
+                        payload: payload === undefined ? null : payload,
+                    };
+                    head = (head + 1) % MAX_ENTRIES;
+                    if (count < MAX_ENTRIES) count++;
+                },
+                dump() {
+                    if (count < MAX_ENTRIES) return buf.slice(0, count);
+                    return buf.slice(head).concat(buf.slice(0, head));
+                },
+                size() { return count; },
+                navStart() { return navStart; },
+            };
+        })();
+
+        // Privacy: truncate long IDs while keeping correlatability
+        const _trunc = (s, n) => (typeof s === 'string' && s.length > n) ? s.slice(0, n) + '…' : s;
+
+        // ── Debug-only: SDK log level, console mirror, gUM intercept ────────
+        if (DEBUG_ENABLED) {
+            DEBUG_LOG.push('debug.enabled', { via: 'URL or sessionStorage' });
+
+            // Console mirror (wrap BEFORE any other script runs)
+            ['log', 'warn', 'error', 'debug'].forEach(fn => {
+                const orig = console[fn].bind(console);
+                console[fn] = (...args) => {
+                    try {
+                        DEBUG_LOG.push('console.' + fn, args.map(a => {
+                            try { return typeof a === 'string' ? a : JSON.stringify(a); }
+                            catch { return String(a); }
+                        }).join(' '));
+                    } catch {}
+                    orig(...args);
+                };
+            });
+
+            // Monkey-patch navigator.mediaDevices.getUserMedia BEFORE SDK loads
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+                navigator.mediaDevices.getUserMedia = async function(constraints) {
+                    DEBUG_LOG.push('gum.start', constraints);
+                    try {
+                        const stream = await origGUM(constraints);
+                        DEBUG_LOG.push('gum.success', stream.getTracks().map(t => ({
+                            kind: t.kind,
+                            label: t.label ? '(granted)' : '(permission hidden)',
+                            id: _trunc(t.id, 12),
+                        })));
+                        return stream;
+                    } catch (err) {
+                        DEBUG_LOG.push('gum.error', { name: err.name, message: err.message });
+                        throw err;
+                    }
+                };
+            }
+        }
+    </script>
+
     <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+
+    <script>
+        // ── Enable SDK debug logs AFTER the UMD bundle is available ─────────
+        // Done here (not in the pre-SDK block) because the UMD global is
+        // defined only after the previous <script src> executes.
+        if (DEBUG_ENABLED) {
+            const LC = window.LivekitClient || window.Livekit || window.livekitClient;
+            if (LC && typeof LC.setLogLevel === 'function') {
+                LC.setLogLevel('debug');
+                DEBUG_LOG.push('sdk.logLevel', 'debug (via ' + (LC === window.LivekitClient ? 'LivekitClient' : 'fallback') + ')');
+            } else {
+                DEBUG_LOG.push('sdk.logLevel.missing', 'no setLogLevel on UMD global; SDK logs stay at default');
+            }
+        }
+
+        // ── loggedCall: wrap mute/publish operations with timing + stack ────
+        async function loggedCall(label, fn) {
+            DEBUG_LOG.push('call.start', label);
+            if (DEBUG_ENABLED) {
+                const stack = (new Error()).stack || '';
+                DEBUG_LOG.push('call.stack', stack.split('\n').slice(0, 10).join('\n'));
+            }
+            const t0 = performance.now();
+            try {
+                const r = await fn();
+                DEBUG_LOG.push('call.success', `${label} (${Math.round(performance.now() - t0)}ms)`);
+                return r;
+            } catch (err) {
+                DEBUG_LOG.push('call.error', `${label}: ${(err && err.message) || err}`);
+                throw err;
+            }
+        }
+
+        // ── Safe JSON serializer for payload dump (handles circular refs) ───
+        function _safeJSON(value) {
+            try {
+                const seen = new WeakSet();
+                return JSON.stringify(value, (k, v) => {
+                    if (typeof v === 'object' && v !== null) {
+                        if (seen.has(v)) return '[circular]';
+                        seen.add(v);
+                    }
+                    if (typeof v === 'function') return '[function]';
+                    if (typeof v === 'bigint') return v.toString();
+                    return v;
+                });
+            } catch (e) {
+                try { return String(value); } catch { return '[unserializable]'; }
+            }
+        }
+
+        // ── Download logs: emits a plain-text file for support engineers ────
+        function downloadLogs() {
+            const roomSid = (typeof room !== 'undefined' && room && room.sid) || '';
+            const roomName = (typeof room !== 'undefined' && room && room.name) || ROOM_NAME || 'unknown';
+            const user = (typeof room !== 'undefined' && room && room.localParticipant && room.localParticipant.identity) || PARTICIPANT_NAME || 'unknown';
+            const now = new Date();
+            const pad = n => String(n).padStart(2, '0');
+            const ts = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+            const safe = s => String(s).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 48);
+            const filename = `room_${safe(roomSid || roomName)}_user_${safe(user)}_ts_${ts}.txt`;
+
+            const header = [
+                `# LiveKit client diagnostic log`,
+                `# Generated:     ${now.toISOString()}   (epoch_ms=${Date.now()})`,
+                `# Nav start:     ${new Date(DEBUG_LOG.navStart()).toISOString()}   (epoch_ms=${DEBUG_LOG.navStart()})`,
+                `# Clock note:    entries carry ISO, epoch_ms (for cross-log correlation with agent`,
+                `#                logs which log epoch-ms), and perf_ms (monotonic, no skew).`,
+                `# Room name:     ${roomName}`,
+                `# Room SID:      ${roomSid}`,
+                `# Participant:   ${user}`,
+                `# Debug flag:    ${DEBUG_ENABLED}`,
+                `# Buffer size:   ${DEBUG_LOG.size()} entries`,
+                `# User-Agent:    ${navigator.userAgent}`,
+                `# Platform:      ${navigator.platform}`,
+                `# Connection:    ${(navigator.connection && navigator.connection.effectiveType) || 'unknown'}`,
+                `# Language:      ${navigator.language}`,
+                ``,
+                `# Timeline (oldest -> newest): <ISO>  <epoch_ms>  <perf_ms>  <type>  <payload>`,
+            ].join('\n');
+
+            const lines = DEBUG_LOG.dump().map(e => {
+                const payloadStr = (typeof e.payload === 'string')
+                    ? e.payload
+                    : (e.payload == null ? '' : _safeJSON(e.payload));
+                return `${e.iso}  ${String(e.epoch_ms)}  ${e.perf_ms.toFixed(1).padStart(10)}  ${e.type.padEnd(28)}  ${payloadStr}`;
+            });
+
+            const blob = new Blob([header + '\n' + lines.join('\n') + '\n'], { type: 'text/plain' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = filename;
+            a.click();
+            URL.revokeObjectURL(a.href);
+            DEBUG_LOG.push('download', filename);
+        }
+        window.downloadLogs = downloadLogs;  // expose for onclick attr
+    </script>
+
     <script>
         // Get connection info from session storage
         const TOKEN = sessionStorage.getItem('survey_token');
@@ -263,6 +462,12 @@
 
         // Initialize on page load
         document.addEventListener('DOMContentLoaded', function() {
+            // Reveal the debug-logs button when ?debug=1 is set
+            if (DEBUG_ENABLED) {
+                const btn = document.getElementById('btn-download-logs');
+                if (btn) btn.classList.remove('hidden');
+            }
+
             if (PARTICIPANT_NAME) {
                 const displayName = IS_OBSERVER ? PARTICIPANT_NAME + ' (Observer)' : PARTICIPANT_NAME;
                 document.getElementById('participant-name-display').textContent = displayName;
@@ -405,7 +610,8 @@
 
                 // Publish local audio (separate try-catch so mic errors don't show as connection failure)
                 try {
-                    await room.localParticipant.setMicrophoneEnabled(true);
+                    await loggedCall('setMicrophoneEnabled(true) [initial]',
+                        () => room.localParticipant.setMicrophoneEnabled(true));
                     localAudioTrack = room.localParticipant.getTrack(LivekitClient.Track.Source.Microphone);
                     setupAudioVisualization();
                 } catch (micError) {
@@ -418,7 +624,8 @@
                 try {
                     console.log('Initial camera setup, isVideoEnabled =', isVideoEnabled);
                     if (isVideoEnabled) {
-                        await room.localParticipant.setCameraEnabled(true);
+                        await loggedCall('setCameraEnabled(true) [initial]',
+                            () => room.localParticipant.setCameraEnabled(true));
                         // Add a small delay then try to attach video as fallback
                         // (in case LocalTrackPublished event doesn't fire immediately)
                         setTimeout(() => {
@@ -442,13 +649,25 @@
 
         function setupRoomEventHandlers() {
             room.on(LivekitClient.RoomEvent.Connected, () => {
+                DEBUG_LOG.push('event.Connected', { sid: room.sid, name: room.name, localIdentity: room.localParticipant?.identity });
+                // Snapshot device list (labels hidden unless permission granted)
+                if (DEBUG_ENABLED && navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+                    navigator.mediaDevices.enumerateDevices().then(devs => {
+                        DEBUG_LOG.push('devices', devs.map(d => ({
+                            kind: d.kind,
+                            label: d.label ? '(granted)' : '(permission hidden)',
+                            deviceId: (d.deviceId || '').slice(0, 8),
+                        })));
+                    }).catch(e => DEBUG_LOG.push('devices.error', String(e)));
+                }
                 console.log('Connected to room');
                 updateConnectionStatus('connected', 'Connected');
                 // Handle participants who joined before us
                 handleExistingParticipants();
             });
 
-            room.on(LivekitClient.RoomEvent.Disconnected, () => {
+            room.on(LivekitClient.RoomEvent.Disconnected, (reason) => {
+                DEBUG_LOG.push('event.Disconnected', { reason: String(reason || '') });
                 console.log('Disconnected from room');
                 updateConnectionStatus('disconnected', 'Disconnected');
 
@@ -462,6 +681,7 @@
             });
 
             room.on(LivekitClient.RoomEvent.ParticipantConnected, (participant) => {
+                DEBUG_LOG.push('event.ParticipantConnected', { identity: participant.identity, kind: participant.kind });
                 console.log('Participant connected:', participant.identity, 'name:', participant.name, 'kind:', participant.kind);
                 // Create video tile for remote participants (not agents, not ourselves)
                 if (!participant.identity.includes('agent') && participant.kind !== LivekitClient.ParticipantKind.AGENT) {
@@ -470,11 +690,18 @@
             });
 
             room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
+                DEBUG_LOG.push('event.ParticipantDisconnected', { identity: participant.identity });
                 console.log('Participant disconnected:', participant.identity);
                 removeRemoteParticipantTile(participant.identity);
             });
 
             room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+                DEBUG_LOG.push('event.TrackSubscribed', {
+                    identity: participant?.identity,
+                    kind: track.kind,
+                    source: track.source,
+                    trackSid: _trunc(publication?.trackSid || track?.sid || publication?.sid, 12),
+                });
                 if (track.kind === LivekitClient.Track.Kind.Audio) {
                     const trackSid = publication.trackSid || track.sid || publication.sid;
 
@@ -534,6 +761,11 @@
             });
 
             room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+                DEBUG_LOG.push('event.TrackUnsubscribed', {
+                    identity: participant?.identity,
+                    kind: track.kind,
+                    trackSid: _trunc(publication?.trackSid || track?.sid || publication?.sid, 12),
+                });
                 // ── Clean up audio elements on unsubscribe ──
                 if (track.kind === LivekitClient.Track.Kind.Audio) {
                     const trackSid = publication.trackSid || track.sid || publication.sid;
@@ -574,6 +806,8 @@
             });
 
             room.on(LivekitClient.RoomEvent.ActiveSpeakersChanged, (speakers) => {
+                // Only log speaker identities, not the full Participant objects (noisy)
+                DEBUG_LOG.push('event.ActiveSpeakersChanged', speakers.map(s => s.identity));
                 const agentSpeaking = speakers.some(s =>
                     s.identity.includes('agent') || s.kind === LivekitClient.ParticipantKind.AGENT
                 );
@@ -585,6 +819,7 @@
             });
 
             room.on(LivekitClient.RoomEvent.DataReceived, (data, participant) => {
+                DEBUG_LOG.push('event.DataReceived', { from: participant?.identity, bytes: data?.byteLength ?? data?.length ?? 0 });
                 // Handle any data messages from agent
                 try {
                     const message = JSON.parse(new TextDecoder().decode(data));
@@ -596,6 +831,11 @@
 
             // Track when local tracks are published
             room.on(LivekitClient.RoomEvent.LocalTrackPublished, (publication) => {
+                DEBUG_LOG.push('event.LocalTrackPublished', {
+                    source: publication.source,
+                    trackSid: _trunc(publication.trackSid, 12),
+                    muted: publication.isMuted,
+                });
                 console.log('LocalTrackPublished:', publication.source);
 
                 // Handle microphone track for mute sync
@@ -620,6 +860,10 @@
 
             // Track when local video is unpublished
             room.on(LivekitClient.RoomEvent.LocalTrackUnpublished, (publication) => {
+                DEBUG_LOG.push('event.LocalTrackUnpublished', {
+                    source: publication.source,
+                    trackSid: _trunc(publication.trackSid, 12),
+                });
                 if (publication.source === LivekitClient.Track.Source.Camera) {
                     console.log('Camera track unpublished');
                     const localVideo = document.getElementById('local-video');
@@ -629,6 +873,17 @@
             });
 
             room.on(LivekitClient.RoomEvent.TrackMuted, (publication, participant) => {
+                // The LiveKit SDK does NOT expose who initiated the mute
+                // (local user gesture vs. server-side MuteRoomTrackRequest
+                // from the agent's round-robin).  Correlate with the
+                // `call.start mute()` entries nearby AND with agent logs by
+                // epoch_ms + identity to disambiguate.
+                DEBUG_LOG.push('event.TrackMuted', {
+                    identity: participant?.identity,
+                    source: publication?.source,
+                    trackSid: _trunc(publication?.trackSid, 12),
+                    isLocal: participant === room.localParticipant,
+                });
                 // Only handle local participant's mic (not affecting video)
                 if (participant === room.localParticipant &&
                     publication.source === LivekitClient.Track.Source.Microphone) {
@@ -638,6 +893,12 @@
             });
 
             room.on(LivekitClient.RoomEvent.TrackUnmuted, (publication, participant) => {
+                DEBUG_LOG.push('event.TrackUnmuted', {
+                    identity: participant?.identity,
+                    source: publication?.source,
+                    trackSid: _trunc(publication?.trackSid, 12),
+                    isLocal: participant === room.localParticipant,
+                });
                 // Only handle local participant's mic (not affecting video)
                 if (participant === room.localParticipant &&
                     publication.source === LivekitClient.Track.Source.Microphone) {
@@ -649,6 +910,12 @@
             // Safety net: If permissions change (e.g., backend restored mic permission),
             // ensure the mic track gets re-published if it was unpublished
             room.on(LivekitClient.RoomEvent.ParticipantPermissionsChanged, (prevPermissions, participant) => {
+                DEBUG_LOG.push('event.ParticipantPermissionsChanged', {
+                    identity: participant?.identity,
+                    isLocal: participant === room.localParticipant,
+                    prevCanPublish: prevPermissions?.canPublish,
+                    newCanPublish: participant?.permissions?.canPublish,
+                });
                 if (participant === room.localParticipant) {
                     console.log('Permissions changed for local participant:', participant.permissions);
 
@@ -666,6 +933,40 @@
                     }
                 }
             });
+
+            // ── Additional listeners for diagnostic logging ─────────────────
+            // These weren't wired before and are important for debugging
+            // camera/mic disappearing mid-call.
+
+            // Remote track unpublished — fires when a REMOTE participant's
+            // track goes away (agent round-robin mute can cascade to this).
+            if (LivekitClient.RoomEvent.TrackUnpublished) {
+                room.on(LivekitClient.RoomEvent.TrackUnpublished, (publication, participant) => {
+                    DEBUG_LOG.push('event.TrackUnpublished', {
+                        identity: participant?.identity,
+                        source: publication?.source,
+                        trackSid: _trunc(publication?.trackSid, 12),
+                    });
+                });
+            }
+
+            // Connection state changes — captures transient drops that look
+            // like "mic stopped working" to participants.
+            if (LivekitClient.RoomEvent.ConnectionStateChanged) {
+                room.on(LivekitClient.RoomEvent.ConnectionStateChanged, (state) => {
+                    DEBUG_LOG.push('event.ConnectionStateChanged', { state: String(state) });
+                });
+            }
+            if (LivekitClient.RoomEvent.Reconnecting) {
+                room.on(LivekitClient.RoomEvent.Reconnecting, () => {
+                    DEBUG_LOG.push('event.Reconnecting', null);
+                });
+            }
+            if (LivekitClient.RoomEvent.Reconnected) {
+                room.on(LivekitClient.RoomEvent.Reconnected, () => {
+                    DEBUG_LOG.push('event.Reconnected', null);
+                });
+            }
         }
 
         function updateSpeakingIndicators(agentSpeaking, participantSpeaking) {
@@ -906,16 +1207,17 @@
                     // Use track-level mute/unmute (consistent with backend MutePublishedTrack)
                     // This fires TrackMuted/TrackUnmuted events which update the UI via our handlers
                     if (micPub.isMuted) {
-                        await micPub.unmute();
+                        await loggedCall('micPub.unmute()', () => micPub.unmute());
                     } else {
-                        await micPub.mute();
+                        await loggedCall('micPub.mute()', () => micPub.mute());
                     }
                     // NOTE: Do NOT set isMuted or update UI here.
                     // The TrackMuted/TrackUnmuted event handlers will
                     // update isMuted and call updateMuteUI() automatically.
                 } else {
                     // No mic track published yet — enable the microphone (first publish)
-                    await room.localParticipant.setMicrophoneEnabled(true);
+                    await loggedCall('setMicrophoneEnabled(true) [toggleMute fallback]',
+                        () => room.localParticipant.setMicrophoneEnabled(true));
                     console.log('toggleMute: mic track was not published, enabled microphone');
                 }
             } catch (error) {
@@ -965,7 +1267,8 @@
 
             try {
                 // Toggle the camera - the LocalTrackPublished/Unpublished events will handle UI
-                await room.localParticipant.setCameraEnabled(newState);
+                await loggedCall(`setCameraEnabled(${newState}) [toggleVideo]`,
+                    () => room.localParticipant.setCameraEnabled(newState));
                 isVideoEnabled = newState;
                 console.log('toggleVideo: setCameraEnabled succeeded, new state =', isVideoEnabled);
             } catch (error) {
