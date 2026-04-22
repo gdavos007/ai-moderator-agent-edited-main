@@ -135,6 +135,16 @@ def is_uncertain_response(text: str) -> bool:
 
     text_lower = text.lower().strip()
 
+    # ── Collapse disfluent false-start stutter: word followed by 2+ dots ──
+    # Handles hedged uncertain phrases like
+    #   "I....I don't....I will...I think I....I don't know"
+    # where intermediate stutter fragments ("don't....", "will...") would
+    # otherwise survive punctuation stripping as false "substantive" tokens
+    # ("don", "will").  A 2-dot minimum leaves normal sentence punctuation
+    # untouched.
+    text_lower = re.sub(r'\S+\.{2,}\s*', ' ', text_lower)
+    text_lower = re.sub(r'\s+', ' ', text_lower).strip()
+
     # ── Strip meta-commentary phrases before substantive-content check ──
     for meta_phrase in META_COMMENTARY_PHRASES:
         if meta_phrase in text_lower:

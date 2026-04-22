@@ -308,9 +308,16 @@ class TestDisfluentUncertainResponse:
     """Regression: hedged/disfluent uncertain phrases must route to encouragement."""
 
     @pytest.mark.parametrize("text", [
-        "Well umm...I think I....I don't know",   # exact reported bug
-        "umm, I think, I don't know",             # shorter disfluent variant
-        "I think I don't know",                   # hedge + uncertain
+        "Well umm...I think I....I don't know",         # original reported bug
+        "umm, I think, I don't know",                   # shorter disfluent variant
+        "I think I don't know",                         # hedge + uncertain
+        # --- Multi-stutter regression (second reported bug, 2026-04-22) -----
+        # Intermediate "don't...." used to survive as the fragment "don" after
+        # apostrophe stripping and counted as substantive content.  The 2-dot
+        # stutter-strip added to is_uncertain_response() makes this uncertain.
+        "I....I don't....I will...I think I....I don't know",  # exact reported bug
+        "I....I....I don't know",                       # simple multi-stutter
+        "I....um....I don't know",                      # stutter + filler
     ])
     def test_disfluent_uncertain_is_detected(self, text):
         assert is_uncertain_response(text), (
@@ -320,6 +327,11 @@ class TestDisfluentUncertainResponse:
     @pytest.mark.parametrize("text", [
         "I like the product but I'm not sure about pricing",
         "I think it's good, don't know",
+        # --- Substantive-with-stutter must stay substantive ----------------
+        # The 2-dot stutter-strip removes the false-start "I...." but the
+        # remaining opinion words must still register as content.
+        "I....I really like the product",               # stutter + substantive
+        "I....I think the price is too high",           # stutter + opinion
     ])
     def test_substantive_answers_still_accepted(self, text):
         assert not is_uncertain_response(text), (
