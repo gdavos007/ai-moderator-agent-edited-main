@@ -30,7 +30,7 @@ import secrets
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
@@ -52,6 +52,14 @@ FRONTEND_DIR = WEB_DIR / "frontend"
 TEMPLATES_DIR = WEB_DIR / "templates"
 CONFIG_DIR = WEB_DIR / "config"
 SURVEYS_CONFIG_FILE = CONFIG_DIR / "surveys.json"
+
+# Admin auth dependency (used by /admin, /create-session, /cleanup-rooms AND
+# by the report portal routes lower in the file).  Imported up here so the
+# first-layer admin routes can reference it.  Needs web/ on sys.path to find
+# the sibling `backend` package.
+if str(WEB_DIR) not in sys.path:
+    sys.path.insert(0, str(WEB_DIR))
+from backend.auth import require_admin as _require_admin  # noqa: E402
 
 
 def load_surveys_config() -> dict:
@@ -511,8 +519,8 @@ async def quick_start(request: Request):
     return RedirectResponse(url="/join/quick-start", status_code=302)
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page(request: Request):
-    """Simple admin interface to start focus groups"""
+async def admin_page(request: Request, _admin: str = Depends(_require_admin)):
+    """Simple admin interface to start focus groups (admin-gated)."""
     html_content = """
     <!DOCTYPE html>
     <html>
@@ -575,8 +583,8 @@ async def admin_page(request: Request):
     return HTMLResponse(content=html_content)
 
 @app.post("/create-session")
-async def create_session(request: Request):
-    """Create a new focus group session with actual LiveKit room"""
+async def create_session(request: Request, _admin: str = Depends(_require_admin)):
+    """Create a new focus group session with actual LiveKit room (admin-gated)."""
     form = await request.form()
     session_name = form.get("session_name", "Focus Group Session")
     participant_count = int(form.get("participant_count", "3"))
@@ -678,8 +686,8 @@ async def create_session(request: Request):
         return HTMLResponse(content=html_content)
 
 @app.post("/cleanup-rooms")
-async def cleanup_rooms():
-    """Clean up all LiveKit rooms"""
+async def cleanup_rooms(_admin: str = Depends(_require_admin)):
+    """Clean up all LiveKit rooms (admin-gated)."""
     try:
         url, api_key, api_secret = get_livekit_credentials()
         livekit_api = api.LiveKitAPI(url, api_key, api_secret)
