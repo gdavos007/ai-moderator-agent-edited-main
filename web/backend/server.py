@@ -734,6 +734,23 @@ async def join_session_simple(request: Request, session_id: str):
     <html>
     <head>
         <title>Join Focus Group</title>
+        <!-- Capture ?debug=1 here so it survives the /join -> /join-now -> /survey
+             redirect chain via sessionStorage (which the survey page already reads). -->
+        <script>
+        (function() {{
+            try {{
+                const p = new URLSearchParams(location.search);
+                if (p.has('debug')) {{
+                    const v = p.get('debug');
+                    if (v === '0' || v === 'false') {{
+                        sessionStorage.removeItem('livekit_debug');
+                    }} else {{
+                        sessionStorage.setItem('livekit_debug', '1');
+                    }}
+                }}
+            }} catch (e) {{ /* non-fatal */ }}
+        }})();
+        </script>
         <style>
             body {{ font-family: Arial; margin: 40px; background: #f5f5f5; }}
             .container {{ max-width: 500px; margin: 0 auto; background: white; padding: 40px; border-radius: 10px; text-align: center; }}
