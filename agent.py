@@ -434,6 +434,26 @@ async def entrypoint(ctx: agents.JobContext):
 
         # ========== NORMAL MODE: Standard survey flow ==========
 
+        # If the avatar is configured but is still starting up (lazy-start
+        # triggered by participant_connected), wait briefly for it to reach
+        # CONNECTED before delivering the welcome. Otherwise the first
+        # sentence plays before the avatar video is ready, causing the
+        # voice/avatar desync Ganesh observed during the welcome.
+        if os.environ.get("ANAM_AVATAR_ID") and not moderator._audio_only_mode:
+            avatar_wait_deadline = asyncio.get_event_loop().time() + 10.0
+            while asyncio.get_event_loop().time() < avatar_wait_deadline:
+                if moderator._avatar_connected or moderator._audio_only_mode:
+                    break
+                await asyncio.sleep(0.25)
+            if moderator._avatar_connected:
+                logger.info("AVATAR_LIFECYCLE avatar CONNECTED before welcome — proceeding in sync")
+            else:
+                logger.warning(
+                    f"AVATAR_LIFECYCLE avatar not CONNECTED after wait "
+                    f"(state={getattr(moderator, '_avatar_state', '?')}, "
+                    f"audio_only={moderator._audio_only_mode}) — proceeding to welcome anyway"
+                )
+
         # WELCOME SECTION
         # Use welcome from survey config or default
         logger.info("Delivering welcome message...")
