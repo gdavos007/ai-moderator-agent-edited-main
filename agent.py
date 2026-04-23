@@ -149,6 +149,70 @@ async def handle_initial_greeting(session, question_loader, config, participant_
     moderator.survey_data_export.set_greeting(greeting_text)
 
 
+async def _upload_transcript_on_shutdown(moderator) -> None:
+    """POST the final survey transcript to the Post-Session Report Portal.
+
+    Registered via ctx.add_shutdown_callback so it runs AFTER ctx.room.disconnect()
+    — it cannot block avatar cleanup or entrypoint completion. Exceptions are
+    logged and swallowed; failure is never fatal.
+    """
+    upload_url = os.environ.get("REPORT_UPLOAD_URL")
+    upload_secret = os.environ.get("REPORT_UPLOAD_SECRET")
+    if not (upload_url and upload_secret):
+        logger.info("📤 Skipping transcript upload: REPORT_UPLOAD_URL/SECRET not set")
+        return
+    try:
+        import httpx
+        transcript_data = moderator.survey_transcript.transcript
+        session_id = transcript_data.get("session_id") or ""
+        if not session_id:
+            logger.warning("📤 Skipping upload: survey_transcript has no session_id")
+            return
+
+        questions = []
+        try:
+            for q in (moderator.question_loader.questions or []):
+                questions.append({
+                    "id": getattr(q, "id", ""),
+                    "question": getattr(q, "question", ""),
+                    "type": getattr(q, "question_type", ""),
+                    "response_options": getattr(q, "response_options", None) or [],
+                })
+        except Exception as qe:
+            logger.warning(f"[report-upload] Could not serialize questions: {qe}")
+
+        payload = {
+            "session_id": session_id,
+            "title": (getattr(moderator.survey_config, "name", None)
+                      or getattr(moderator.survey_config, "survey_id", "Focus Group")),
+            "room_name": moderator.ctx.room.name if moderator.ctx and moderator.ctx.room else "",
+            "started_at": transcript_data.get("session_start"),
+            "ended_at": transcript_data.get("session_end"),
+            "participants": transcript_data.get("participants", []),
+            "transcript": transcript_data,
+            "questions": questions,
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(
+                f"{upload_url.rstrip('/')}/api/sessions/{session_id}/transcript",
+                json=payload,
+                headers={"X-Upload-Secret": upload_secret},
+            )
+        if 200 <= r.status_code < 300:
+            logger.info(
+                f"📤 Transcript uploaded for session {session_id} "
+                f"(HTTP {r.status_code})"
+            )
+        else:
+            logger.warning(
+                f"📤 Transcript upload returned HTTP {r.status_code}: "
+                f"{r.text[:300]}"
+            )
+    except Exception as e:
+        logger.warning(f"📤 Transcript upload failed (non-fatal): {e}")
+
+
 async def request_handler(job_request: agents.JobRequest):
     """
     Custom request handler to log job details before acceptance.
@@ -266,6 +330,12 @@ async def entrypoint(ctx: agents.JobContext):
 
         # Get moderator reference
         moderator = session._agent
+
+        # Register transcript upload as a shutdown callback. Runs AFTER
+        # ctx.room.disconnect() inside the LiveKit job shutdown sequence, so a
+        # slow or unreachable backend cannot block avatar teardown.
+        ctx.add_shutdown_callback(lambda: _upload_transcript_on_shutdown(moderator))
+        logger.info("📤 Registered transcript upload shutdown callback")
 
         # Get expected participant count and observer mode from room metadata FIRST
         expected_participants = None

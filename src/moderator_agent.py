@@ -3028,73 +3028,10 @@ class CommunityModeratorAgent(Agent):
             except Exception as e:
                 logger.error(f"Failed to generate STT debug report: {e}", exc_info=True)
 
-            # ── Post-Session Report Portal: upload transcript to web backend ──
-            # Best-effort HTTPS POST.  Failure is logged but does NOT block
-            # room shutdown.  Only runs if both env vars are set, so agents
-            # without portal credentials (dev/local) are unaffected.
-            _upload_url = os.getenv("REPORT_UPLOAD_URL")
-            _upload_secret = os.getenv("REPORT_UPLOAD_SECRET")
-            if _upload_url and _upload_secret:
-                try:
-                    import httpx as _httpx
-                    _transcript_data = self.survey_transcript.transcript
-                    _session_id = _transcript_data.get("session_id", "")
-                    if not _session_id:
-                        raise RuntimeError("session_id missing on survey_transcript")
-
-                    # Serialize the discussion guide — use the shape the report
-                    # generator expects ({id, question}).  Fall back gracefully
-                    # if a question doesn't expose all fields.
-                    _questions = []
-                    try:
-                        for _q in (self.question_loader.questions or []):
-                            _questions.append({
-                                "id": getattr(_q, "id", ""),
-                                "question": getattr(_q, "question", ""),
-                                "type": getattr(_q, "question_type", ""),
-                                "response_options": getattr(_q, "response_options", None) or [],
-                            })
-                    except Exception as _qe:
-                        logger.warning(f"[report-upload] Could not serialize questions: {_qe}")
-
-                    _payload = {
-                        "session_id": _session_id,
-                        "title": getattr(self.survey_config, "name", None)
-                            or getattr(self.survey_config, "survey_id", "Focus Group"),
-                        "room_name": self.ctx.room.name if self.ctx and self.ctx.room else "",
-                        "started_at": _transcript_data.get("session_start"),
-                        "ended_at": _transcript_data.get("session_end"),
-                        "participants": _transcript_data.get("participants", []),
-                        "transcript": _transcript_data,
-                        "questions": _questions,
-                    }
-
-                    async with _httpx.AsyncClient(timeout=10.0) as _client:
-                        _r = await _client.post(
-                            f"{_upload_url.rstrip('/')}/api/sessions/{_session_id}/transcript",
-                            json=_payload,
-                            headers={"X-Upload-Secret": _upload_secret},
-                        )
-                        if 200 <= _r.status_code < 300:
-                            logger.info(
-                                f"📤 Transcript uploaded to {_upload_url} for session "
-                                f"{_session_id} (HTTP {_r.status_code})"
-                            )
-                        else:
-                            logger.warning(
-                                f"📤 Transcript upload returned HTTP {_r.status_code}: "
-                                f"{_r.text[:300]}"
-                            )
-                except Exception as _upload_err:
-                    logger.warning(
-                        f"📤 Transcript upload failed (non-fatal): {_upload_err}"
-                    )
-            else:
-                logger.info(
-                    "📤 Skipping transcript upload: REPORT_UPLOAD_URL and/or "
-                    "REPORT_UPLOAD_SECRET not set."
-                )
-            # ──────────────────────────────────────────────────────────────────
+            # Transcript upload to the Post-Session Report Portal is handled by a
+            # LiveKit shutdown callback registered in agent.py — it runs AFTER
+            # room.disconnect() so it cannot block avatar cleanup or entrypoint
+            # completion.
 
             # CRITICAL: End the room entirely to prevent retry jobs from succeeding
             # Just disconnecting is not enough - LiveKit will keep retrying other dispatches
