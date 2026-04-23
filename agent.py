@@ -435,23 +435,38 @@ async def entrypoint(ctx: agents.JobContext):
         # ========== NORMAL MODE: Standard survey flow ==========
 
         # If the avatar is configured but is still starting up (lazy-start
-        # triggered by participant_connected), wait briefly for it to reach
-        # CONNECTED before delivering the welcome. Otherwise the first
-        # sentence plays before the avatar video is ready, causing the
-        # voice/avatar desync Ganesh observed during the welcome.
+        # triggered by participant_connected), wait for it to reach CONNECTED
+        # and then allow its video pipeline a short warm-up before delivering
+        # the welcome. Otherwise the first sentence plays before Anam's
+        # lip-sync pipeline has primed, causing the voice/avatar desync.
         if os.environ.get("ANAM_AVATAR_ID") and not moderator._audio_only_mode:
-            avatar_wait_deadline = asyncio.get_event_loop().time() + 10.0
-            while asyncio.get_event_loop().time() < avatar_wait_deadline:
+            AVATAR_WAIT_TIMEOUT = 30.0  # Anam cold-start can exceed 10s on slow links
+            AVATAR_WARMUP_GRACE = 2.0   # let video pipeline stabilize post-CONNECT
+
+            was_already_connected = moderator._avatar_connected
+            wait_start = asyncio.get_event_loop().time()
+            deadline = wait_start + AVATAR_WAIT_TIMEOUT
+            while asyncio.get_event_loop().time() < deadline:
                 if moderator._avatar_connected or moderator._audio_only_mode:
                     break
                 await asyncio.sleep(0.25)
-            if moderator._avatar_connected:
-                logger.info("AVATAR_LIFECYCLE avatar CONNECTED before welcome — proceeding in sync")
+            waited_for = asyncio.get_event_loop().time() - wait_start
+
+            if moderator._avatar_connected and not was_already_connected:
+                logger.info(
+                    f"AVATAR_LIFECYCLE avatar CONNECTED after {waited_for:.1f}s — "
+                    f"applying {AVATAR_WARMUP_GRACE}s warm-up grace before welcome TTS"
+                )
+                await asyncio.sleep(AVATAR_WARMUP_GRACE)
+            elif moderator._avatar_connected:
+                logger.info("AVATAR_LIFECYCLE avatar was already CONNECTED before welcome — proceeding in sync")
+            elif moderator._audio_only_mode:
+                logger.info("AVATAR_LIFECYCLE downgraded to audio-only during wait — proceeding")
             else:
                 logger.warning(
-                    f"AVATAR_LIFECYCLE avatar not CONNECTED after wait "
-                    f"(state={getattr(moderator, '_avatar_state', '?')}, "
-                    f"audio_only={moderator._audio_only_mode}) — proceeding to welcome anyway"
+                    f"AVATAR_LIFECYCLE avatar not CONNECTED after {waited_for:.1f}s wait "
+                    f"(state={getattr(moderator, '_avatar_state', '?')}) — proceeding anyway, "
+                    f"welcome may desync"
                 )
 
         # WELCOME SECTION
