@@ -30,7 +30,7 @@ _DEFAULT_MODEL = os.environ.get("REPORT_MODEL", "gpt-4o-2024-08-06")
 # "gpt-4o" alias also works at the time of writing, but pinning to a dated
 # version keeps reports reproducible.
 
-MIN_RESPONSES_FOR_FULL_REPORT = 3
+MIN_RESPONSES_FOR_FULL_REPORT = 1
 
 
 # --------------------------------------------------------------------------- #

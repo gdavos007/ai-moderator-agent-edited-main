@@ -26,10 +26,15 @@ JSON schema. You will not output any prose outside the JSON.
    finding would only be supported by moderator text, drop that finding.
 6. **`overall_sentiment`** is exactly one of: `positive`, `neutral`, `mixed`,
    `negative`.
-7. **Graceful degradation.** If the transcript has fewer than 3 participant
-   responses, return a minimal report: `synopsis.summary` explains the
-   session ended before substantive discussion, `key_findings = []`,
-   `question_analysis` may still list questions asked (with empty quotes).
+7. **Work with what you have.** Small sessions (1–2 participants, a handful
+   of responses) still produce a real report: extract whatever findings,
+   quotes, themes and takeaways the transcript actually supports, even if
+   that's only one or two of each. Never return an empty `key_findings`
+   or zero `top_takeaways` when the transcript has substantive participant
+   speech. If sample size is limited, say so in `synopsis.summary`
+   ("Based on a solo participant…" / "With two participants…") but still
+   do the extraction — don't bail out. Only emit a truly empty report if
+   the transcript has zero participant responses.
 
 ## Tone
 
