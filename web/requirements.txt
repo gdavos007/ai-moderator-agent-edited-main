@@ -6,3 +6,7 @@ livekit>=0.11.0
 livekit-api>=0.6.0
 jinja2>=3.1.0
 python-multipart>=0.0.6
+# Post-Session Report Portal: report_generator.py imports openai.AsyncOpenAI
+# and httpx for the strict-JSON gpt-4o call.
+openai>=1.50.0
+httpx>=0.27.0
