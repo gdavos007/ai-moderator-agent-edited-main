@@ -4147,6 +4147,14 @@ async def create_moderator_session(
         # Initialize audio activity tracking
         moderator.participant_audio_activity[participant.identity] = None
 
+        # Lazy-start the avatar on first human arrival so we don't burn the
+        # Anam ~30s connection window waiting for participants to join.
+        _start_avatar_once_fn = getattr(moderator, "_start_avatar_once", None)
+        if (_start_avatar_once_fn is not None
+                and not getattr(moderator, "_avatar_start_attempted", False)
+                and not moderator._audio_only_mode):
+            asyncio.create_task(_start_avatar_once_fn(f"first_human:{participant.identity}"))
+
     @ctx.room.on("track_published")
     def on_track_published(publication, participant):
         """Subscribe to audio tracks from human participants only.
@@ -4228,14 +4236,19 @@ async def create_moderator_session(
     moderator.agent_session = session
     logger.info("AVATAR_LIFECYCLE session.start() completed — session is ready")
 
-    # ── Step 2: Start Anam avatar AFTER session is ready ─────────────────
+    # ── Step 2: Lazy-start Anam avatar on first human participant ─────────
+    # Anam sessions time out ~30s after connecting if no human is in the room,
+    # so starting the avatar at session.start wastes that window while we wait
+    # for participants. Instead, start only when the first human joins (or
+    # immediately if a human is already present at session.start time).
     anam_avatar_id = os.environ.get("ANAM_AVATAR_ID")
+    moderator._avatar_start_attempted = False
 
-    if moderator._audio_only_mode:
-        logger.info("AVATAR_LIFECYCLE AUDIO_ONLY_MODE enabled — skipping avatar entirely")
-        moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="audio_only_mode")
-    elif ANAM_AVAILABLE and anam_avatar_id:
-        logger.info(f"AVATAR_LIFECYCLE starting avatar_id={anam_avatar_id} (session already started)")
+    async def _start_avatar_once(trigger: str):
+        if moderator._avatar_start_attempted:
+            return
+        moderator._avatar_start_attempted = True
+        logger.info(f"AVATAR_LIFECYCLE starting avatar_id={anam_avatar_id} (trigger={trigger})")
         moderator._set_avatar_state(AVATAR_STATE_STARTING)
         try:
             avatar = anam.AvatarSession(
@@ -4253,7 +4266,6 @@ async def create_moderator_session(
             moderator._set_avatar_state(AVATAR_STATE_FAILED, reason=str(e))
             moderator._avatar_enabled = False
             moderator._avatar_connected = False
-            # Downgrade to audio-only mode on startup failure
             moderator._audio_only_mode = True
             logger.warning(
                 "Anam avatar failed to start — downgrading to audio-only mode: %s",
@@ -4264,6 +4276,31 @@ async def create_moderator_session(
                 "Check that ANAM_AVATAR_ID exists in your Anam Lab account and matches the API key. "
                 "See https://lab.anam.ai/avatars or the Anam avatar gallery for valid IDs."
             )
+
+    # Expose on the moderator so the participant_connected handler (declared
+    # earlier) can invoke it via late binding when the first human joins.
+    moderator._start_avatar_once = _start_avatar_once
+
+    def _has_human_participant_now() -> bool:
+        from livekit.rtc import ParticipantKind
+        for p in ctx.room.remote_participants.values():
+            if getattr(p, "kind", None) == ParticipantKind.PARTICIPANT_KIND_AGENT:
+                continue
+            if p.identity.startswith("agent") or moderator._is_avatar_identity(p.identity):
+                continue
+            return True
+        return False
+
+    if moderator._audio_only_mode:
+        logger.info("AVATAR_LIFECYCLE AUDIO_ONLY_MODE enabled — skipping avatar entirely")
+        moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="audio_only_mode")
+    elif ANAM_AVAILABLE and anam_avatar_id:
+        if _has_human_participant_now():
+            logger.info("AVATAR_LIFECYCLE human already in room — starting avatar immediately")
+            await _start_avatar_once("human_already_present")
+        else:
+            logger.info("AVATAR_LIFECYCLE no humans yet — deferring avatar start until first human joins")
+            moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="waiting_for_human")
     else:
         if not ANAM_AVAILABLE:
             logger.info("AVATAR_LIFECYCLE plugin not installed — running without avatar")
