@@ -63,27 +63,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-async def _prime_anam_lip_sync(session) -> None:
-    """Feed Anam a short primer utterance so its phoneme-matching pipeline
-    warms up before the real welcome plays. wait_remote_track already
-    guarantees A/V START together; this handles the separate cold-start
-    where Anam's first ~2s of generated video don't track phonemes
-    because its internal pipeline needs real audio to stabilize.
-
-    Skipped when the avatar isn't running (audio-only path / no
-    ANAM_AVATAR_ID), so non-avatar setups aren't affected.
-    """
-    if not os.environ.get("ANAM_AVATAR_ID"):
-        return
-    logger.info("🎬 Priming Anam lip-sync pipeline with warm-up utterance")
-    try:
-        await session.say("Welcome.", allow_interruptions=False)
-        await asyncio.sleep(1.0)  # let the pipeline settle before the real welcome
-        logger.info("🎬 Anam primer complete — real welcome will be in sync")
-    except Exception as e:
-        logger.warning(f"🎬 Anam primer failed (non-fatal): {e}")
-
-
 async def handle_welcome_section(session, question_loader, config):
     """
     Handle the welcome section from survey config or use defaults.
@@ -96,10 +75,6 @@ async def handle_welcome_section(session, question_loader, config):
     Returns:
         wait_seconds: Number of seconds to wait for audio setup
     """
-    # Prime Anam's lip-sync before the real welcome so the first sentence
-    # doesn't play against cold-start phoneme frames.
-    await _prime_anam_lip_sync(session)
-
     if question_loader.use_unified_format and question_loader.welcome_section and question_loader.welcome_section.enabled:
         # Use welcome section from survey config
         welcome = question_loader.welcome_section
@@ -466,8 +441,7 @@ async def entrypoint(ctx: agents.JobContext):
         # lip-sync pipeline has primed, causing the voice/avatar desync.
         if os.environ.get("ANAM_AVATAR_ID") and not moderator._audio_only_mode:
             AVATAR_WAIT_TIMEOUT = 30.0  # Anam cold-start can exceed 10s on slow links
-            AVATAR_WARMUP_GRACE = 0.5   # brief settle after CONNECT — real warm-up
-                                        # is done by the primer utterance below
+            AVATAR_WARMUP_GRACE = 2.0   # let video pipeline stabilize post-CONNECT
 
             was_already_connected = moderator._avatar_connected
             wait_start = asyncio.get_event_loop().time()
