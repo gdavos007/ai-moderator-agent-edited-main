@@ -100,6 +100,12 @@ class AgentConfig:
     default_room_name: str = "community-discussion"
     max_participants: int = 50
 
+    # VAD (Silero) configuration — overridable via env for tuning soft-spoken participants
+    vad_activation_threshold: float = 0.5
+    vad_min_speech_duration: float = 0.15
+    vad_prefix_padding_duration: float = 0.6
+    vad_min_silence_duration: float = 0.55
+
     @staticmethod
     def _extract_agent_name_from_voice(tts_voice: str, tts_provider: str) -> str:
         """
@@ -169,6 +175,11 @@ class AgentConfig:
             discussion_topic=os.getenv("DISCUSSION_TOPIC", "Global warming"),
             off_topic_interrupt_threshold=int(os.getenv("OFF_TOPIC_INTERRUPT_THRESHOLD", "15")),
             enable_topic_enforcement=os.getenv("ENABLE_TOPIC_ENFORCEMENT", "true").lower() == "true",
+            # VAD tuning (Silero)
+            vad_activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.5")),
+            vad_min_speech_duration=float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.15")),
+            vad_prefix_padding_duration=float(os.getenv("VAD_PREFIX_PADDING_DURATION", "0.6")),
+            vad_min_silence_duration=float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.55")),
         )
 
     def validate(self) -> bool:

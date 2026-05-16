@@ -3,6 +3,7 @@
 Defines the explicit phases a turn can be in and validates transitions
 between them. Pure domain logic — no I/O, no SDK imports.
 """
+import inspect
 import logging
 from enum import Enum
 from typing import Callable, Optional, Set, FrozenSet
@@ -109,16 +110,18 @@ class TurnPhaseMachine:
         Returns False if the transition is invalid (phase unchanged).
         """
         allowed = _ALLOWED_TRANSITIONS.get(self._phase, frozenset())
+        caller = _caller_name()
         if target in allowed:
             old = self._phase
             self._phase = target
             self._transition_count += 1
-            logger.debug(f"Turn phase: {old.value} -> {target.value}")
+            logger.info("PHASE %s → %s | caller=%s", old.value, target.value, caller)
             return True
         else:
             logger.error(
                 f"Invalid turn phase transition: {self._phase.value} -> {target.value} "
-                f"(allowed: {', '.join(p.value for p in sorted(allowed, key=lambda p: p.value))})"
+                f"(allowed: {', '.join(p.value for p in sorted(allowed, key=lambda p: p.value))}) "
+                f"| caller={caller}"
             )
             if self._on_invalid:
                 self._on_invalid(self._phase, target)
@@ -133,4 +136,16 @@ class TurnPhaseMachine:
         self._phase = target
         self._transition_count += 1
         if old != target:
-            logger.warning(f"Turn phase FORCED: {old.value} -> {target.value}")
+            logger.warning(
+                "Turn phase FORCED: %s -> %s | caller=%s",
+                old.value, target.value, _caller_name(),
+            )
+
+
+def _caller_name() -> str:
+    """Best-effort: return caller's function name (skip our own frame)."""
+    try:
+        frame = inspect.stack()[2]
+        return f"{frame.function}:{frame.lineno}"
+    except Exception:
+        return "?"

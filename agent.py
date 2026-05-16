@@ -321,6 +321,10 @@ async def entrypoint(ctx: agents.JobContext):
             discussion_topic=config.discussion_topic,
             off_topic_interrupt_threshold=config.off_topic_interrupt_threshold,
             enable_topic_enforcement=False,  # Disabled for survey mode - only time limits matter
+            vad_activation_threshold=config.vad_activation_threshold,
+            vad_min_speech_duration=config.vad_min_speech_duration,
+            vad_prefix_padding_duration=config.vad_prefix_padding_duration,
+            vad_min_silence_duration=config.vad_min_silence_duration,
             question_loader=question_loader,
             participant_manager=participant_manager,
             survey_config=survey_config,

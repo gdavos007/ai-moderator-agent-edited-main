@@ -208,6 +208,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None  # Track when last transcript was received
         self.last_stt_fragment = ""  # Track the last individual STT fragment (for cumulative detection)
         self._turn_accumulated_text = ""  # Accumulates completed STT utterances within a turn
+        self._turn_epoch: int = 0  # Bumped on every full turn reset; used to detect stale-fragment analysis
         # Phase 1 additions: Event-based response capture
         self.captured_response: Optional[str] = None  # Final committed response text
         self._response_ready: asyncio.Event = asyncio.Event()  # Signaled when user_speech_committed fires
@@ -529,6 +530,45 @@ class CommunityModeratorAgent(Agent):
 
         return result
 
+    def _richest_response_for_analysis(self, captured_text: str) -> str:
+        """Pick the richest in-turn response text at analysis time.
+
+        Fix A for the 2026-05-12 Christopher demo: the disfluency-extension
+        loop can exit with `captured_text` bound to an early fragment
+        ("Well, I I I think") while STT keeps appending richer text into
+        `self.latest_user_response` ("...advertising, marketing, public
+        affairs campaign...").  Picking the longer candidate avoids
+        analyzing stale text.
+
+        Strategy: choose the longest of {captured_text, latest_user_response,
+        _turn_accumulated_text + " " + last_stt_fragment} that exists.
+        Tie → keep captured_text (caller's chosen value).
+        Logs which source won so we can verify in production.
+        """
+        captured = (captured_text or "").strip()
+        latest = (self.latest_user_response or "").strip()
+        acc = (self._turn_accumulated_text or "").strip()
+        last = (self.last_stt_fragment or "").strip()
+        joined = (acc + " " + last).strip() if acc and last and last not in acc else (acc or last)
+
+        candidates = [("captured", captured), ("latest", latest), ("joined_acc", joined)]
+        # Filter empties; pick longest; stable tiebreak prefers captured
+        non_empty = [(label, txt) for label, txt in candidates if txt]
+        if not non_empty:
+            return captured
+
+        chosen_label, chosen_text = max(
+            non_empty,
+            key=lambda lt: (len(lt[1]), 0 if lt[0] == "captured" else -1),
+        )
+
+        if chosen_label != "captured" and len(chosen_text) > len(captured):
+            logger.info(
+                "🩹 FIX_A picked richer response: source=%s len=%d (was captured len=%d) epoch=%s",
+                chosen_label, len(chosen_text), len(captured), self._turn_epoch,
+            )
+        return chosen_text
+
     async def _analyze_with_filler(self, question_text: str, response_text: str, survey_desc: str, filler_threshold: float = 2.0):
         """Run LLM analysis with a transition filler if it takes too long.
 
@@ -538,6 +578,23 @@ class CommunityModeratorAgent(Agent):
         Returns the analysis result and the wall-clock duration in seconds.
         """
         self._analysis_start_time = datetime.now()
+        # ── Observability: log the exact text being analyzed vs. live buffers ──
+        # If response_text diverges from latest_user_response / _turn_accumulated_text
+        # at this moment, we have proof of the stale-fragment bug (Failure A).
+        _pid = getattr(self, "actual_respondent", None) or getattr(self, "_current_stt_participant", None) or "?"
+        _qid = getattr(self.current_question_object, "id", "?") if getattr(self, "current_question_object", None) else "?"
+        _epoch = self._turn_epoch
+        _acc = getattr(self, "_turn_accumulated_text", "") or ""
+        _latest = getattr(self, "latest_user_response", "") or ""
+        _last_frag = getattr(self, "last_stt_fragment", "") or ""
+        logger.info(
+            "🧪 ANALYZE [%s|Q#%s|T%s] text(%d)=%r | latest_buf(%d)=%r | acc(%d)=%r | last_frag(%d)=%r",
+            _pid, _qid, _epoch,
+            len(response_text or ""), (response_text or "")[-160:],
+            len(_latest), _latest[-160:],
+            len(_acc), _acc[-160:],
+            len(_last_frag), _last_frag,
+        )
         analysis_task = asyncio.create_task(analyze_response(question_text, response_text, survey_desc))
 
         try:
@@ -602,6 +659,7 @@ class CommunityModeratorAgent(Agent):
         self._user_stopped_speaking_at = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
 
         # Flow control
         self._gentle_warning_in_progress = False
@@ -1107,6 +1165,7 @@ class CommunityModeratorAgent(Agent):
             self.response_captured = False
             self.last_stt_fragment = ""
             self._turn_accumulated_text = ""
+            self._turn_epoch += 1
             self.pending_stt_transcript = None
             self.response_fragments = []
             self.last_fragment_time = None
@@ -1121,7 +1180,13 @@ class CommunityModeratorAgent(Agent):
                 self._first_vad_speaking_time = None
             return "retry"
 
-        response_to_analyze = captured_text
+        # ── FIX A: prefer the richest in-turn response over a stale captured_text ──
+        # The disfluency-extension loop above can break with `captured_text` bound
+        # to an early fragment ("Well, I I I think") while STT keeps appending
+        # richer text ("...advertising, marketing, public affairs campaign..."),
+        # which lands in `self.latest_user_response` via on_user_input_transcribed.
+        # Re-read the buffer at analysis time so we never analyze stale text.
+        response_to_analyze = self._richest_response_for_analysis(captured_text)
 
         # ── CHECK 3: Unified LLM analysis ──
         question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
@@ -1577,6 +1642,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
@@ -1765,6 +1831,7 @@ class CommunityModeratorAgent(Agent):
         self.response_captured = False
         self.last_stt_fragment = ""
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
         self.pending_stt_transcript = None
         self.response_fragments = []
         self.last_fragment_time = None
@@ -1826,6 +1893,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""  # Fixed: was missing — could carry forward off-topic text
+        self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
@@ -3817,6 +3885,10 @@ async def create_moderator_session(
     discussion_topic: str = "the current topic",
     off_topic_interrupt_threshold: int = 15,
     enable_topic_enforcement: bool = True,
+    vad_activation_threshold: float = 0.5,
+    vad_min_speech_duration: float = 0.15,
+    vad_prefix_padding_duration: float = 0.6,
+    vad_min_silence_duration: float = 0.55,
     question_loader: Optional[QuestionLoader] = None,
     participant_manager: Optional[ParticipantManager] = None,
     survey_config: Optional[SurveyConfig] = None,
@@ -4092,14 +4164,16 @@ async def create_moderator_session(
     #   Previous 0.4s was too aggressive during agent TTS — brief pauses
     #   between words fired end-of-speech prematurely.
     vad_instance = silero.VAD.load(
-        min_silence_duration=0.55,
-        min_speech_duration=0.15,
-        prefix_padding_duration=0.6,
-        activation_threshold=0.5,
+        min_silence_duration=vad_min_silence_duration,
+        min_speech_duration=vad_min_speech_duration,
+        prefix_padding_duration=vad_prefix_padding_duration,
+        activation_threshold=vad_activation_threshold,
     )
     logger.info(
-        "VAD configured: min_silence=0.55s, min_speech=0.15s, "
-        "prefix_pad=0.6s, activation=0.5 (echo-barge-in hardened)"
+        "VAD configured: min_silence=%.2fs, min_speech=%.2fs, "
+        "prefix_pad=%.2fs, activation=%.2f (env-tunable via VAD_* vars)",
+        vad_min_silence_duration, vad_min_speech_duration,
+        vad_prefix_padding_duration, vad_activation_threshold,
     )
 
     session = AgentSession(
@@ -4170,13 +4244,28 @@ async def create_moderator_session(
             logger.info(f"track_published skipped for agent identity: {participant.identity}")
             return
 
-        logger.critical(f"🔥 TRACK_PUBLISHED EVENT: {participant.identity}, kind={publication.kind}, sid={publication.sid}")
+        logger.info(
+            "🎧 TRACK published | identity=%s sid=%s track_sid=%s kind=%s source=%s muted=%s subscribed=%s",
+            participant.identity, getattr(participant, "sid", None), publication.sid,
+            publication.kind, getattr(publication, "source", None),
+            getattr(publication, "muted", None), getattr(publication, "subscribed", None),
+        )
         if publication.kind == TrackKind.KIND_AUDIO:
             logger.critical(f"🎤 Audio track published by {participant.identity}, subscribing...")
             publication.set_subscribed(True)
             logger.critical(f"✅ Subscribed to {participant.identity}'s audio track")
         else:
             logger.info(f"  Non-audio track published: kind={publication.kind}")
+
+    @ctx.room.on("track_subscribed")
+    def on_track_subscribed(track, publication, participant):
+        """Confirm subscription happened — feeds STT pipeline."""
+        logger.info(
+            "🎧 TRACK subscribed | identity=%s sid=%s track_sid=%s kind=%s source=%s muted=%s",
+            participant.identity, getattr(participant, "sid", None), publication.sid,
+            publication.kind, getattr(publication, "source", None),
+            getattr(publication, "muted", None),
+        )
 
     @ctx.room.on("track_unmuted")
     def on_track_unmuted(publication, participant):
@@ -4195,6 +4284,10 @@ async def create_moderator_session(
             return  # Avatar unmute is irrelevant to survey logic
 
         if publication.kind == TrackKind.KIND_AUDIO:
+            logger.info(
+                "🎧 TRACK unmuted | identity=%s track_sid=%s source=%s",
+                identity, publication.sid, getattr(publication, "source", None),
+            )
             logger.critical(f"🎙️  AUDIO ACTIVE: {identity} unmuted (track: {publication.sid})")
             moderator.participant_audio_activity[identity] = datetime.now()
             moderator.actual_respondent = identity
@@ -4223,11 +4316,18 @@ async def create_moderator_session(
     # The session must be fully started before the avatar can bind to it.
     # Previous ordering (avatar first) caused the avatar to start against an
     # un-started session, leading to playback sync errors and mid-session crashes.
+    # Noise cancellation: NC (multi-speaker) — NOT BVC.
+    # BVC is single-speaker tuned ("Optimized for single-speaker scenarios where
+    # cross-talk from nearby people could confuse transcriptions"). In a focus-group
+    # room, BVC attenuates quieter/non-dominant participants as "background voices",
+    # which is what caused Christopher's audio to reach STT degraded on 2026-05-12.
+    # NC removes traffic/fans/music without isolating one speaker — safe for groups.
+    logger.info("🔊 Noise cancellation: NC (multi-speaker / focus-group safe)")
     await session.start(
         room=ctx.room,
         agent=moderator,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVC(),
+            noise_cancellation=noise_cancellation.NC(),
             close_on_disconnect=False,  # Don't close session if participant goes "away"
         ),
     )
@@ -4812,6 +4912,14 @@ async def create_moderator_session(
         if not new_fragment:
             return
 
+        # ── Observability: snapshot buffer BEFORE mutation ─────────────
+        _is_final = getattr(event, 'is_final', True)
+        _pid = moderator.actual_respondent or moderator._current_stt_participant or "?"
+        _qid = getattr(moderator.current_question_object, "id", "?") if moderator.current_question_object else "?"
+        _epoch = moderator._turn_epoch
+        _buf_before = moderator.latest_user_response or ""
+        _acc_before = moderator._turn_accumulated_text or ""
+
         # Detect utterance boundary: when fragment length drops significantly,
         # STT has started a new utterance rather than extending the previous one.
         # Accumulate the previous utterance so multi-utterance answers aren't lost.
@@ -4832,6 +4940,19 @@ async def create_moderator_session(
         moderator.pending_stt_transcript = transcript
         moderator.last_stt_fragment = new_fragment
         moderator.last_fragment_time = datetime.now()
+
+        # ── Observability: snapshot buffer AFTER mutation ──────────────
+        _buf_after = moderator.latest_user_response or ""
+        _acc_after = moderator._turn_accumulated_text or ""
+        logger.info(
+            "🗣️ STT[%s|Q#%s|T%s] is_final=%s frag(%d)=%r | "
+            "acc_before(%d)=%r | buf_after(%d)=%r | acc_after(%d)=%r",
+            _pid, _qid, _epoch, _is_final,
+            len(new_fragment), new_fragment,
+            len(_acc_before), _acc_before[-80:],
+            len(_buf_after), _buf_after[-80:],
+            len(_acc_after), _acc_after[-80:],
+        )
         if moderator._first_fragment_time is None:
             moderator._first_fragment_time = datetime.now()
 
