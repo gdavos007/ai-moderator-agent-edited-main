@@ -208,6 +208,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None  # Track when last transcript was received
         self.last_stt_fragment = ""  # Track the last individual STT fragment (for cumulative detection)
         self._turn_accumulated_text = ""  # Accumulates completed STT utterances within a turn
+        self._turn_epoch: int = 0  # Bumped on every full turn reset; used to detect stale-fragment analysis
         # Phase 1 additions: Event-based response capture
         self.captured_response: Optional[str] = None  # Final committed response text
         self._response_ready: asyncio.Event = asyncio.Event()  # Signaled when user_speech_committed fires
@@ -529,6 +530,45 @@ class CommunityModeratorAgent(Agent):
 
         return result
 
+    def _richest_response_for_analysis(self, captured_text: str) -> str:
+        """Pick the richest in-turn response text at analysis time.
+
+        Fix A for the 2026-05-12 Christopher demo: the disfluency-extension
+        loop can exit with `captured_text` bound to an early fragment
+        ("Well, I I I think") while STT keeps appending richer text into
+        `self.latest_user_response` ("...advertising, marketing, public
+        affairs campaign...").  Picking the longer candidate avoids
+        analyzing stale text.
+
+        Strategy: choose the longest of {captured_text, latest_user_response,
+        _turn_accumulated_text + " " + last_stt_fragment} that exists.
+        Tie → keep captured_text (caller's chosen value).
+        Logs which source won so we can verify in production.
+        """
+        captured = (captured_text or "").strip()
+        latest = (self.latest_user_response or "").strip()
+        acc = (self._turn_accumulated_text or "").strip()
+        last = (self.last_stt_fragment or "").strip()
+        joined = (acc + " " + last).strip() if acc and last and last not in acc else (acc or last)
+
+        candidates = [("captured", captured), ("latest", latest), ("joined_acc", joined)]
+        # Filter empties; pick longest; stable tiebreak prefers captured
+        non_empty = [(label, txt) for label, txt in candidates if txt]
+        if not non_empty:
+            return captured
+
+        chosen_label, chosen_text = max(
+            non_empty,
+            key=lambda lt: (len(lt[1]), 0 if lt[0] == "captured" else -1),
+        )
+
+        if chosen_label != "captured" and len(chosen_text) > len(captured):
+            logger.info(
+                "🩹 FIX_A picked richer response: source=%s len=%d (was captured len=%d) epoch=%s",
+                chosen_label, len(chosen_text), len(captured), self._turn_epoch,
+            )
+        return chosen_text
+
     async def _analyze_with_filler(self, question_text: str, response_text: str, survey_desc: str, filler_threshold: float = 2.0):
         """Run LLM analysis with a transition filler if it takes too long.
 
@@ -543,7 +583,7 @@ class CommunityModeratorAgent(Agent):
         # at this moment, we have proof of the stale-fragment bug (Failure A).
         _pid = getattr(self, "actual_respondent", None) or getattr(self, "_current_stt_participant", None) or "?"
         _qid = getattr(self.current_question_object, "id", "?") if getattr(self, "current_question_object", None) else "?"
-        _epoch = getattr(self, "_turn_epoch", "?")
+        _epoch = self._turn_epoch
         _acc = getattr(self, "_turn_accumulated_text", "") or ""
         _latest = getattr(self, "latest_user_response", "") or ""
         _last_frag = getattr(self, "last_stt_fragment", "") or ""
@@ -619,6 +659,7 @@ class CommunityModeratorAgent(Agent):
         self._user_stopped_speaking_at = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
 
         # Flow control
         self._gentle_warning_in_progress = False
@@ -1124,6 +1165,7 @@ class CommunityModeratorAgent(Agent):
             self.response_captured = False
             self.last_stt_fragment = ""
             self._turn_accumulated_text = ""
+            self._turn_epoch += 1
             self.pending_stt_transcript = None
             self.response_fragments = []
             self.last_fragment_time = None
@@ -1138,7 +1180,13 @@ class CommunityModeratorAgent(Agent):
                 self._first_vad_speaking_time = None
             return "retry"
 
-        response_to_analyze = captured_text
+        # ── FIX A: prefer the richest in-turn response over a stale captured_text ──
+        # The disfluency-extension loop above can break with `captured_text` bound
+        # to an early fragment ("Well, I I I think") while STT keeps appending
+        # richer text ("...advertising, marketing, public affairs campaign..."),
+        # which lands in `self.latest_user_response` via on_user_input_transcribed.
+        # Re-read the buffer at analysis time so we never analyze stale text.
+        response_to_analyze = self._richest_response_for_analysis(captured_text)
 
         # ── CHECK 3: Unified LLM analysis ──
         question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
@@ -1594,6 +1642,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
@@ -1782,6 +1831,7 @@ class CommunityModeratorAgent(Agent):
         self.response_captured = False
         self.last_stt_fragment = ""
         self._turn_accumulated_text = ""
+        self._turn_epoch += 1
         self.pending_stt_transcript = None
         self.response_fragments = []
         self.last_fragment_time = None
@@ -1843,6 +1893,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""  # Fixed: was missing — could carry forward off-topic text
+        self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
         self.encouragement_given = False
@@ -4865,7 +4916,7 @@ async def create_moderator_session(
         _is_final = getattr(event, 'is_final', True)
         _pid = moderator.actual_respondent or moderator._current_stt_participant or "?"
         _qid = getattr(moderator.current_question_object, "id", "?") if moderator.current_question_object else "?"
-        _epoch = getattr(moderator, "_turn_epoch", "?")
+        _epoch = moderator._turn_epoch
         _buf_before = moderator.latest_user_response or ""
         _acc_before = moderator._turn_accumulated_text or ""
 
