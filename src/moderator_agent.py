@@ -4355,7 +4355,7 @@ async def create_moderator_session(
                 persona_config=anam.PersonaConfig(
                     name="Survey Moderator Avatar",
                     avatarId=anam_avatar_id,
-                    avatarModel="cara-3",
+                    avatarModel="cara-4-latest",
                 ),
             )
             await avatar.start(session, room=ctx.room)
@@ -4448,7 +4448,7 @@ async def create_moderator_session(
                                 persona_config=anam.PersonaConfig(
                                     name="Survey Moderator Avatar",
                                     avatarId=anam_avatar_id,
-                                    avatarModel="cara-3",
+                                    avatarModel="cara-4-latest",
                                 ),
                             )
                             await new_avatar.start(session, room=ctx.room)
