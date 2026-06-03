@@ -192,7 +192,7 @@ class DeadlineManager:
             return WatchdogSignal.NONE
         if user_speaking:
             return WatchdogSignal.NONE
-        if first_vad_seconds_ago > 6.0:
+        if first_vad_seconds_ago > 3.0:
             self._stt_nudge_given = True
             return WatchdogSignal.STT_NUDGE
         return WatchdogSignal.NONE
