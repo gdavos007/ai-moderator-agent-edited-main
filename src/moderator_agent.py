@@ -4357,12 +4357,16 @@ async def create_moderator_session(
     # room, BVC attenuates quieter/non-dominant participants as "background voices",
     # which is what caused Christopher's audio to reach STT degraded on 2026-05-12.
     # NC removes traffic/fans/music without isolating one speaker — safe for groups.
-    logger.info("🔊 Noise cancellation: NC (multi-speaker / focus-group safe)")
+    # NOTE: reverted NC()→BVC(). NC's native processor calls std::terminate on a
+    # mic sample-rate mismatch ("Input and output sample rates must be equal"),
+    # which crashes the whole agent process the moment a participant mic connects.
+    # BVC is the known non-crashing option. See incident 2026-07-01.
+    logger.info("🔊 Noise cancellation: BVC (reverted from NC — NC crashed on mic sample-rate mismatch)")
     await session.start(
         room=ctx.room,
         agent=moderator,
         room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.NC(),
+            noise_cancellation=noise_cancellation.BVC(),
             close_on_disconnect=False,  # Don't close session if participant goes "away"
         ),
     )
@@ -4390,7 +4394,7 @@ async def create_moderator_session(
                 persona_config=anam.PersonaConfig(
                     name="Survey Moderator Avatar",
                     avatarId=anam_avatar_id,
-                    avatarModel="cara-4-latest",
+                    avatarModel="cara-3",  # org lacks access to cara-4-latest (403); cara-3 is plan-accessible
                 ),
             )
             await avatar.start(session, room=ctx.room)
@@ -4483,7 +4487,7 @@ async def create_moderator_session(
                                 persona_config=anam.PersonaConfig(
                                     name="Survey Moderator Avatar",
                                     avatarId=anam_avatar_id,
-                                    avatarModel="cara-4-latest",
+                                    avatarModel="cara-3",  # org lacks access to cara-4-latest (403); cara-3 is plan-accessible
                                 ),
                             )
                             await new_avatar.start(session, room=ctx.room)
