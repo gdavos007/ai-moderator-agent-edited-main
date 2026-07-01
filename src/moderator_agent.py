@@ -269,6 +269,11 @@ class CommunityModeratorAgent(Agent):
         self._first_fragment_time: Optional[datetime] = None
         self._user_stopped_speaking_at: Optional[datetime] = None
         self._first_vad_speaking_time: Optional[datetime] = None
+        # ── Ack-latency baseline metrics (diagnostic only; no behavior impact) ──
+        # Timestamps for the 4 lifecycle events feeding the stop→ack latency budget.
+        self._m_user_stopped_at: Optional[datetime] = None   # (a) VAD speaking→listening
+        self._m_committed_at: Optional[datetime] = None       # (b) user_speech_committed
+        self._m_await_return_at: Optional[datetime] = None    # (c) _await_response returned → processing began
         self._shutting_down: bool = False
         self._tts_dedupe_spoken: Set[str] = set()
         self._encouragement_followup_given: bool = False
@@ -1036,6 +1041,7 @@ class CommunityModeratorAgent(Agent):
         # LATENCY TRACKING
         response_processing_start = datetime.now()
         self._response_processing_start = response_processing_start
+        self._m_await_return_at = response_processing_start  # metric (c): _await_response returned
         logger.critical(f"[{question_context}] LATENCY TRACKING: Response processing started")
 
         speaker_name = (self.actual_respondent if self.actual_respondent else participant).capitalize()
@@ -1414,8 +1420,34 @@ class CommunityModeratorAgent(Agent):
 
         return "accepted"
 
+    def _log_ack_latency_metrics(self, context: str) -> None:
+        """Emit a single consolidated stop→ack latency line for baseline tuning.
+
+        Diagnostic only — no behavior change. Reads the 4 lifecycle timestamps
+        captured this turn and logs the inter-event deltas plus the total.
+        Called at every "Thank you" ack site.
+        """
+        now = datetime.now()
+        stopped = self._m_user_stopped_at
+        committed = self._m_committed_at
+        await_ret = self._m_await_return_at
+
+        def _ms(a: Optional[datetime], b: Optional[datetime]) -> str:
+            return f"{(b - a).total_seconds() * 1000:.0f}" if (a and b) else "n/a"
+
+        logger.info(
+            "📊 METRIC ack_latency[%s]: stop→commit=%sms | commit→await_return=%sms | "
+            "await_return→ack=%sms | stop→ack_TOTAL=%sms",
+            context,
+            _ms(stopped, committed),
+            _ms(committed, await_ret),
+            _ms(await_ret, now),
+            _ms(stopped, now),
+        )
+
     async def _acknowledge_response(self, participant: str, speaker_name: str) -> None:
         """Fire a brief acknowledgment after a valid response."""
+        self._log_ack_latency_metrics("post_analysis")
         _ack_speaker = speaker_name
         self._prewarmed_ack_text = f"Thank you, {_ack_speaker}."
         try:
@@ -3518,6 +3550,7 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
                         self._response_processing_start = None  # Reset for next response
 
+                    self._log_ack_latency_metrics("all_answered")
                     await self._safe_say(ack_text, allow_interruptions=False, context="ack_all_answered")
                     self.survey_transcript.add_acknowledgment(ack_text)
                 except RuntimeError as e:
@@ -3583,6 +3616,7 @@ class CommunityModeratorAgent(Agent):
                         logger.info(f"📊 METRIC: response_end_to_next_tts_ms={latency * 1000:.0f}")
                         self._response_processing_start = None  # Reset for next response
 
+                    self._log_ack_latency_metrics("no_more_participants")
                     await self._safe_say(ack_text, allow_interruptions=False, context="ack_no_more_participants")
                     self.survey_transcript.add_acknowledgment(ack_text)
                 except RuntimeError as e:
@@ -3634,6 +3668,7 @@ class CommunityModeratorAgent(Agent):
 
                 self._response_processing_start = None  # Reset for next response
 
+            self._log_ack_latency_metrics("multi_participant")
             await self._safe_say(ack_text, allow_interruptions=False, context="ack_multi_participant")
             self.survey_transcript.add_acknowledgment(ack_text)
 
@@ -5053,6 +5088,7 @@ async def create_moderator_session(
         # ── Single write ──
         moderator.captured_response = corrected
         moderator._response_ready.set()
+        moderator._m_committed_at = datetime.now()  # metric (b): user_speech_committed
 
         # Also update legacy variables for compatibility
         moderator.latest_user_response = corrected
@@ -5110,6 +5146,7 @@ async def create_moderator_session(
             if moderator._turn_phase.is_in(TurnPhase.PARTICIPANT_SPEAKING):
                 moderator._turn_phase.transition_to(TurnPhase.PARTICIPANT_PAUSED)
             moderator._user_stopped_speaking_at = datetime.now()
+            moderator._m_user_stopped_at = moderator._user_stopped_speaking_at  # metric (a)
 
             # ACCUMULATE actual VAD speaking duration (not wall-clock from turn start)
             # Each speaking→listening transition adds the segment length
