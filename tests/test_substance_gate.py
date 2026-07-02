@@ -167,7 +167,14 @@ class TestPauseCooldownConstants:
         assert PAUSE_COOLDOWN_QUANTITATIVE == 0.6
 
     def test_qualitative_cooldown(self):
-        assert PAUSE_COOLDOWN_QUALITATIVE == 2.5
+        # 2026-07-02 latency work: lowered 2.5→1.2 after Priority 1 moved
+        # analysis off the critical path (qual cooldown was the dominant latency).
+        assert PAUSE_COOLDOWN_QUALITATIVE == 1.2
+
+    def test_qualitative_cooldown_still_absorbs_brief_pause(self):
+        """Qual cooldown must stay meaningfully above the quant cooldown so a
+        brief mid-thought pause doesn't clip an open-ended answer."""
+        assert PAUSE_COOLDOWN_QUALITATIVE >= 1.0
 
     def test_quantitative_cooldown_is_sub_second(self):
         """Quant answers are short/high-confidence — cooldown deliberately < 1s."""

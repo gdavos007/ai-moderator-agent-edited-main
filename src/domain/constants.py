@@ -101,14 +101,19 @@ MIN_COMMITTED_CHARS = 2
 # for open-ended qualitative answers where the participant may pause mid-thought.
 # (Priority 2 latency work, 2026-07-01: quant lowered 1.5→0.6.)
 PAUSE_COOLDOWN_QUANTITATIVE = 0.6
-PAUSE_COOLDOWN_QUALITATIVE = 2.5
+# 2026-07-02 latency work: qual lowered 2.5→1.2. After Priority 1 moved LLM
+# analysis off the critical path, this cooldown was the dominant remaining
+# latency (~3.4s stop→ack). 1.2s still absorbs a brief mid-thought pause while
+# cutting ~1.3s. Tune up toward 1.5 if participants get clipped mid-answer.
+PAUSE_COOLDOWN_QUALITATIVE = 1.2
 
 # Stabilization window: how long to wait for STT fragments to stop arriving
 # before promoting a response. Quantitative is measured from when the user
 # STOPPED speaking (short window); qualitative keeps the longer window measured
 # from the first fragment. (Priority 2: quant effectively 2.0→0.6.)
 STABILIZATION_QUANTITATIVE = 0.6
-STABILIZATION_QUALITATIVE = 2.0
+# 2026-07-02: qual lowered 2.0→1.2 alongside the cooldown (see above).
+STABILIZATION_QUALITATIVE = 1.2
 
 # Polling wait_for cap: max seconds the _await_response loop blocks per iteration
 # before re-checking watchdogs. Lower = faster reaction to a ready response.
