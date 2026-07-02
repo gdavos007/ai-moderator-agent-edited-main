@@ -264,6 +264,7 @@ class CommunityModeratorAgent(Agent):
         # Deadline/watchdog state managed by self._deadline_mgr (DeadlineManager)
         self._ack_already_spoken: bool = False
         self._prewarmed_ack_text: Optional[str] = None
+        self._early_ack_handle: Optional[object] = None  # Priority 1: ack fired concurrently with analysis
         self._gentle_warning_in_progress: bool = False
         self._gentle_warning_started_at: Optional[float] = None
         self._analysis_in_progress: bool = False
@@ -1232,6 +1233,25 @@ class CommunityModeratorAgent(Agent):
             _latency = (datetime.now() - self._response_processing_start).total_seconds()
             logger.info(f"METRIC: response_end_to_next_tts_ms={_latency * 1000:.0f}")
 
+        # ── PRIORITY 1: ack-before-analysis ──
+        # Speak "Thank you, {name}" NOW, concurrently with the LLM analysis, rather
+        # than after it. Only on a FRESH, substantive answer that isn't a likely
+        # short off-topic — so we almost never stack a "Thank you" on top of a
+        # correction. If analysis still finds a problem, the retry branches below
+        # speak the corrective follow-up (and reset _ack_already_spoken).
+        _early_ack_eligible = (
+            not self.relevance_prompt_given
+            and self._short_offtopic_count == 0
+            and not self.partial_repeat_handled
+            and not self.already_answered_prompt_given
+            and not self.encouragement_given
+            and not self._ack_already_spoken
+            and _is_committable(response_to_analyze)
+            and not _is_too_short_for_offtopic(response_to_analyze)
+        )
+        if _early_ack_eligible:
+            self._fire_early_ack(speaker_name)
+
         analysis, analysis_secs = await self._analyze_with_filler(question_for_analysis, response_to_analyze, survey_desc)
         logger.info(
             f"[{question_context}] Analysis: relevant={analysis.is_relevant}, "
@@ -1271,6 +1291,8 @@ class CommunityModeratorAgent(Agent):
             self.response_captured = False
             self.last_stt_fragment = ""
             self.encouragement_given = False
+            self._ack_already_spoken = False  # Priority 1: allow re-ack on the retry
+            self._early_ack_handle = None
             self.waiting_for_response = True
             self.last_speech_time = None
             self._deadline_mgr.bump_epoch()
@@ -1337,6 +1359,8 @@ class CommunityModeratorAgent(Agent):
             self.latest_user_response = None
             self.response_captured = False
             self.last_stt_fragment = ""
+            self._ack_already_spoken = False  # Priority 1: allow re-ack on the retry
+            self._early_ack_handle = None
             self.waiting_for_response = True
             self.last_speech_time = None
             self._deadline_mgr.bump_epoch()
@@ -1437,7 +1461,16 @@ class CommunityModeratorAgent(Agent):
             return "retry"
 
         # ── Response accepted — fire acknowledgment ──
-        await self._acknowledge_response(participant, speaker_name)
+        if self._ack_already_spoken and self._early_ack_handle is not None:
+            # Early ack (Priority 1) already spoken concurrently with analysis;
+            # just await its playout so the next question follows it cleanly.
+            try:
+                await self._early_ack_handle
+            except Exception as e:
+                logger.debug(f"Early ack handle await skipped: {e}")
+            self._early_ack_handle = None
+        else:
+            await self._acknowledge_response(participant, speaker_name)
 
         return "accepted"
 
@@ -1465,6 +1498,32 @@ class CommunityModeratorAgent(Agent):
             _ms(await_ret, now),
             _ms(stopped, now),
         )
+
+    def _fire_early_ack(self, speaker_name: str) -> None:
+        """Priority 1: start the "Thank you, {name}" TTS concurrently with the LLM
+        analysis instead of after it, removing ~1.1s of analysis latency from the
+        time-to-ack.
+
+        Does NOT await playout — the accept path awaits the handle after analysis so
+        the next question still follows the ack. If analysis instead triggers a
+        retry (off-topic/repeat/partial/already-answered), those branches reset
+        _ack_already_spoken and speak their corrective follow-up after this ack.
+        """
+        self._log_ack_latency_metrics("early_ack")
+        self._prewarmed_ack_text = f"Thank you, {speaker_name}."
+        try:
+            self._early_ack_handle = self.agent_session.say(
+                self._prewarmed_ack_text, allow_interruptions=False
+            )
+            self._estimated_remaining_tts = 0.0  # Clear stale immediately
+            self.survey_transcript.add_acknowledgment(self._prewarmed_ack_text)
+            self._ack_already_spoken = True
+            self._transition_filler_said = True
+            logger.info(f"Ack fired (early, pre-analysis): '{self._prewarmed_ack_text}'")
+        except Exception as e:
+            logger.warning(f"Early ack failed (will fall back to post-analysis ack): {e}")
+            self._ack_already_spoken = False
+            self._early_ack_handle = None
 
     async def _acknowledge_response(self, participant: str, speaker_name: str) -> None:
         """Fire a brief acknowledgment after a valid response."""
@@ -1889,6 +1948,8 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []
         self.last_fragment_time = None
         self.actual_respondent = None
+        self._ack_already_spoken = False  # Priority 1: allow re-ack on the retry
+        self._early_ack_handle = None
 
         self.waiting_for_response = True
         self.last_speech_time = None
