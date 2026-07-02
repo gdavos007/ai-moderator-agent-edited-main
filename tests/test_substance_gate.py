@@ -13,6 +13,10 @@ from src.domain.constants import (
     MIN_COMMITTED_CHARS,
     PAUSE_COOLDOWN_QUANTITATIVE,
     PAUSE_COOLDOWN_QUALITATIVE,
+    STABILIZATION_QUANTITATIVE,
+    STABILIZATION_QUALITATIVE,
+    POLL_WAIT_CAP_QUANTITATIVE,
+    POLL_WAIT_CAP_DEFAULT,
 )
 
 
@@ -158,15 +162,33 @@ class TestPauseCooldownConstants:
     """Verify pause cooldown values used in _await_response fragment promotion."""
 
     def test_quantitative_cooldown(self):
-        assert PAUSE_COOLDOWN_QUANTITATIVE == 1.5
+        # Priority 2 latency work (2026-07-01): lowered 1.5→0.6 so short,
+        # high-confidence quantitative answers are acknowledged quickly.
+        assert PAUSE_COOLDOWN_QUANTITATIVE == 0.6
 
     def test_qualitative_cooldown(self):
         assert PAUSE_COOLDOWN_QUALITATIVE == 2.5
 
-    def test_quantitative_greater_than_one_second(self):
-        """A 1-second thinking pause should NOT trigger fragment promotion."""
-        assert PAUSE_COOLDOWN_QUANTITATIVE > 1.0
+    def test_quantitative_cooldown_is_sub_second(self):
+        """Quant answers are short/high-confidence — cooldown deliberately < 1s."""
+        assert 0.3 <= PAUSE_COOLDOWN_QUANTITATIVE < 1.0
 
     def test_qualitative_greater_than_quantitative(self):
         """Qualitative questions get a longer pause window."""
         assert PAUSE_COOLDOWN_QUALITATIVE > PAUSE_COOLDOWN_QUANTITATIVE
+
+
+class TestPriority2LatencyGates:
+    """Verify the Priority 2 fast-gate constants for quantitative questions."""
+
+    def test_stabilization_quant_is_short(self):
+        assert 0.3 <= STABILIZATION_QUANTITATIVE <= 1.0
+
+    def test_stabilization_qual_longer_than_quant(self):
+        assert STABILIZATION_QUALITATIVE > STABILIZATION_QUANTITATIVE
+
+    def test_poll_cap_quant_is_sub_half_second(self):
+        assert 0.3 <= POLL_WAIT_CAP_QUANTITATIVE <= 0.5
+
+    def test_poll_cap_quant_faster_than_default(self):
+        assert POLL_WAIT_CAP_QUANTITATIVE < POLL_WAIT_CAP_DEFAULT
