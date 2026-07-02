@@ -325,6 +325,7 @@ async def entrypoint(ctx: agents.JobContext):
             vad_min_speech_duration=config.vad_min_speech_duration,
             vad_prefix_padding_duration=config.vad_prefix_padding_duration,
             vad_min_silence_duration=config.vad_min_silence_duration,
+            turn_engine=config.turn_engine,
             question_loader=question_loader,
             participant_manager=participant_manager,
             survey_config=survey_config,

@@ -106,6 +106,11 @@ class AgentConfig:
     vad_prefix_padding_duration: float = 0.6
     vad_min_silence_duration: float = 0.55
 
+    # Turn engine: "legacy" = custom _await_response polling loop + endpointing gates.
+    # "native" = LiveKit semantic EOU (MultilingualModel) owns end-of-turn; slim waiter.
+    # Default legacy (known-good); flip to native via TURN_ENGINE secret for A/B.
+    turn_engine: str = "legacy"
+
     @staticmethod
     def _extract_agent_name_from_voice(tts_voice: str, tts_provider: str) -> str:
         """
@@ -180,6 +185,8 @@ class AgentConfig:
             vad_min_speech_duration=float(os.getenv("VAD_MIN_SPEECH_DURATION", "0.15")),
             vad_prefix_padding_duration=float(os.getenv("VAD_PREFIX_PADDING_DURATION", "0.6")),
             vad_min_silence_duration=float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.55")),
+            # Turn engine (legacy custom loop vs native LiveKit EOU)
+            turn_engine=os.getenv("TURN_ENGINE", "legacy").strip().lower(),
         )
 
     def validate(self) -> bool:
