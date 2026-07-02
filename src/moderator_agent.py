@@ -3374,8 +3374,12 @@ class CommunityModeratorAgent(Agent):
         # Quantitative raised from 0.4→0.6 to prevent echo-triggered false turns.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                # Lowered 1.2→0.6 for the semantic EOU model: VAD only needs to
+                # trigger the end-of-utterance check quickly; the turn detector
+                # decides whether the thought is actually complete. (Falls back to
+                # a longer effective wait automatically when EOU says "incomplete".)
+                self.agent_session.vad.update_options(min_silence_duration=0.6)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (qualitative + EOU turn detection)")
             elif self.current_question_object.is_quantitative():
                 self.agent_session.vad.update_options(min_silence_duration=0.6)
                 logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
@@ -3800,8 +3804,12 @@ class CommunityModeratorAgent(Agent):
         # DYNAMIC VAD CONFIGURATION: Same echo-hardened thresholds as first loop.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                # Lowered 1.2→0.6 for the semantic EOU model: VAD only needs to
+                # trigger the end-of-utterance check quickly; the turn detector
+                # decides whether the thought is actually complete. (Falls back to
+                # a longer effective wait automatically when EOU says "incomplete".)
+                self.agent_session.vad.update_options(min_silence_duration=0.6)
+                logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (qualitative + EOU turn detection)")
             elif self.current_question_object.is_quantitative():
                 self.agent_session.vad.update_options(min_silence_duration=0.6)
                 logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
@@ -4293,6 +4301,28 @@ async def create_moderator_session(
         vad_prefix_padding_duration, vad_activation_threshold,
     )
 
+    # ── Turn detection ──────────────────────────────────────────────────────
+    # Semantic end-of-utterance (EOU) model: instead of committing after a fixed
+    # window of silence, it reads the transcript and predicts whether the turn is
+    # actually complete — ending fast on finished thoughts, waiting on trailing
+    # ones ("I think that..."). Faster AND fewer cutoffs than plain silence.
+    #
+    # Runtime kill-switch: set TURN_DETECTION=server_vad (LiveKit secret) to fall
+    # back to plain silence detection WITHOUT a code redeploy if it misbehaves.
+    _td_mode = os.getenv("TURN_DETECTION", "eou").strip().lower()
+    _turn_detection = "server_vad"
+    if _td_mode == "eou":
+        try:
+            _turn_detection = MultilingualModel()
+            logger.info("🧠 Turn detection: MultilingualModel (semantic EOU)")
+        except Exception as e:
+            # Never let a missing/broken EOU model take the agent down — fall back
+            # to plain silence detection (which is what shipped before).
+            _turn_detection = "server_vad"
+            logger.warning("🧠 Turn detection: EOU model unavailable (%s) — falling back to server_vad", e)
+    else:
+        logger.info("🧠 Turn detection: server_vad (semantic EOU disabled via TURN_DETECTION=%s)", _td_mode)
+
     session = AgentSession(
         stt=stt_instance,
        llm=openai.LLM(
@@ -4301,7 +4331,11 @@ async def create_moderator_session(
         ),
         tts=tts_instance,
         vad=vad_instance,
-        turn_detection="server_vad",  # Enable turn detection for event handling (FIXED: was "manual")
+        turn_detection=_turn_detection,
+        # With the EOU model, endpointing waits between these bounds based on the
+        # model's confidence the turn is done: complete → ~min, incomplete → up to max.
+        min_endpointing_delay=0.4,
+        max_endpointing_delay=5.0,
         allow_interruptions=True,               # Session default; per-call overrides for warnings/acks
         min_interruption_duration=0.5,          # Min user speech to trigger interrupt
         discard_audio_if_uninterruptible=True,  # Drop user audio during non-interruptible TTS

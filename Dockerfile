@@ -9,6 +9,10 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements and install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Pre-download plugin model files (Silero VAD + turn-detector EOU model) so they
+# ship in the image. Without this the turn detector fails at runtime with
+# "Could not find file model_q8.onnx" (incident 2026-07).
+RUN python -m livekit.agents download-files
 # Copy ALL application files
 COPY . .
 # Set environment variables
