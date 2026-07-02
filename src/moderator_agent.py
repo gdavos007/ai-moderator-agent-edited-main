@@ -72,6 +72,8 @@ from .domain.constants import (
     SILENCE_WATCHDOG_TIMEOUT, IDLE_NO_VAD_TIMEOUT, TTS_SAFETY_MARGIN,
     DISFLUENCY_EXTENSION_BUDGET, POST_NUDGE_EXTENSION_SECS,
     MIN_COMMITTED_CHARS, PAUSE_COOLDOWN_QUANTITATIVE, PAUSE_COOLDOWN_QUALITATIVE,
+    STABILIZATION_QUANTITATIVE, STABILIZATION_QUALITATIVE,
+    POLL_WAIT_CAP_QUANTITATIVE, POLL_WAIT_CAP_DEFAULT,
     AVATAR_STATE_IDLE, AVATAR_STATE_STARTING, AVATAR_STATE_CONNECTED,
     AVATAR_STATE_DISCONNECTED, AVATAR_STATE_RECONNECTING, AVATAR_STATE_FAILED,
     ANAM_AVATAR_IDENTITY,
@@ -719,6 +721,26 @@ class CommunityModeratorAgent(Agent):
             f"(participant={participant}, epoch={self._deadline_mgr.epoch})"
         )
 
+    def _is_quantitative_question(self) -> bool:
+        """True when the current question is quantitative/MC (branch key for fast gates)."""
+        return bool(self.current_question_object and self.current_question_object.is_quantitative())
+
+    def _stabilization_pending(self) -> bool:
+        """True if we should keep waiting for STT fragments to stop arriving.
+
+        Quantitative: short window (STABILIZATION_QUANTITATIVE) measured from when
+        the user STOPPED speaking — answers are short so late fragments are rare.
+        Qualitative/default: longer window measured from the FIRST fragment, so a
+        participant thinking mid-answer isn't cut off. (Priority 2 latency work.)
+        """
+        if self.turn_time_exceeded:
+            return False
+        if self._is_quantitative_question():
+            anchor = self._user_stopped_speaking_at
+            return anchor is not None and (datetime.now() - anchor).total_seconds() < STABILIZATION_QUANTITATIVE
+        return (self._first_fragment_time is not None
+                and (datetime.now() - self._first_fragment_time).total_seconds() < STABILIZATION_QUALITATIVE)
+
     async def _await_response(
         self,
         participant: str,
@@ -764,10 +786,11 @@ class CommunityModeratorAgent(Agent):
                         logger.warning(f"Polling deadline reached ({polling_timeout}s effective)")
                         break
 
+                _poll_cap = POLL_WAIT_CAP_QUANTITATIVE if self._is_quantitative_question() else POLL_WAIT_CAP_DEFAULT
                 try:
                     await asyncio.wait_for(
                         self._response_ready.wait(),
-                        timeout=min(max(remaining, 0.1), 2.0),
+                        timeout=min(max(remaining, 0.1), _poll_cap),
                     )
                 except asyncio.TimeoutError:
                     pass  # Fall through to watchdog checks
@@ -831,10 +854,9 @@ class CommunityModeratorAgent(Agent):
                     if self.user_currently_speaking and not self.turn_time_exceeded:
                         continue
 
-                    # Stabilization delay: if first fragment arrived <2s ago, wait
-                    if (self._first_fragment_time is not None
-                        and not self.turn_time_exceeded
-                        and (datetime.now() - self._first_fragment_time).total_seconds() < 2.0):
+                    # Stabilization delay (quant: short window from stop-speaking;
+                    # qual: longer window from first fragment). See _stabilization_pending.
+                    if self._stabilization_pending():
                         continue
 
                     # Pause cooldown: wait after user stops speaking
@@ -868,8 +890,7 @@ class CommunityModeratorAgent(Agent):
                     and not self.turn_time_exceeded):
                     # Fragment handler captured something but committed event hasn't fired yet
                     # Check stabilization and pause cooldown same as above
-                    if (self._first_fragment_time is not None
-                        and (datetime.now() - self._first_fragment_time).total_seconds() < 2.0):
+                    if self._stabilization_pending():
                         continue
                     if (self._user_stopped_speaking_at is not None):
                         pause_cooldown = PAUSE_COOLDOWN_QUALITATIVE if (self.current_question_object and self.current_question_object.is_qualitative()) else PAUSE_COOLDOWN_QUANTITATIVE

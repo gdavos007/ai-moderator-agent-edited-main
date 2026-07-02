@@ -96,9 +96,24 @@ POST_NUDGE_EXTENSION_SECS = 15.0
 # as a response.
 MIN_COMMITTED_CHARS = 2
 
-# Pause cooldown: seconds after user stops speaking before fragment promotion
-PAUSE_COOLDOWN_QUANTITATIVE = 1.5
+# Pause cooldown: seconds after user stops speaking before fragment promotion.
+# Quantitative answers are short and high-confidence, so we wait far less than
+# for open-ended qualitative answers where the participant may pause mid-thought.
+# (Priority 2 latency work, 2026-07-01: quant lowered 1.5→0.6.)
+PAUSE_COOLDOWN_QUANTITATIVE = 0.6
 PAUSE_COOLDOWN_QUALITATIVE = 2.5
+
+# Stabilization window: how long to wait for STT fragments to stop arriving
+# before promoting a response. Quantitative is measured from when the user
+# STOPPED speaking (short window); qualitative keeps the longer window measured
+# from the first fragment. (Priority 2: quant effectively 2.0→0.6.)
+STABILIZATION_QUANTITATIVE = 0.6
+STABILIZATION_QUALITATIVE = 2.0
+
+# Polling wait_for cap: max seconds the _await_response loop blocks per iteration
+# before re-checking watchdogs. Lower = faster reaction to a ready response.
+POLL_WAIT_CAP_QUANTITATIVE = 0.4
+POLL_WAIT_CAP_DEFAULT = 2.0
 
 
 # ── Avatar health states ─────────────────────────────────────────────────────
