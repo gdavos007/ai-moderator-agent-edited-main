@@ -136,7 +136,7 @@ Do **not** tune `deadline_manager.py` for ack latency — it only affects STT-fa
 The whole turn-wait contract is switchable via the `TURN_ENGINE` secret (default `legacy`; set on the agent as `self._turn_engine`, plumbed `AgentConfig` → `agent.py` → `create_moderator_session`).
 
 - **`legacy`** — `turn_detection="server_vad"` + the full custom `_await_response` polling loop + pause-cooldown/stabilization gates + qual VAD `min_silence=1.2`. Known-good; ack latency ~2.5–5s.
-- **`native`** — LiveKit's semantic EOU model (`MultilingualModel`) owns end-of-turn; qual VAD `min_silence=0.6`; the slim `_await_response_native()` waiter drops cooldown/stabilization/STT-health. **Proven 2026-07-06: fast-path acks ~55–400ms.**
+- **`native`** — LiveKit's semantic EOU model (`MultilingualModel`) owns end-of-turn; qual VAD `min_silence=0.8` (raised from 0.6 to reduce mid-thought cutoffs); `min_endpointing_delay=0.4` / `max_endpointing_delay=5.0`; the slim `_await_response_native()` waiter drops cooldown/stabilization/STT-health. **Proven 2026-07-06: fast-path acks ~55–400ms.**
 
 ⚠️ **Native only works because of THREE coupled changes in `moderator_agent.py` — do not remove any:**
 1. **`llm_node` returns an empty stream in native.** A model turn detector activates LiveKit's autonomous conversational loop, which auto-generates *off-script questions and phantom participants*. Blocking `llm_node` (the final generation chokepoint) stops all of it. Safe because questions/welcome/acks are direct TTS and `response_analysis.py` uses a **separate** `AsyncOpenAI` client.
