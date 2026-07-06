@@ -1,318 +1,152 @@
 # AI Survey Moderator Agent
 
-An AI-powered voice survey moderator built with LiveKit Agents SDK and OpenAI that conducts surveys by reading questions from Word documents and capturing participant responses via real-time voice conversation.
+An AI-powered **voice survey / focus-group moderator** built on the [LiveKit Agents SDK](https://docs.livekit.io/agents/). The agent joins a LiveKit room, reads survey questions aloud, captures participant responses via real-time speech, manages multi-participant turn-taking, and exports results to CSV/JSON. An optional **Anam talking-head avatar** renders the agent's voice as video.
 
-## 🎯 Core Features
+> For contributor-facing engineering detail (module map, gotchas, deploy runbook), see **[CLAUDE.md](CLAUDE.md)**. For product scope and requirements, see **[docs/PRD.md](docs/PRD.md)**.
 
-### Survey Administration
-- 📄 **Question Loading**: Reads survey questions from Word documents (`.docx`) with automatic parsing
-- 🎙️ **Voice Interaction**: Natural conversation using OpenAI STT, TTS, and Silero VAD
-- 👥 **Multi-Participant**: Supports multiple participants with round-robin question distribution
-- 🎥 **Zoom Integration**: Join Zoom meetings as a bot via Recall.ai (Phase 1) 🆕
-- ⏱️ **Time Management**: Configurable response time limits (default 20s) with grace periods
-- 🔄 **Smart Polling**: Event-driven response capture with speech detection
+---
 
-### Response Capture & Processing
-- 📝 **Real-time Transcription**: Captures participant responses using OpenAI STT
-- ✅ **Response Correction**: Fuzzy matching to correct transcription errors against answer options
-- 🔍 **Duplicate Prevention**: Ensures each response is captured only once
-- 🎯 **Progress Tracking**: Monitors which participants have answered each question
+## Production pipeline
 
-### Data Export
-- 📊 **CSV Export**: Structured data ready for analysis (Excel, Python, R)
-- 📋 **JSON Transcript**: Complete conversation history for debugging
-- ⏰ **Timestamps**: Every interaction timestamped for temporal analysis
-- 🔒 **Session Isolation**: Each survey session creates separate output files
+**Deepgram `nova-3` (STT) → OpenAI LLM (temperature 0.0) → ElevenLabs (TTS)**, with **Silero VAD**, LiveKit **`noise_cancellation.BVC()`**, and semantic **end-of-utterance (EOU) turn detection**.
 
-## 🏗️ Architecture
+> The code *defaults* to OpenAI STT/TTS (`config/agent_config.py`); the LiveKit Cloud deployment overrides these to Deepgram + ElevenLabs via secrets (`STT_PROVIDER`, `TTS_PROVIDER`, …).
 
+### Turn engine (`TURN_ENGINE`)
+
+| Mode | Turn detection | Behavior |
+|------|----------------|----------|
+| `legacy` (default) | `server_vad` | Custom `_await_response` polling loop with pause-cooldown/stabilization gates. Known-good; ack latency ~2.5–5s. |
+| `native` | `MultilingualModel` (semantic EOU) | LiveKit's EOU model owns end-of-turn; slim waiter; the agent's autonomous LLM replies are suppressed so it only reads scripted questions. **Fast-path acks ~55–400ms.** |
+
+Switch modes with the `TURN_ENGINE` env/secret — no code change. `native` requires three coupled pieces (all in `src/moderator_agent.py`): an `llm_node` block, `on_user_turn_completed` as the response producer, and the slim `_await_response_native` waiter. See CLAUDE.md → *Turn Engine* for why.
+
+---
+
+## Core features
+
+- **Verbatim question reading** — temperature 0.0 + direct-TTS bypass; the agent never invents or paraphrases questions.
+- **Multi-participant round-robin** — tracks who was asked vs. who actually answered; observer mode (agent stays silent until an observer says "start survey").
+- **Response analysis** — LLM-classified relevance / repeat-request / partial-answer / already-answered, with corrective re-prompts (separate OpenAI client from the voice pipeline).
+- **Fuzzy STT correction** — edit-distance + phonetic matching of responses to expected answer options.
+- **Turn-time management** — per-turn speaking limit (~45s) with grace periods and wrap-up warnings.
+- **Web join experience** — browser UI for participants (FastAPI); the primary, working delivery method.
+- **Data export** — per-session CSV (responses + metadata) and full JSON transcript.
+
+> ⚠️ **Zoom integration via Recall.ai is not functional.** The web join experience is the supported path.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Room["LiveKit Room (Cloud)"]
+        P["👥 Participants<br/>(browser / web join)"]
+        A["🤖 Survey Moderator Agent"]
+        AV["🎭 Anam Avatar<br/>(optional video)"]
+    end
+
+    P -- "mic audio" --> A
+    A -- "TTS voice (via avatar)" --> AV
+    AV -- "A/V" --> P
+
+    subgraph Pipeline["Voice pipeline (create_moderator_session)"]
+        STT["Deepgram nova-3<br/>STT"]
+        VAD["Silero VAD +<br/>BVC noise cancel"]
+        EOU["Turn detection<br/>server_vad | MultilingualModel"]
+        TTS["ElevenLabs TTS"]
+    end
+
+    A --> VAD --> STT --> EOU
+    A --> TTS
+
+    subgraph Logic["Survey logic (moderator_agent.py)"]
+        LOOP["_survey_loop<br/>round-robin"]
+        WAIT["_await_response /<br/>_await_response_native"]
+        PROC["_process_captured_response<br/>(relevance / repeat / partial)"]
+        ANALYSIS["response_analysis.py<br/>(separate OpenAI client)"]
+    end
+
+    EOU --> WAIT --> PROC --> LOOP
+    PROC --> ANALYSIS
+
+    subgraph Out["Outputs (output/)"]
+        CSV["CSV: responses + metadata"]
+        JSON["JSON transcript"]
+    end
+
+    PROC --> CSV
+    PROC --> JSON
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     LiveKit Room                            │
-│  ┌──────────────┐              ┌──────────────┐            │
-│  │ Participant  │◄────────────►│  AI Agent    │            │
-│  │   (Voice)    │   Audio      │   (Voice)    │            │
-│  └──────────────┘   Tracks     └──────────────┘            │
-└─────────────────────────────────────────────────────────────┘
-                                        │
-                    ┌───────────────────┼───────────────────┐
-                    ▼                   ▼                   ▼
-            ┌──────────────┐    ┌──────────────┐   ┌──────────────┐
-            │  OpenAI STT  │    │  OpenAI LLM  │   │  OpenAI TTS  │
-            │  (Transcribe)│    │  (Generate)  │   │   (Speak)    │
-            └──────────────┘    └──────────────┘   └──────────────┘
-                    │                                       
-                    ▼                                       
-        ┌──────────────────────┐                           
-        │  Response Capture    │                           
-        │  - Event Handler     │                           
-        │  - Smart Polling     │                           
-        │  - Correction        │                           
-        └──────────────────────┘                           
-                    │                                       
-        ┌───────────┴───────────┐                          
-        ▼                       ▼                           
-┌──────────────┐        ┌──────────────┐                   
-│   CSV Export │        │ JSON Transcript│                  
-│ (Analysis)   │        │  (Debug)      │                   
-└──────────────┘        └──────────────┘                   
-```
 
-## 📋 Requirements
+Two separately-deployed runtimes: the **Agent** runs on **LiveKit Cloud** (`lk agent deploy`); the **web frontend** runs on a **Hetzner VPS** (Docker). See CLAUDE.md → *How to Deploy*.
 
-- Python 3.12+
-- LiveKit account and API credentials
-- OpenAI API key
-- macOS, Linux, or Windows
+---
 
-## 🚀 Setup
+## Run locally (development)
 
-### 1. Clone the Repository
+Three terminals:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ai-moderator-agent.git
-cd ai-moderator-agent
+# 1 — Agent
+PYTHONPATH=src uv run python agent.py dev
+
+# 2 — Web API / frontend
+PYTHONPATH=src uv run python web/backend/server.py
+
+# 3 — Public URL for participants
+ngrok http 8080
 ```
 
-### 2. Create Virtual Environment
+Share the ngrok URL for participants to join from their browser. Select a survey with `SURVEY_ID=<id>` (default `poc_focus_group`).
 
 ```bash
-python3.12 -m venv ai_moderator_agent
-source ai_moderator_agent/bin/activate  # On Windows: ai_moderator_agent\Scripts\activate
+uv sync                       # install deps (or: pip install -r requirements.txt)
+python -m pytest tests/       # run tests
 ```
 
-### 3. Install Dependencies
+## Deploy (production)
 
 ```bash
-pip install -r requirements.txt
+lk agent deploy               # Agent → LiveKit Cloud (agent id from livekit.toml)
+lk agent status               # "Sleeping" = scaled to zero (normal)
+lk agent logs                 # streams NEW lines only — start BEFORE reproducing
 ```
 
-### 4. Configure Environment
+Agent secrets live in **LiveKit Cloud**, not the image — editing `.env.local` does not change the deployed agent. Change a single secret via the LiveKit dashboard (`lk agent update-secrets` does a full replace). The web frontend deploys to Hetzner via `git pull` + `docker build`/`docker run` (port 8083→8080).
 
-```bash
-cp .env.example .env.local
-```
+---
 
-Edit `.env.local` with your credentials:
-```bash
-# LiveKit Configuration
-LIVEKIT_URL=wss://your-project.livekit.cloud
-LIVEKIT_API_KEY=your_api_key
-LIVEKIT_API_SECRET=your_api_secret
+## Configuration
 
-# OpenAI Configuration
-OPENAI_API_KEY=your_openai_api_key
-```
+Key env vars (`config/agent_config.py`, overridden by LiveKit Cloud secrets in production):
 
-### 5. Add Survey Questions
+| Var | Purpose |
+|-----|---------|
+| `STT_PROVIDER` / `TTS_PROVIDER` | `openai` \| `deepgram` \| `elevenlabs` (prod: deepgram + elevenlabs) |
+| `TURN_ENGINE` | `legacy` (default) \| `native` (semantic EOU) |
+| `VAD_ACTIVATION_THRESHOLD`, `VAD_MIN_SILENCE_DURATION`, … | Silero VAD tuning |
+| `ANAM_AVATAR_ID` | Anam **avatar** id (not a persona id) — the voice routes through the avatar |
+| `SURVEY_ID` | Which survey from `surveys_config.yaml` (default `poc_focus_group`) |
 
-Place your Word document (`.docx`) with survey questions in the `topic_questions/` directory.
+---
 
-**Question Format Example:**
-```
-Q#1: How would you rate our service?
-excellent
-good
-fair
-poor
+## Repository layout
 
-Q#2: What can we improve?
-[Open-ended question - no response options]
-```
+| Path | Purpose |
+|------|---------|
+| `agent.py` | Worker entry point; welcome delivery; wires config → session |
+| `src/moderator_agent.py` | Core agent: survey loop, turn engine, response capture, avatar |
+| `src/domain/` | Pure logic (turn phase, deadline manager, response analysis, transcription, constants) — mirrored by `tests/` |
+| `config/agent_config.py` | Env-driven config + moderator instructions |
+| `surveys_config.yaml` | Survey definitions (`survey_id`, `questions_file`) |
+| `web/` | FastAPI browser join UI |
+| `docs/PRD.md` | Product requirements + architecture |
+| `output/` | CSV / JSON exports per session |
 
-## 💻 Usage
+---
 
-### Option 1: LiveKit-Only Mode (Direct Participants)
+## License
 
-### Start the Agent
-
-**Terminal 1:**
-```bash
-source ai_moderator_agent/bin/activate
-python agent.py dev
-```
-
-You should see:
-```
-Starting AI Survey Moderator Agent
-registered worker
-```
-
-### Join Survey Session
-
-**Terminal 2:**
-```bash
-source ai_moderator_agent/bin/activate
-python join_survey.py
-```
-
-This will output a clickable link:
-```
-✨ CLICK THIS LINK to join (opens in browser):
-https://meet.livekit.io/custom?liveKitUrl=...
-```
-
-Click the link to join via your web browser. Make sure to:
-1. Grant microphone permissions
-2. Unmute your microphone
-3. Wait for the agent to start speaking
-
-### Option 2: Zoom Integration (Phase 1: Recall.ai) 🆕
-
-Conduct surveys with participants joining from Zoom meetings!
-
-**Features**:
-- ✅ Participants join via familiar Zoom interface
-- ✅ Participant names automatically captured from Zoom
-- ✅ No changes to existing agent code required
-- ✅ Full survey functionality maintained
-
-**Quick Start**:
-
-```bash
-# Terminal 1: Start webhook tunnel
-ngrok http 8000
-
-# Terminal 2: Start agent
-python agent.py
-
-# Terminal 3: Start Zoom bridge
-python zoom_survey.py \
-  --zoom-url "https://zoom.us/j/YOUR_MEETING_ID" \
-  --webhook-url "https://YOUR_NGROK_URL.ngrok.io"
-```
-
-**Prerequisites**:
-- Recall.ai API key (sign up at https://recall.ai/)
-- ngrok installed (`brew install ngrok`)
-- Add `RECALL_API_KEY` to `.env.local`
-
-📖 **Complete Guide**: See [ZOOM_QUICKSTART.md](ZOOM_QUICKSTART.md) for 10-minute setup
-📚 **Full Documentation**: See [ZOOM_SETUP.md](ZOOM_SETUP.md) for detailed guide, troubleshooting, and costs
-
-## 📊 Output Files
-
-Survey results are saved in `output/` directory:
-
-### CSV Export
-`AI_Survey_Agent_Output_Responses_YYYYMMDD_HHMMSS.csv`
-```csv
-Session ID,Participant Name,Question#,question_id,Question,Response Options,Participant Response,Timestamp
-20251108_171604,John Doe,1,Q#1,How would you rate...?,excellent;good;fair;poor,Excellent,2025-11-08T17:17:03
-```
-
-### JSON Transcript
-`survey_transcript_YYYYMMDD_HHMMSS.json`
-```json
-{
-  "session_id": "20251108_171604",
-  "start_time": "2025-11-08T17:16:04",
-  "greeting": "Hello everyone! I'm your AI survey moderator...",
-  "questions": [
-    {
-      "question_number": 1,
-      "question_text": "How would you rate our service?",
-      "responses": [
-        {
-          "participant": "John Doe",
-          "response_text": "Excellent",
-          "timestamp": "2025-11-08T17:17:03"
-        }
-      ]
-    }
-  ]
-}
-```
-
-## ⚙️ Configuration
-
-Key settings in `.env.local`:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LIVEKIT_URL` | LiveKit server WebSocket URL | Required |
-| `LIVEKIT_API_KEY` | LiveKit API key | Required |
-| `LIVEKIT_API_SECRET` | LiveKit API secret | Required |
-| `OPENAI_API_KEY` | OpenAI API key | Required |
-| `MAX_TURN_DURATION` | Max speaking time per participant (seconds) | 20 |
-| `ENABLE_TURN_LIMITS` | Enable/disable time limits | True |
-| `LOG_LEVEL` | Logging verbosity (DEBUG, INFO, WARNING) | INFO |
-
-## 🛠️ Troubleshooting
-
-### Agent Not Joining
-
-Run cleanup script to kill processes and clear cache:
-```bash
-./cleanup.sh
-```
-
-Then restart:
-```bash
-python agent.py dev
-```
-
-### macOS BrokenPipeError
-
-This is fixed in the code using `forkserver` multiprocessing context. If you still encounter issues, ensure you're running Python 3.12+.
-
-### No Audio / Microphone Issues
-
-1. Check browser microphone permissions
-2. Ensure microphone is unmuted in browser
-3. Wait for agent's "microphone ready" announcement
-4. Check logs for `"source": "SOURCE_MICROPHONE"` (should not be `SOURCE_UNKNOWN`)
-
-### Responses Not Captured
-
-Check `logs/agent.log` for:
-- `user_input_transcribed` events (should fire when you speak)
-- `"source": "SOURCE_MICROPHONE"` in audio track logs
-- STT transcript entries
-
-## 📁 Project Structure
-
-```
-ai-moderator-agent/
-├── agent.py                    # Main entry point
-├── join_survey.py             # Session creation script (LiveKit only)
-├── zoom_survey.py             # Zoom integration entry point (NEW)
-├── cleanup.sh                 # Cleanup utility
-├── config/
-│   └── agent_config.py        # Configuration management
-├── src/
-│   ├── moderator_agent.py     # Core agent logic
-│   ├── question_loader.py     # Word document parser
-│   ├── participant_manager.py # Participant tracking
-│   ├── survey_transcript.py   # JSON export
-│   ├── survey_data_export.py  # CSV export
-│   ├── audit_logger.py        # Audit logging
-│   └── zoom_bridge/           # Zoom integration (NEW)
-│       ├── recall_bot.py      # Recall.ai bot manager
-│       ├── webhook_handler.py # Webhook event handler
-│       └── audio_forwarder.py # Audio routing LiveKit↔Zoom
-├── topic_questions/           # Survey questions (.docx files)
-├── output/                    # Survey results (CSV + JSON)
-└── logs/                      # Agent logs
-```
-
-## 🔧 Technical Highlights
-
-- **Direct TTS Bypass**: Speaks questions verbatim to prevent AI hallucination
-- **Event-Driven Capture**: Uses `user_input_transcribed` events for STT
-- **Smart Polling**: Monitors speech state with 0.5s checks and 1s grace period
-- **Forkserver Multiprocessing**: Eliminates macOS BrokenPipeError on Python 3.12+
-- **Session Persistence**: `close_on_disconnect=False` keeps session alive
-- **Fuzzy Matching**: Corrects transcription errors using edit distance
-
-## 📝 License
-
-MIT License - see LICENSE file for details
-
-## 🤝 Contributing
-
-This is a private repository. Contact the repository owner for collaboration access.
-
-## 📧 Support
-
-For issues or questions, please open an issue in the GitHub repository.
+Proprietary — internal project.

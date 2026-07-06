@@ -99,6 +99,5 @@ requirements_support_ticket.txt
 
 # Local test files
 join_survey.html
-docs/
 src_data/
 *.jsoncopy

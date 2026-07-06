@@ -132,6 +132,19 @@ The time from a participant stopping speaking to "Thank you, {name}" is governed
 
 Do **not** tune `deadline_manager.py` for ack latency — it only affects STT-failure nudges.
 
+### Turn Engine (`TURN_ENGINE` = `legacy` | `native`)
+The whole turn-wait contract is switchable via the `TURN_ENGINE` secret (default `legacy`; set on the agent as `self._turn_engine`, plumbed `AgentConfig` → `agent.py` → `create_moderator_session`).
+
+- **`legacy`** — `turn_detection="server_vad"` + the full custom `_await_response` polling loop + pause-cooldown/stabilization gates + qual VAD `min_silence=1.2`. Known-good; ack latency ~2.5–5s.
+- **`native`** — LiveKit's semantic EOU model (`MultilingualModel`) owns end-of-turn; qual VAD `min_silence=0.6`; the slim `_await_response_native()` waiter drops cooldown/stabilization/STT-health. **Proven 2026-07-06: fast-path acks ~55–400ms.**
+
+⚠️ **Native only works because of THREE coupled changes in `moderator_agent.py` — do not remove any:**
+1. **`llm_node` returns an empty stream in native.** A model turn detector activates LiveKit's autonomous conversational loop, which auto-generates *off-script questions and phantom participants*. Blocking `llm_node` (the final generation chokepoint) stops all of it. Safe because questions/welcome/acks are direct TTS and `response_analysis.py` uses a **separate** `AsyncOpenAI` client.
+2. **`on_user_turn_completed` is the response PRODUCER in native** (not `user_speech_committed`, which fires unreliably/late with a model detector → ~50s ack freezes). It extracts the transcript from `new_message`, sets `captured_response`/`_response_ready`, and raises `StopResponse` to suppress the auto-reply.
+3. **`_await_response_native()`** — slim waiter; keeps timeout→nudge→skip, 45s turn limit, idle-no-VAD + silence watchdogs.
+
+**Deploy gotcha:** after `lk agent deploy`, a warm/stale replica can keep serving OLD code. "Nothing in the logs + same old behavior" = stale instance, not a failed fix — force a fresh session. (LiveKit warns `min_endpointing_delay`/`turn_detection` move to `turn_handling=TurnHandlingOptions(...)` in v2.0.)
+
 ### Configuration
 - **`config/agent_config.py`** — `AgentConfig` dataclass loaded from env vars. STT providers (OpenAI/Deepgram/Google), TTS providers (OpenAI/Deepgram/ElevenLabs), configurable turn timing, and **env-tunable Silero VAD** (`VAD_ACTIVATION_THRESHOLD`, `VAD_MIN_SILENCE_DURATION`, `VAD_MIN_SPEECH_DURATION`, `VAD_PREFIX_PADDING_DURATION`). Dataclass defaults are OpenAI; production overrides to Deepgram + ElevenLabs via secrets.
 - **`.env.local`** — LOCAL DEV credentials only (LIVEKIT_URL, LIVEKIT_API_KEY/SECRET, OPENAI_API_KEY, DEEPGRAM_API_KEY, ELEVEN_API_KEY, ANAM_API_KEY, ANAM_AVATAR_ID, etc.). Editing this does **not** change the deployed agent — LiveKit Cloud secrets do (see *How to Deploy*).
