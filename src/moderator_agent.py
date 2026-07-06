@@ -265,6 +265,7 @@ class CommunityModeratorAgent(Agent):
         self._ack_already_spoken: bool = False
         self._prewarmed_ack_text: Optional[str] = None
         self._early_ack_handle: Optional[object] = None  # Priority 1: ack fired concurrently with analysis
+        self._turn_engine: str = "legacy"  # "legacy" | "native" — set by create_moderator_session
         self._gentle_warning_in_progress: bool = False
         self._gentle_warning_started_at: Optional[float] = None
         self._analysis_in_progress: bool = False
@@ -752,7 +753,14 @@ class CommunityModeratorAgent(Agent):
 
         Replaces both SMART POLLING loops.  Returns the captured response
         text, ``None`` on timeout/shutdown, or ``"PAUSED"`` sentinel.
+
+        Dispatches to the slim native waiter when TURN_ENGINE=native — there,
+        LiveKit's EOU model owns end-of-turn so the custom endpointing gates
+        are removed. Legacy path (below) is the known-good custom loop.
         """
+        if self._turn_engine == "native":
+            return await self._await_response_native(participant, polling_timeout, tts_fully_spoken)
+
         import time as _time
 
         _saved_tts_estimate = self._estimated_remaining_tts
@@ -919,6 +927,144 @@ class CommunityModeratorAgent(Agent):
             return self.captured_response
         if self.latest_user_response and self.latest_user_response.strip():
             logger.info(f"Rescuing STT fragments as response: '{self.latest_user_response[:100]}...'")
+            return self.latest_user_response.strip()
+
+        return None
+
+    async def _await_response_native(
+        self,
+        participant: str,
+        polling_timeout: float,
+        tts_fully_spoken: bool,
+    ) -> Optional[str]:
+        """Slim waiter for TURN_ENGINE=native.
+
+        LiveKit's semantic EOU model (MultilingualModel) owns end-of-turn, so
+        this DROPS the custom endpointing (pause-cooldown, stabilization,
+        STT-health watchdog, the "wait for silence" continues, and the legacy
+        latest_user_response fragment promotion). It KEEPS: reset, timeout
+        monitor (nudge→skip), PAUSED handling, shutdown/gentle-warning guards,
+        deadline-extension-while-speaking, the silence + idle-no-VAD watchdogs,
+        the delivery-state guard, and the last-resort rescue.
+
+        Sole producer: the EOU-timed user_speech_committed handler, which sets
+        captured_response + _response_ready. On _response_ready we return
+        immediately (after the delivery guard) — EOU already decided the turn
+        is complete.
+        """
+        import time as _time
+
+        _saved_tts_estimate = self._estimated_remaining_tts
+        self._reset_response_flags(participant)
+        self._estimated_remaining_tts = _saved_tts_estimate
+
+        # Start timeout monitor (kept: survey must advance if silent)
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+        self.response_timeout_task = asyncio.create_task(
+            self.monitor_response_timeout(participant, epoch=self._deadline_mgr.epoch)
+        )
+
+        self._deadline_mgr.set_deadline(polling_timeout)
+
+        observer_stt_task: Optional[asyncio.Task] = None
+        if self.observer_mode_enabled:
+            observer_stt_task = asyncio.create_task(self._observer_stt_polling(participant))
+
+        try:
+            while True:
+                remaining = self._deadline_mgr.remaining()
+                if remaining <= 0 and not self.user_currently_speaking and not self._gentle_warning_in_progress:
+                    if self.captured_response is not None:
+                        logger.info("[native] Deadline reached but captured_response exists — processing")
+                    else:
+                        logger.warning(f"[native] Polling deadline reached ({polling_timeout}s effective)")
+                        break
+
+                # Small cap: we return immediately on _response_ready, so this only
+                # governs how often the watchdogs get a chance to run.
+                try:
+                    await asyncio.wait_for(
+                        self._response_ready.wait(),
+                        timeout=min(max(remaining, 0.1), 0.5),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+                if self._shutting_down:
+                    logger.info("[native] _await_response exiting: _shutting_down=True")
+                    break
+
+                if not self.waiting_for_response:
+                    logger.warning("[native] Timeout monitor signaled no-response — exiting")
+                    break
+
+                # ── Pause check ──
+                if self.survey_state == SurveyState.PAUSED:
+                    logger.info("[native] Survey PAUSED — waiting for resume")
+                    observer_identity = self.participant_manager.get_observer_identity()
+                    if observer_identity:
+                        self._set_stt_participant(observer_identity, context="pause_in_await_response_native")
+                    while self.survey_state == SurveyState.PAUSED:
+                        await asyncio.sleep(0.5)
+                    logger.info("[native] Survey RESUMED — exiting for re-ask")
+                    return "PAUSED"
+
+                # ── Gentle warning guard (turn-duration warning kept) ──
+                if self._gentle_warning_in_progress:
+                    if self._gentle_warning_started_at and (_time.time() - self._gentle_warning_started_at) > 8.0:
+                        logger.error("[native] WATCHDOG: _gentle_warning_in_progress stuck >8s — force-clearing")
+                        self._gentle_warning_in_progress = False
+                        self._gentle_warning_started_at = None
+                    else:
+                        if self._response_ready.is_set():
+                            self.captured_response = None
+                            self._response_ready.clear()
+                        continue
+
+                # ── Deadline extension while speaking ──
+                if self._deadline_mgr.is_expired():
+                    if self.user_currently_speaking or self._gentle_warning_in_progress:
+                        self._deadline_mgr.extend_deadline(5.0)
+                        continue
+                    if self.captured_response is None:
+                        logger.warning(f"[native] Polling deadline reached ({polling_timeout}s effective)")
+                        break
+
+                # ── Watchdogs kept: silence + idle-no-VAD (NOT stt-health) ──
+                await self._check_silence_watchdog(participant)
+                await self._check_idle_no_vad(participant, tts_fully_spoken)
+
+                # ── Response ready? EOU already decided the turn is done —
+                #     no cooldown / stabilization / speaking gate. ──
+                if self._response_ready.is_set() and self.captured_response is not None:
+                    if not self._is_delivery_confirmed(self.current_question_num, participant):
+                        _ds_key = self._delivery_key(self.current_question_num, participant)
+                        _ds = self.question_delivery_state.get(_ds_key, "unknown")
+                        logger.warning(
+                            f"[native] DELIVERY GUARD: Discarding response — "
+                            f"delivery_state={_ds} for Q#{self.current_question_num}/{participant}"
+                        )
+                        self.captured_response = None
+                        self._response_ready.clear()
+                        continue
+                    self._silence_confirmed_time = datetime.now()
+                    return self.captured_response
+
+        finally:
+            if observer_stt_task and not observer_stt_task.done():
+                observer_stt_task.cancel()
+                try:
+                    await observer_stt_task
+                except asyncio.CancelledError:
+                    pass
+
+        # Last-resort rescue
+        if self.captured_response:
+            return self.captured_response
+        if self.latest_user_response and self.latest_user_response.strip():
+            logger.info(f"[native] Rescuing STT fragments as response: '{self.latest_user_response[:100]}...'")
             return self.latest_user_response.strip()
 
         return None
@@ -3374,8 +3520,11 @@ class CommunityModeratorAgent(Agent):
         # Quantitative raised from 0.4→0.6 to prevent echo-triggered false turns.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                # Native: EOU owns semantic end-of-turn, so VAD only needs to trigger
+                # the check quickly (0.6). Legacy: keep the long 1.2s silence gate.
+                _qual_ms = 0.6 if self._turn_engine == "native" else 1.2
+                self.agent_session.vad.update_options(min_silence_duration=_qual_ms)
+                logger.info(f"🎙️  VAD updated: min_silence_duration={_qual_ms}s (qualitative, engine={self._turn_engine})")
             elif self.current_question_object.is_quantitative():
                 self.agent_session.vad.update_options(min_silence_duration=0.6)
                 logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
@@ -3800,8 +3949,11 @@ class CommunityModeratorAgent(Agent):
         # DYNAMIC VAD CONFIGURATION: Same echo-hardened thresholds as first loop.
         if self.current_question_object:
             if self.current_question_object.is_qualitative():
-                self.agent_session.vad.update_options(min_silence_duration=1.2)
-                logger.info(f"🎙️  VAD updated: min_silence_duration=1.2s (qualitative question)")
+                # Native: EOU owns semantic end-of-turn, so VAD only needs to trigger
+                # the check quickly (0.6). Legacy: keep the long 1.2s silence gate.
+                _qual_ms = 0.6 if self._turn_engine == "native" else 1.2
+                self.agent_session.vad.update_options(min_silence_duration=_qual_ms)
+                logger.info(f"🎙️  VAD updated: min_silence_duration={_qual_ms}s (qualitative, engine={self._turn_engine})")
             elif self.current_question_object.is_quantitative():
                 self.agent_session.vad.update_options(min_silence_duration=0.6)
                 logger.info(f"🎙️  VAD updated: min_silence_duration=0.6s (quantitative question)")
@@ -4006,6 +4158,7 @@ async def create_moderator_session(
     vad_min_speech_duration: float = 0.15,
     vad_prefix_padding_duration: float = 0.6,
     vad_min_silence_duration: float = 0.55,
+    turn_engine: str = "legacy",
     question_loader: Optional[QuestionLoader] = None,
     participant_manager: Optional[ParticipantManager] = None,
     survey_config: Optional[SurveyConfig] = None,
@@ -4065,6 +4218,7 @@ async def create_moderator_session(
         participant_manager=participant_manager,
         survey_config=survey_config,
     )
+    moderator._turn_engine = (turn_engine or "legacy").strip().lower()
 
     # Store room context for disconnection
     moderator.ctx = ctx
@@ -4293,6 +4447,23 @@ async def create_moderator_session(
         vad_prefix_padding_duration, vad_activation_threshold,
     )
 
+    # ── Turn engine selection (see TURN_ENGINE / turn_engine config) ──────────
+    # native: LiveKit semantic EOU (MultilingualModel) owns end-of-turn, and the
+    #         slim _await_response_native waiter consumes the EOU-timed
+    #         user_speech_committed event (no custom cooldown/stabilization).
+    # legacy: plain server_vad + the full custom polling loop (known-good).
+    _native = (turn_engine or "legacy").strip().lower() == "native"
+    if _native:
+        try:
+            _turn_detection = MultilingualModel()
+        except Exception as e:
+            # Never let a missing/broken EOU model take the agent down.
+            _turn_detection = "server_vad"
+            _native = False
+            logger.warning("Turn engine: EOU model unavailable (%s) — falling back to server_vad/legacy waiter", e)
+    else:
+        _turn_detection = "server_vad"
+
     session = AgentSession(
         stt=stt_instance,
        llm=openai.LLM(
@@ -4301,10 +4472,25 @@ async def create_moderator_session(
         ),
         tts=tts_instance,
         vad=vad_instance,
-        turn_detection="server_vad",  # Enable turn detection for event handling (FIXED: was "manual")
+        turn_detection=_turn_detection,
+        # Endpointing bounds only matter with the EOU model (native): complete
+        # turn → ~min, incomplete → up to max. Harmless under server_vad.
+        min_endpointing_delay=0.4,
+        max_endpointing_delay=5.0,
         allow_interruptions=True,               # Session default; per-call overrides for warnings/acks
         min_interruption_duration=0.5,          # Min user speech to trigger interrupt
         discard_audio_if_uninterruptible=True,  # Drop user audio during non-interruptible TTS
+    )
+
+    # If the EOU model fell back, reflect that on the agent so the waiter matches.
+    if not _native:
+        moderator._turn_engine = "legacy"
+    logger.critical(
+        "🔀 TURN_ENGINE=%s | turn_detection=%s | native_waiter=%s | qual_vad_min_silence=%s",
+        moderator._turn_engine,
+        "MultilingualModel" if _native else "server_vad",
+        "on" if _native else "off",
+        "0.6" if _native else "1.2",
     )
 
     # Set up room event handlers for participant management BEFORE starting session
@@ -5249,8 +5435,11 @@ async def create_moderator_session(
             logger.debug("User paused speaking (turn monitoring continues)")
 
             # IMMEDIATE CAPTURE: Check for response right after user stops speaking
-            # This is faster than waiting for conversation_item_added which can be 15+ seconds late
-            asyncio.create_task(_capture_user_response_immediately())
+            # This is faster than waiting for conversation_item_added which can be 15+ seconds late.
+            # NATIVE: skip this parallel producer entirely — user_speech_committed (EOU-timed) is
+            # the sole producer, and this path uses unanswered[0] (phantom-participant risk).
+            if moderator._turn_engine != "native":
+                asyncio.create_task(_capture_user_response_immediately())
 
         # When user starts speaking
         if event.new_state == "speaking" and event.old_state != "speaking":
@@ -5462,7 +5651,9 @@ async def create_moderator_session(
     logger.critical("=" * 80)
     logger.critical("🚀 AGENT SESSION STARTED WITH NEW EVENT HANDLERS")
     logger.critical("🔍 Listening for: user_input_transcribed (primary), user_state_changed, conversation_item_added (fallback)")
-    logger.critical("🔧 Turn detection: server_vad")
+    logger.critical("🔧 Turn detection: %s (engine=%s)",
+                    "MultilingualModel" if moderator._turn_engine == "native" else "server_vad",
+                    moderator._turn_engine)
     logger.critical("🎙️  STT: Capturing responses via user_input_transcribed event (bypasses LLM flow)")
     logger.critical("⏱️  Polling: Waits for latest_user_response variable (max 30s) to let user finish speaking")
     logger.critical("💾 Response storage: latest_user_response variable -> polling -> JSON/CSV export")
