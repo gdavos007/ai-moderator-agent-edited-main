@@ -3609,7 +3609,7 @@ class CommunityModeratorAgent(Agent):
             if self.current_question_object.is_qualitative():
                 # Native: EOU owns semantic end-of-turn, so VAD only needs to trigger
                 # the check quickly (0.6). Legacy: keep the long 1.2s silence gate.
-                _qual_ms = 0.6 if self._turn_engine == "native" else 1.2
+                _qual_ms = 0.8 if self._turn_engine == "native" else 1.2
                 self.agent_session.vad.update_options(min_silence_duration=_qual_ms)
                 logger.info(f"🎙️  VAD updated: min_silence_duration={_qual_ms}s (qualitative, engine={self._turn_engine})")
             elif self.current_question_object.is_quantitative():
@@ -4038,7 +4038,7 @@ class CommunityModeratorAgent(Agent):
             if self.current_question_object.is_qualitative():
                 # Native: EOU owns semantic end-of-turn, so VAD only needs to trigger
                 # the check quickly (0.6). Legacy: keep the long 1.2s silence gate.
-                _qual_ms = 0.6 if self._turn_engine == "native" else 1.2
+                _qual_ms = 0.8 if self._turn_engine == "native" else 1.2
                 self.agent_session.vad.update_options(min_silence_duration=_qual_ms)
                 logger.info(f"🎙️  VAD updated: min_silence_duration={_qual_ms}s (qualitative, engine={self._turn_engine})")
             elif self.current_question_object.is_quantitative():
@@ -4577,7 +4577,7 @@ async def create_moderator_session(
         moderator._turn_engine,
         "MultilingualModel" if _native else "server_vad",
         "on" if _native else "off",
-        "0.6" if _native else "1.2",
+        "0.8" if _native else "1.2",
     )
 
     # Set up room event handlers for participant management BEFORE starting session
