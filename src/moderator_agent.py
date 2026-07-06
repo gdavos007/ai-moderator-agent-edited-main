@@ -723,24 +723,59 @@ class CommunityModeratorAgent(Agent):
             f"(participant={participant}, epoch={self._deadline_mgr.epoch})"
         )
 
+    def _extract_turn_text(self, new_message) -> str:
+        """Pull plain text out of the ChatMessage LiveKit passes to
+        on_user_turn_completed (content is a list of strings / content parts)."""
+        try:
+            content = getattr(new_message, "content", None)
+            if content is None:
+                return ""
+            if isinstance(content, str):
+                return content.strip()
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                else:
+                    parts.append(getattr(item, "text", None) or str(item))
+            return " ".join(p for p in parts if p).strip()
+        except Exception:
+            return ""
+
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
-        """Suppress LiveKit's automatic post-turn LLM reply in native mode.
+        """NATIVE: this is BOTH the response producer AND the auto-reply suppressor.
 
-        This agent drives ALL speech manually: it reads survey questions verbatim
-        via direct TTS and uses explicit generate_reply() only for specific
-        redirects. It never wants LiveKit's automatic reply. With native turn
-        detection (MultilingualModel), LiveKit engages its conversational loop and
-        auto-generates a reply from `instructions` after every turn — which invents
-        off-script questions and phantom participants (incident 2026-07-06).
+        With a model turn detector (MultilingualModel), on_user_turn_completed is
+        the reliable end-of-turn signal (per LiveKit support), whereas
+        user_speech_committed fires unreliably/late — which left the native slim
+        waiter blocked for ~50s while the answer sat here (incident 2026-07-06).
 
-        Raising StopResponse tells LiveKit to skip reply generation for this turn
-        (agent_activity.py: `except StopResponse: return`). The user_speech_committed
-        event still fires, so the native slim waiter still gets the response.
-
-        Gated to native so legacy behavior is byte-for-byte unchanged.
+        So in native we capture the response HERE (set captured_response +
+        _response_ready, the same contract user_speech_committed provides in legacy)
+        and raise StopResponse to block LiveKit's autonomous reply. The native
+        waiter wakes immediately. Legacy is byte-for-byte unchanged.
         """
         if self._turn_engine == "native":
-            logger.critical("🚫 on_user_turn_completed CALLED (native) — raising StopResponse to block auto-reply")
+            text = self._extract_turn_text(new_message)
+            captured = False
+            if text and _is_committable(text) and self.survey_state == SurveyState.RUNNING:
+                corrected = text
+                if self.current_question_object and self.current_question_object.response_options:
+                    try:
+                        corrected = correct_transcription(text, self.current_question_object.response_options)
+                    except Exception:
+                        corrected = text
+                self.captured_response = corrected
+                self.latest_user_response = corrected
+                self._m_committed_at = datetime.now()
+                self._response_ready.set()
+                captured = True
+                logger.critical("🟢 on_user_turn_completed (native) CAPTURED: %r", corrected[:100])
+            else:
+                logger.critical(
+                    "⚪ on_user_turn_completed (native) no-capture (text=%r committable=%s state=%s)",
+                    (text or "")[:60], _is_committable(text) if text else False, self.survey_state,
+                )
             raise StopResponse()
         # legacy: preserve prior behavior (server_vad doesn't engage this loop)
         return await super().on_user_turn_completed(turn_ctx, new_message)
