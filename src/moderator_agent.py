@@ -740,10 +740,40 @@ class CommunityModeratorAgent(Agent):
         Gated to native so legacy behavior is byte-for-byte unchanged.
         """
         if self._turn_engine == "native":
-            logger.debug("on_user_turn_completed: suppressing auto-reply (native, manual survey flow)")
+            logger.critical("🚫 on_user_turn_completed CALLED (native) — raising StopResponse to block auto-reply")
             raise StopResponse()
         # legacy: preserve prior behavior (server_vad doesn't engage this loop)
         return await super().on_user_turn_completed(turn_ctx, new_message)
+
+    def llm_node(self, chat_ctx, tools, model_settings):
+        """Block the agent's autonomous LLM generation in native mode.
+
+        on_user_turn_completed/StopResponse guards the post-turn reply path, but
+        LiveKit can reach LLM generation through other triggers too. llm_node is
+        the FINAL common chokepoint for every agent LLM generation, so blocking it
+        here suppresses ALL autonomous replies regardless of trigger — which is the
+        correct behavior for this fully-manual agent (it reads questions/acks via
+        direct TTS; off-topic/repeat analysis uses a SEPARATE OpenAI client in
+        response_analysis.py, so it is unaffected).
+
+        Legacy is delegated verbatim (byte-for-byte unchanged). The CRITICAL log
+        gives ground truth on whether/when the LLM was about to speak.
+        """
+        if self._turn_engine == "native":
+            _preview = ""
+            try:
+                items = getattr(chat_ctx, "items", None) or getattr(chat_ctx, "messages", None) or []
+                if items:
+                    _preview = str(getattr(items[-1], "content", items[-1]))[:120]
+            except Exception:
+                pass
+            logger.critical("🚫 llm_node BLOCKED (native) — suppressing autonomous LLM reply | last_ctx=%r", _preview)
+
+            async def _empty():
+                if False:
+                    yield  # make this an async generator that yields nothing
+            return _empty()
+        return super().llm_node(chat_ctx, tools, model_settings)
 
     def _is_quantitative_question(self) -> bool:
         """True when the current question is quantitative/MC (branch key for fast gates)."""
