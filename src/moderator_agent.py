@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from livekit import agents, api
-from livekit.agents import Agent, AgentSession, RoomInputOptions
+from livekit.agents import Agent, AgentSession, RoomInputOptions, StopResponse
 from livekit.plugins import openai, google, silero, noise_cancellation
 from livekit.agents import LanguageCode
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
@@ -722,6 +722,28 @@ class CommunityModeratorAgent(Agent):
             f"{POST_NUDGE_EXTENSION_SECS}s after participant activity detected "
             f"(participant={participant}, epoch={self._deadline_mgr.epoch})"
         )
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Suppress LiveKit's automatic post-turn LLM reply in native mode.
+
+        This agent drives ALL speech manually: it reads survey questions verbatim
+        via direct TTS and uses explicit generate_reply() only for specific
+        redirects. It never wants LiveKit's automatic reply. With native turn
+        detection (MultilingualModel), LiveKit engages its conversational loop and
+        auto-generates a reply from `instructions` after every turn — which invents
+        off-script questions and phantom participants (incident 2026-07-06).
+
+        Raising StopResponse tells LiveKit to skip reply generation for this turn
+        (agent_activity.py: `except StopResponse: return`). The user_speech_committed
+        event still fires, so the native slim waiter still gets the response.
+
+        Gated to native so legacy behavior is byte-for-byte unchanged.
+        """
+        if self._turn_engine == "native":
+            logger.debug("on_user_turn_completed: suppressing auto-reply (native, manual survey flow)")
+            raise StopResponse()
+        # legacy: preserve prior behavior (server_vad doesn't engage this loop)
+        return await super().on_user_turn_completed(turn_ctx, new_message)
 
     def _is_quantitative_question(self) -> bool:
         """True when the current question is quantitative/MC (branch key for fast gates)."""
