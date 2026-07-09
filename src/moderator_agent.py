@@ -4749,7 +4749,7 @@ async def create_moderator_session(
                 persona_config=anam.PersonaConfig(
                     name="Survey Moderator Avatar",
                     avatarId=anam_avatar_id,
-                    avatarModel="cara-3",  # cara-3 is plan-accessible (cara-4 / cara-4-latest 403 for this org)
+                    avatarModel="cara-4-latest",  # NOTE: 403'd for this org on 2026-07-01; revert to cara-3 if avatar fails
                 ),
             )
             await avatar.start(session, room=ctx.room)
@@ -4842,7 +4842,7 @@ async def create_moderator_session(
                                 persona_config=anam.PersonaConfig(
                                     name="Survey Moderator Avatar",
                                     avatarId=anam_avatar_id,
-                                    avatarModel="cara-3",  # cara-3 is plan-accessible (cara-4 / cara-4-latest 403 for this org)
+                                    avatarModel="cara-4-latest",  # NOTE: 403'd for this org on 2026-07-01; revert to cara-3 if avatar fails
                                 ),
                             )
                             await new_avatar.start(session, room=ctx.room)
