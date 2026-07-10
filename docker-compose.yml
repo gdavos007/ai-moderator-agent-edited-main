@@ -32,9 +32,9 @@ services:
   postgres:
     image: postgres:15
     environment:
-      POSTGRES_DB: moderator_agent
-      POSTGRES_USER: moderator_user
-      POSTGRES_PASSWORD: secure_password123
+      POSTGRES_DB: ${POSTGRES_DB:-moderator_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-moderator_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in your .env}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
