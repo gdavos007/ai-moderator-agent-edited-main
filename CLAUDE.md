@@ -50,7 +50,7 @@ lk agent logs            # streams NEW lines only — start it BEFORE reproducin
 # ⚠️ update-secrets does a FULL REPLACE — passing one key wipes the rest. Prefer the dashboard.
 ```
 
-The Anam avatar is selected by the `ANAM_AVATAR_ID` secret. It must be an **avatar id** (see `https://api.anam.ai/v1/avatars`), NOT a **persona id** — passing a persona id fails to render, and since the agent's voice routes through the avatar, the room goes silent. `avatarModel` is pinned to `cara-3` in code (the org lacks access to `cara-4-latest`).
+The Anam avatar is selected by the `ANAM_AVATAR_ID` secret. It must be an **avatar id** (see `https://api.anam.ai/v1/avatars`), NOT a **persona id** — passing a persona id fails to render, and since the agent's voice routes through the avatar, the room goes silent. `avatarModel` is pinned to `cara-4-latest` in code (both the start and reconnect call sites), confirmed working 2026-07-09. (Historical note: `cara-4-latest` 403'd for this org on 2026-07-01 — the fallback then was `cara-3`; if a future 403 appears, revert both sites to `cara-3`.)
 
 ## Other Common Commands
 
