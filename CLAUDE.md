@@ -58,9 +58,6 @@ The Anam avatar is selected by the `ANAM_AVATAR_ID` secret. It must be an **avat
 # Start the agent (production / Docker)
 python agent.py start
 
-# Start a fresh survey session with N participants
-python3 start_fresh_survey.py --participants 3
-
 # Run all tests
 python -m pytest tests/
 
