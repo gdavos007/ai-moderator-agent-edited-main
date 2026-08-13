@@ -59,14 +59,30 @@ class SurveyTranscript:
         logger.info(f"📝 Recorded question #{question_number} to {participant}")
         self._save()
 
-    def add_response(self, question_number: int, participant: str, response_text: str):
-        """Record a participant's response (from STT)"""
+    def add_response(self, question_number: int, participant: str, response_text: str,
+                     finals_text: str = "", trailing_text: str = "",
+                     is_provisional: bool = False):
+        """Record a participant's response (from STT).
+
+        Defect F: validated and unvalidated speech are recorded as SEPARATE
+        fields, never merged inline. `finals_text` was finalised by Deepgram;
+        `trailing_text` is an interim captured when the turn was cut short and
+        may be retracted. An inline marker would pollute both the classifier
+        input and any quote pulled for a client report, so consumers choose:
+        render `finals_text` alone for a conservative transcript, or
+        `finals_text + trailing_text` when completeness matters more.
+
+        `response_text` remains the combined text for existing consumers.
+        """
         self.transcript["conversation"].append({
             "timestamp": datetime.now().isoformat(),
             "type": "response",
             "question_number": question_number,
             "speaker": participant,
-            "text": response_text
+            "text": response_text,
+            "finals_text": finals_text,
+            "trailing_text": trailing_text,
+            "is_provisional": is_provisional,
         })
 
         # Track participants

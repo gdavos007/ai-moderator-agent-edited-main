@@ -92,6 +92,7 @@ from .domain.text_analysis import (
     is_avatar_identity as _is_avatar_identity_fn,
 )
 from .domain.transcription import parse_multi_option_response, correct_transcription
+from .domain.stt_reconstruction import SttTurnAccumulator, ReconstructedResponse
 from .domain.observer import is_observer_command
 from .domain.delivery_state import (
     delivery_key, set_delivery_state, is_delivery_confirmed, is_delivery_full,
@@ -209,6 +210,11 @@ class CommunityModeratorAgent(Agent):
         self.response_fragments = []  # DEPRECATED: No longer used (STT sends cumulative transcripts, not fragments)
         self.last_fragment_time = None  # Track when last transcript was received
         self.last_stt_fragment = ""  # Track the last individual STT fragment (for cumulative detection)
+        # Defect F: authoritative per-turn STT reconstruction. Owner is DECLARED
+        # via reset(participant=...) at each turn start — never inferred.
+        self._stt_turn = SttTurnAccumulator()
+        # DEPRECATED (Defect F): derived from self._stt_turn for back-compat.
+        # Remove after M3 — do not add new readers.
         self._turn_accumulated_text = ""  # Accumulates completed STT utterances within a turn
         self._turn_epoch: int = 0  # Bumped on every full turn reset; used to detect stale-fragment analysis
         # Phase 1 additions: Event-based response capture
@@ -539,44 +545,22 @@ class CommunityModeratorAgent(Agent):
 
         return result
 
-    def _richest_response_for_analysis(self, captured_text: str) -> str:
-        """Pick the richest in-turn response text at analysis time.
+    def _canonical_response(self, captured_text: str = "") -> ReconstructedResponse:
+        """The authoritative reconstruction of the current turn (Defect F).
 
-        Fix A for the 2026-05-12 Christopher demo: the disfluency-extension
-        loop can exit with `captured_text` bound to an early fragment
-        ("Well, I I I think") while STT keeps appending richer text into
-        `self.latest_user_response` ("...advertising, marketing, public
-        affairs campaign...").  Picking the longer candidate avoids
-        analyzing stale text.
+        Replaces the old max-by-length FIX_A heuristic, which could not work:
+        the three legacy buffers are each corrupted differently, so the longest
+        is not the most complete. Verified over 94 real events / 7 turns — see
+        tests/test_stt_reconstruction.py.
 
-        Strategy: choose the longest of {captured_text, latest_user_response,
-        _turn_accumulated_text + " " + last_stt_fragment} that exists.
-        Tie → keep captured_text (caller's chosen value).
-        Logs which source won so we can verify in production.
+        `captured_text` is a fallback ONLY, used when the accumulator holds
+        nothing for this turn (e.g. a capture path that bypassed the STT
+        stream). It is never merged with the accumulator's output.
         """
-        captured = (captured_text or "").strip()
-        latest = (self.latest_user_response or "").strip()
-        acc = (self._turn_accumulated_text or "").strip()
-        last = (self.last_stt_fragment or "").strip()
-        joined = (acc + " " + last).strip() if acc and last and last not in acc else (acc or last)
-
-        candidates = [("captured", captured), ("latest", latest), ("joined_acc", joined)]
-        # Filter empties; pick longest; stable tiebreak prefers captured
-        non_empty = [(label, txt) for label, txt in candidates if txt]
-        if not non_empty:
-            return captured
-
-        chosen_label, chosen_text = max(
-            non_empty,
-            key=lambda lt: (len(lt[1]), 0 if lt[0] == "captured" else -1),
-        )
-
-        if chosen_label != "captured" and len(chosen_text) > len(captured):
-            logger.info(
-                "🩹 FIX_A picked richer response: source=%s len=%d (was captured len=%d) epoch=%s",
-                chosen_label, len(chosen_text), len(captured), self._turn_epoch,
-            )
-        return chosen_text
+        recon = self._stt_turn.result()
+        if recon.text:
+            return recon
+        return ReconstructedResponse((captured_text or "").strip(), "")
 
     async def _analyze_with_filler(self, question_text: str, response_text: str, survey_desc: str, filler_threshold: float = 2.0):
         """Run LLM analysis with a transition filler if it takes too long.
@@ -668,6 +652,8 @@ class CommunityModeratorAgent(Agent):
         self._user_stopped_speaking_at = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        # Defect F: owner is DECLARED here, not inferred from arrival order.
+        self._stt_turn.reset(participant=participant)
         self._turn_epoch += 1
 
         # Flow control
@@ -765,6 +751,24 @@ class CommunityModeratorAgent(Agent):
                         corrected = correct_transcription(text, self.current_question_object.response_options)
                     except Exception:
                         corrected = text
+                # ── Defect F: the accumulator is authoritative, not this. ────
+                # This handler used to blind-overwrite latest_user_response with
+                # the EOU transcript. We no longer prefer either by length —
+                # max-by-length is exactly what Defect F removed, and turn T22
+                # is the counterexample (the longer string held a duplication).
+                # Divergence is logged with BOTH strings so we can decide from
+                # data whether the EOU producer carries Deepgram's punctuated
+                # final-pass corrections. Review after two sessions.
+                _canon = self._canonical_response(corrected)
+                if _canon.text and _canon.text != corrected:
+                    logger.warning(
+                        "🔀 EOU/accumulator divergence (accumulator wins) epoch=%s\n"
+                        "    accumulator(%d)=%r\n"
+                        "    eou_producer(%d)=%r",
+                        self._turn_epoch, len(_canon.text), _canon.text,
+                        len(corrected), corrected,
+                    )
+                corrected = _canon.text or corrected
                 self.captured_response = corrected
                 self.latest_user_response = corrected
                 self._m_committed_at = datetime.now()
@@ -1426,6 +1430,7 @@ class CommunityModeratorAgent(Agent):
             self.response_captured = False
             self.last_stt_fragment = ""
             self._turn_accumulated_text = ""
+            self._stt_turn.reset(participant=participant)  # Defect F: declared owner
             self._turn_epoch += 1
             self.pending_stt_transcript = None
             self.response_fragments = []
@@ -1447,7 +1452,11 @@ class CommunityModeratorAgent(Agent):
         # richer text ("...advertising, marketing, public affairs campaign..."),
         # which lands in `self.latest_user_response` via on_user_input_transcribed.
         # Re-read the buffer at analysis time so we never analyze stale text.
-        response_to_analyze = self._richest_response_for_analysis(captured_text)
+        # Analysis consumes finals+trailing: it wants maximum context and can
+        # tolerate unvalidated text (a truncated input is what produces the
+        # off-topic false positives in Defect E). Persistence splits the two —
+        # see _record_response_to_exports.
+        response_to_analyze = self._canonical_response(captured_text).text
 
         # ── CHECK 3: Unified LLM analysis ──
         question_for_analysis = self.current_question_object.question if self.current_question_object else self.current_question
@@ -1785,7 +1794,20 @@ class CommunityModeratorAgent(Agent):
         captured_text: str,
         question_id: str,
     ) -> None:
-        """Record accepted response to all export targets (transcript, CSV, STT debug)."""
+        """Record accepted response to all export targets (transcript, CSV, STT debug).
+
+        Defect F: this used to persist the raw `captured_text` while the analyzer
+        ran on a different, enriched string — so the client transcript was a
+        systematically different (and lossy) text from the one the agent reasoned
+        about. Both now read the same authoritative reconstruction.
+
+        The accumulator is still populated for this turn at this point: the
+        "accepted" path performs no reset between analysis and this call.
+        """
+        # ── Defect F: single source of truth, shared with the analyzer ───────
+        _canon = self._canonical_response(captured_text)
+        captured_text = _canon.text
+
         # Combine partial answers if any
         if self.accumulated_partial_answer:
             captured_text = f"{self.accumulated_partial_answer} {captured_text}"
@@ -1825,11 +1847,14 @@ class CommunityModeratorAgent(Agent):
             expected_respondent=participant,
         )
 
-        # Survey transcript (JSON)
+        # Survey transcript (JSON) — validated/unvalidated kept separate
         self.survey_transcript.add_response(
             question_number=self.current_question_num,
             participant=actual_speaker,
             response_text=corrected_response,
+            finals_text=_canon.finals,
+            trailing_text=_canon.trailing,
+            is_provisional=_canon.is_provisional,
         )
 
         # CSV export
@@ -1840,7 +1865,19 @@ class CommunityModeratorAgent(Agent):
             question_text=question_text,
             response_options=response_options,
             response_text=corrected_response,
+            finals_text=_canon.finals,
+            trailing_text=_canon.trailing,
+            is_provisional=_canon.is_provisional,
         )
+
+        if _canon.is_provisional:
+            logger.warning(
+                "📎 PROVISIONAL response persisted for %s Q#%s: %d validated chars "
+                "+ %d UNVALIDATED trailing chars (turn cut before Deepgram "
+                "finalised — see Defect D).",
+                actual_speaker, self.current_question_num,
+                len(_canon.finals), len(_canon.trailing),
+            )
 
         # Mark participant as answered
         self.participant_manager.mark_participant_answered(actual_speaker, self.current_question_num)
@@ -1987,6 +2024,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""
+        self._stt_turn.reset(participant=participant)  # Defect F: declared owner
         self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
@@ -2176,6 +2214,7 @@ class CommunityModeratorAgent(Agent):
         self.response_captured = False
         self.last_stt_fragment = ""
         self._turn_accumulated_text = ""
+        self._stt_turn.reset(participant=participant)  # Defect F: declared owner
         self._turn_epoch += 1
         self.pending_stt_transcript = None
         self.response_fragments = []
@@ -2240,6 +2279,7 @@ class CommunityModeratorAgent(Agent):
         self.last_fragment_time = None
         self.actual_respondent = None
         self._turn_accumulated_text = ""  # Fixed: was missing — could carry forward off-topic text
+        self._stt_turn.reset(participant=participant)  # Defect F: declared owner
         self._turn_epoch += 1
 
         # ── Flow control flags ─────────────────────────────────────────
@@ -5316,22 +5356,28 @@ async def create_moderator_session(
         _buf_before = moderator.latest_user_response or ""
         _acc_before = moderator._turn_accumulated_text or ""
 
-        # Detect utterance boundary: when fragment length drops significantly,
-        # STT has started a new utterance rather than extending the previous one.
-        # Accumulate the previous utterance so multi-utterance answers aren't lost.
-        _prev = moderator.last_stt_fragment or ""
-        if _prev and len(new_fragment) < len(_prev) * 0.6 and len(_prev) > 5:
-            # Previous utterance complete — accumulate it
-            if moderator._turn_accumulated_text:
-                moderator._turn_accumulated_text += " " + _prev
-            else:
-                moderator._turn_accumulated_text = _prev
-
-        # Full turn response = accumulated previous utterances + current fragment
-        if moderator._turn_accumulated_text:
-            moderator.latest_user_response = moderator._turn_accumulated_text + " " + new_fragment
-        else:
-            moderator.latest_user_response = new_fragment
+        # ── Defect F: Deepgram marks utterance boundaries explicitly. ────────
+        # The previous code inferred them from relative fragment length
+        # (len(new) < len(prev) * 0.6), which desynchronises permanently when an
+        # interim over-runs and is then retracted — see stt_reconstruction.py.
+        # `_is_final` is read from the event a few lines above.
+        #
+        # add() returns False (never raises) for the rare cross-speaker case, so
+        # this stays a straight line on the hottest path in the agent
+        # (~2562 calls / 690s session). Rejections log CRITICAL inside add().
+        _accepted = moderator._stt_turn.add(
+            new_fragment,
+            is_final=_is_final,
+            participant=moderator.actual_respondent or moderator._current_stt_participant,
+        )
+        if _accepted:
+            _recon = moderator._stt_turn.result()
+            # Analysis consumes finals+trailing (max context, tolerates
+            # unvalidated text). Client-facing persistence splits them — see
+            # _record_response_to_exports.
+            moderator.latest_user_response = _recon.text
+            # DEPRECATED (Defect F): derived for back-compat readers only.
+            moderator._turn_accumulated_text = _recon.finals
 
         moderator.pending_stt_transcript = transcript
         moderator.last_stt_fragment = new_fragment

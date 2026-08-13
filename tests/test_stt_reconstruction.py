@@ -136,16 +136,69 @@ def test_t22_does_not_reintroduce_duplication():
 
 # ── Safety rails called out in review ────────────────────────────────────────
 
-def test_cross_speaker_fragment_is_rejected_loudly():
+def test_cross_speaker_fragment_is_rejected():
     """Finals-based accumulation is only safe because each turn epoch is tagged
     to exactly one participant (verified across 46 epochs / 2 sessions, <=3
-    participants). That sample is small, so a mismatch must fail loudly rather
-    than silently contaminate a transcript."""
+    participants). That sample is small, so a mismatch must be rejected — and
+    logged CRITICAL — rather than silently contaminate a transcript.
+
+    add() returns a bool rather than raising: this is an expected-but-rare
+    condition on the hottest path in the agent, and try/except around every
+    call would obscure the straight-line normal path.
+    """
     mod = _load_module()
     acc = mod.SttTurnAccumulator(participant="gary_")
-    acc.add("I think that I can see this", is_final=True, participant="gary_")
-    with pytest.raises(mod.CrossSpeakerFragment):
-        acc.add("something else entirely", is_final=True, participant="christopher")
+    assert acc.add("I think that I can see this", is_final=True, participant="gary_") is True
+    assert acc.add("something else entirely", is_final=True, participant="christopher") is False
+    assert acc.result().finals == "I think that I can see this", "contaminated"
+
+
+def test_owner_is_declared_never_inferred():
+    """A spillover fragment that wins a race must not be able to claim the turn.
+
+    If the owner were inferred from the first arriving fragment, that fragment
+    would set the owner and every genuine fragment would then be rejected as
+    cross-speaker — strictly worse than the bug being fixed.
+    """
+    mod = _load_module()
+    acc = mod.SttTurnAccumulator()          # no owner declared
+    acc.add("spillover from someone else", is_final=True, participant="christopher")
+    # The stray fragment must NOT have become the owner:
+    acc.reset(participant="gary_")          # owner declared by the caller
+    assert acc.add("the real answer", is_final=True, participant="gary_") is True
+    assert acc.result().finals == "the real answer"
+
+
+def test_reset_seeds_owner_and_clears_state():
+    mod = _load_module()
+    acc = mod.SttTurnAccumulator(participant="a")
+    acc.add("first turn", is_final=True, participant="a")
+    acc.add("interim", is_final=False, participant="a")
+    acc.reset(participant="b")
+    r = acc.result()
+    assert r.finals == "" and r.trailing == "" and r.is_provisional is False
+    assert acc.add("second turn", is_final=True, participant="b") is True
+
+
+def test_trailing_is_latest_not_longest():
+    """Interims retract (RM_Aq5EeHDjAozN t=481.2: 49 chars -> 30-char final).
+    Longest-wins could resurrect text Deepgram withdrew."""
+    mod = _load_module()
+    acc = mod.SttTurnAccumulator(participant="p")
+    acc.add("anchor", is_final=True, participant="p")
+    acc.add("a much longer interim that gets retracted", is_final=False, participant="p")
+    acc.add("shorter retraction", is_final=False, participant="p")
+    assert acc.result().trailing == "shorter retraction"
+
+
+def test_final_supersedes_pending_trailing():
+    mod = _load_module()
+    acc = mod.SttTurnAccumulator(participant="p")
+    acc.add("interim text", is_final=False, participant="p")
+    acc.add("interim text finalised", is_final=True, participant="p")
+    r = acc.result()
+    assert r.trailing == "" and r.is_provisional is False
+    assert r.finals == "interim text finalised"
 
 
 def test_add_is_cheap_on_the_hot_path():

@@ -52,8 +52,16 @@ class SurveyDataExport:
 
     def add_response(self, participant: str, question_number: int, question_id: str,
                      question_text: str, response_options: List[str],
-                     response_text: str):
-        """Add a participant response to the DataFrame"""
+                     response_text: str, finals_text: str = "",
+                     trailing_text: str = "", is_provisional: bool = False):
+        """Add a participant response to the DataFrame.
+
+        Defect F: `finals_text` (validated by Deepgram) and `trailing_text`
+        (unvalidated interim, captured when the turn was cut short) are separate
+        columns. `is_provisional` flags rows whose combined text contains
+        unvalidated speech, so a client-facing export can filter or annotate
+        them without string-parsing an inline marker.
+        """
 
         # Track unique participants
         self.participants.add(participant)
@@ -73,6 +81,9 @@ class SurveyDataExport:
             'question_text': question_text,
             'response_options': options_str,
             'response_text': formatted_response,
+            'finals_text': finals_text,
+            'trailing_text': trailing_text,
+            'is_provisional': is_provisional,
             'timestamp': datetime.now().isoformat()
         }])
 
