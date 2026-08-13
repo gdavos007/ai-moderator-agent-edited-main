@@ -155,6 +155,57 @@ def _count_responses(conversation: List[Dict[str, Any]]) -> int:
     return sum(1 for t in conversation if t.get("type") == "response")
 
 
+def strip_provisional(conversation: List[Dict[str, Any]]) -> tuple:
+    """Remove unvalidated speech before the transcript reaches the report LLM.
+
+    Reports quote CONFIRMED WORDS ONLY. Deepgram retracts interims — session
+    RM_Aq5EeHDjAozN t=481.2 emitted a 49-char interim that became a 30-char
+    final, meaning '. It probably needs' was text the participant had not yet
+    said. Attributing words like that to a named research participant in a
+    client deliverable is a worse failure than the truncation Defect F fixed,
+    so `trailing_text` is stripped here rather than left to an instruction in
+    report_system.md that the model may or may not honour.
+
+    `trailing_text` remains in the stored transcript — this strips it only from
+    the report payload.
+
+    Returns (sanitised_conversation, n_trimmed, n_chars_removed, n_dropped).
+      trimmed = entry had confirmed words; unvalidated tail removed
+      dropped = entry had NO confirmed words at all; nothing quotable remains
+    """
+    sanitised: List[Dict[str, Any]] = []
+    n_trimmed = n_chars = n_dropped = 0
+
+    for entry in conversation:
+        # Pre-Defect-F transcripts have no trailing_text — pass through.
+        if entry.get("type") != "response" or "trailing_text" not in entry:
+            sanitised.append(entry)
+            continue
+
+        trailing = entry.get("trailing_text") or ""
+        finals = entry.get("finals_text") or ""
+        clean = {k: v for k, v in entry.items()
+                 if k not in ("trailing_text", "finals_text", "is_provisional")}
+
+        if not trailing:
+            sanitised.append(clean)
+            continue
+
+        if not finals:
+            # Turn was cut before Deepgram confirmed anything. Nothing can be
+            # quoted; keeping an empty entry invites the model to invent one.
+            n_dropped += 1
+            n_chars += len(trailing)
+            continue
+
+        clean["text"] = finals
+        n_trimmed += 1
+        n_chars += len(trailing)
+        sanitised.append(clean)
+
+    return sanitised, n_trimmed, n_chars, n_dropped
+
+
 def _build_user_content(payload: Dict[str, Any]) -> str:
     """Render the transcript + discussion guide as a single user message.
 
@@ -162,6 +213,17 @@ def _build_user_content(payload: Dict[str, Any]) -> str:
     but not confuse it with its own response format.
     """
     transcript = payload.get("transcript", {}) or {}
+    conversation, n_trimmed, n_chars, n_dropped = strip_provisional(
+        transcript.get("conversation", []) or []
+    )
+    if n_trimmed or n_dropped:
+        # Counter for the loosening decision: how often would provisional text
+        # have reached a client quote? Measure before relaxing this policy.
+        logger.warning(
+            "📎 PROVISIONAL STRIPPED from report payload: %d entries trimmed, "
+            "%d entries dropped (no confirmed words), %d unvalidated chars withheld.",
+            n_trimmed, n_dropped, n_chars,
+        )
     context = {
         "session_id": payload.get("session_id", ""),
         "title": payload.get("title", ""),
@@ -169,7 +231,7 @@ def _build_user_content(payload: Dict[str, Any]) -> str:
         "ended_at": payload.get("ended_at") or transcript.get("session_end", ""),
         "participants": payload.get("participants") or transcript.get("participants", []),
         "questions": payload.get("questions", []),
-        "conversation": transcript.get("conversation", []),
+        "conversation": conversation,
     }
     return (
         "Here is the focus group session data. Produce the structured report.\n\n"
