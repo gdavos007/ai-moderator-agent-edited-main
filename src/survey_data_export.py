@@ -35,6 +35,9 @@ class SurveyDataExport:
             'question_text',
             'response_options',
             'response_text',
+            'finals_text',      # Defect F: validated by Deepgram
+            'trailing_text',    # Defect F: UNVALIDATED interim, may be retracted
+            'is_provisional',   # Defect F: True when response_text includes trailing
             'timestamp'
         ])
 

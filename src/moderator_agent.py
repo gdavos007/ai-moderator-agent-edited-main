@@ -545,6 +545,34 @@ class CommunityModeratorAgent(Agent):
 
         return result
 
+    def _ingest_stt_fragment(self, fragment: str, *, is_final: bool,
+                             participant: Optional[str] = None) -> bool:
+        """Ingest one STT fragment into the authoritative accumulator (Defect F).
+
+        THE HOTTEST PATH IN THE AGENT — ~2562 calls per 690s session. Keep it a
+        straight line: one add(), and on acceptance two attribute writes. No
+        string building here; the accumulator joins lazily in result().
+
+        Deepgram marks utterance boundaries explicitly via `is_final`. The code
+        this replaced inferred them from relative fragment length
+        (len(new) < len(prev) * 0.6), which desynchronises permanently when an
+        interim over-runs and is then retracted — see stt_reconstruction.py.
+
+        Returns True if the fragment was accepted. add() returns False rather
+        than raising for the expected-but-rare cross-speaker case (it logs
+        CRITICAL itself), so callers need no try/except.
+        """
+        if not self._stt_turn.add(fragment, is_final=is_final, participant=participant):
+            return False
+        recon = self._stt_turn.result()
+        # Analysis consumes finals+trailing (max context, tolerates unvalidated
+        # text). Client-facing persistence splits them — see
+        # _record_response_to_exports.
+        self.latest_user_response = recon.text
+        # DEPRECATED (Defect F): derived for back-compat readers only.
+        self._turn_accumulated_text = recon.finals
+        return True
+
     def _canonical_response(self, captured_text: str = "") -> ReconstructedResponse:
         """The authoritative reconstruction of the current turn (Defect F).
 
@@ -1805,7 +1833,21 @@ class CommunityModeratorAgent(Agent):
         "accepted" path performs no reset between analysis and this call.
         """
         # ── Defect F: single source of truth, shared with the analyzer ───────
+        # STRUCTURAL GUARD, not a comment. This function is only correct while
+        # no turn reset runs between analysis and persistence. That ordering
+        # constraint is invisible at the call site, and an invisible ordering
+        # constraint between two functions is exactly how Defect F was created.
+        # If a future refactor moves a reset in here, the accumulator will be
+        # empty and we would silently fall back to the caller's stale string —
+        # i.e. Defect F would return, undetectably. Fail loudly instead.
         _canon = self._canonical_response(captured_text)
+        if not _canon.text and captured_text:
+            logger.error(
+                "🚨 DEFECT-F GUARD: accumulator empty at persistence time for "
+                "Q#%s/%s — a turn reset ran between analysis and persistence. "
+                "Falling back to the caller's string, which may be stale/lossy.",
+                self.current_question_num, participant,
+            )
         captured_text = _canon.text
 
         # Combine partial answers if any
@@ -5356,28 +5398,16 @@ async def create_moderator_session(
         _buf_before = moderator.latest_user_response or ""
         _acc_before = moderator._turn_accumulated_text or ""
 
-        # ── Defect F: Deepgram marks utterance boundaries explicitly. ────────
-        # The previous code inferred them from relative fragment length
-        # (len(new) < len(prev) * 0.6), which desynchronises permanently when an
-        # interim over-runs and is then retracted — see stt_reconstruction.py.
-        # `_is_final` is read from the event a few lines above.
-        #
-        # add() returns False (never raises) for the rare cross-speaker case, so
-        # this stays a straight line on the hottest path in the agent
-        # (~2562 calls / 690s session). Rejections log CRITICAL inside add().
-        _accepted = moderator._stt_turn.add(
+        # ── Defect F: ingest via the authoritative accumulator. ─────────────
+        # Body extracted to CommunityModeratorAgent._ingest_stt_fragment so the
+        # wired path is reachable from tests (tests/test_stt_replay_harness.py)
+        # without standing up a LiveKit session. This handler is now a thin
+        # adapter: unpack the event, delegate, log.
+        moderator._ingest_stt_fragment(
             new_fragment,
             is_final=_is_final,
             participant=moderator.actual_respondent or moderator._current_stt_participant,
         )
-        if _accepted:
-            _recon = moderator._stt_turn.result()
-            # Analysis consumes finals+trailing (max context, tolerates
-            # unvalidated text). Client-facing persistence splits them — see
-            # _record_response_to_exports.
-            moderator.latest_user_response = _recon.text
-            # DEPRECATED (Defect F): derived for back-compat readers only.
-            moderator._turn_accumulated_text = _recon.finals
 
         moderator.pending_stt_transcript = transcript
         moderator.last_stt_fragment = new_fragment
