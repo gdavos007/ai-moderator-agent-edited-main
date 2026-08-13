@@ -172,6 +172,23 @@ FastAPI server (`web/backend/server.py`) with Jinja2 templates providing a brows
 - `survey_transcript_*.json` — full conversation transcript
 - `stt_debug_*.jsonl` / `stt_comparison_*.txt` — STT debugging
 
+## Observability artifacts
+
+Session dumps live in `observability/<session_tag>/`.
+
+`logs.json` and `traces.json` are 5–9MB OTLP exports, ~270k lines each.
+NEVER Read, cat, head, or grep these directly. A default Read returns the
+first ~37 records (0% of session wall time) and looks successful — you will
+silently reason from nothing.
+
+Query them only via `scripts/otlp_tools.py`:
+
+```
+summary | timeline <start> <end> | grep <regex> | speech | turns | latency
+```
+
+`chat_history.json` (~25-30KB) is safe to Read directly.
+
 ## Tests
 
 Tests in `tests/` are unit tests that mirror logic from `moderator_agent.py` rather than importing it directly (due to heavy LiveKit dependencies). When changing core logic like phrase lists or heuristics in the source, corresponding test files must be updated manually. In particular, tests pin constant values (e.g. `test_substance_gate.py` asserts exact `PAUSE_COOLDOWN_*` / `STABILIZATION_*` / `POLL_WAIT_CAP_*`), so **update those assertions in the same commit** when you change a constant.
