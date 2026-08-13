@@ -49,6 +49,9 @@ output/
 *.csv
 *.json
 !package.json
+# Test fixtures are assertion targets and must be tracked (blanket *.json above
+# is aimed at session output, not committed test data).
+!tests/fixtures/*.json
 
 # IDE
 .vscode/
