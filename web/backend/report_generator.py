@@ -194,8 +194,22 @@ def strip_provisional(conversation: List[Dict[str, Any]]) -> tuple:
         if not finals:
             # Turn was cut before Deepgram confirmed anything. Nothing can be
             # quoted; keeping an empty entry invites the model to invent one.
+            #
+            # This removes a participant's contribution from a client report, so
+            # it must be discoverable from a log rather than from the client.
+            # Never observed on real data (46 turns across both sessions all had
+            # confirmed text) — exercised by a synthetic fixture, see
+            # tests/fixtures/report_payload_synthetic.json.
             n_dropped += 1
             n_chars += len(trailing)
+            logger.warning(
+                "📎 PROVISIONAL DROP: removed a participant turn from the report "
+                "payload entirely — speaker=%r timestamp=%s q=%s, %d unvalidated "
+                "chars, ZERO confirmed words. Nothing quotable remained. "
+                "Dropped text (NOT for client use): %r",
+                entry.get("speaker", "?"), entry.get("timestamp", "?"),
+                entry.get("question_number", "?"), len(trailing), trailing[:200],
+            )
             continue
 
         clean["text"] = finals

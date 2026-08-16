@@ -93,6 +93,45 @@ def test_non_response_turns_are_untouched():
     assert out == convo
 
 
+def test_synthetic_fixture_exercises_every_branch_including_the_drop():
+    """The drop-entirely branch has never fired on real data — all 46 turns in
+    both sessions had confirmed text. This synthetic payload keeps it from being
+    untested dead code, since it is the one branch that removes a participant's
+    contribution from a client report."""
+    import json
+    fixture = json.loads(
+        (_ROOT / "tests" / "fixtures" / "report_payload_synthetic.json").read_text(encoding="utf-8")
+    )
+    exp = fixture["expected"]
+    out, trimmed, chars, dropped = _strip()(fixture["conversation"])
+
+    assert (trimmed, dropped, chars) == (exp["n_trimmed"], exp["n_dropped"], exp["n_chars"])
+
+    surviving = [e.get("_id") for e in out if e.get("_id")]
+    assert surviving == exp["surviving_ids"]
+    for dropped_id in exp["dropped_ids"]:
+        assert dropped_id not in surviving
+
+    r2 = next(e for e in out if e.get("_id") == "r2")
+    assert r2["text"] == exp["r2_text_after"]
+    assert "can be high." not in r2["text"]
+
+
+def test_drop_path_logs_warning_with_speaker_and_timestamp(caplog):
+    """If a participant's contribution vanishes from a client report, that must
+    be discoverable from a log rather than from the client."""
+    import logging
+    convo = [{"type": "response", "speaker": "anshita", "timestamp": "2026-08-13T10:00:45",
+              "question_number": 1, "text": "so I would say", "finals_text": "",
+              "trailing_text": "so I would say", "is_provisional": True}]
+    with caplog.at_level(logging.WARNING):
+        out, _, _, dropped = _strip()(convo)
+    assert out == [] and dropped == 1
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "anshita" in logged, "speaker must be named in the log"
+    assert "2026-08-13T10:00:45" in logged, "timestamp must be in the log"
+
+
 def test_counter_totals_across_a_mixed_session():
     """The counter is the input to the loosening decision — it must be right."""
     strip = _strip()

@@ -1,0 +1,74 @@
+{
+  "_source": "SYNTHETIC — hand-authored, not from a session dump.",
+  "_why_synthetic": "The strip_provisional drop-entirely branch (entry with trailing_text but ZERO finals_text) has never fired on real data: all 46 turns across RM_Aq5EeHDjAozN and RM_Txc3zKUpnAWe had confirmed text. Without this fixture that branch is untested dead code, and it is the one branch that removes a participant's contribution from a client report. Entry 'r3' below exercises it.",
+  "_shape": "Mirrors survey_transcript.add_response output after Defect F: response entries carry text / finals_text / trailing_text / is_provisional.",
+  "conversation": [
+    {
+      "timestamp": "2026-08-13T10:00:00",
+      "type": "question",
+      "question_number": 1,
+      "speaker": "agent",
+      "text": "What do you think the value of opinion research is for companies?"
+    },
+    {
+      "_id": "r1",
+      "_case": "fully_confirmed_untouched",
+      "timestamp": "2026-08-13T10:00:12",
+      "type": "response",
+      "question_number": 1,
+      "speaker": "christopher",
+      "text": "When you know what you want to get out of it, it can be incredibly valuable.",
+      "finals_text": "When you know what you want to get out of it, it can be incredibly valuable.",
+      "trailing_text": "",
+      "is_provisional": false
+    },
+    {
+      "_id": "r2",
+      "_case": "trimmed_confirmed_tail_removed",
+      "timestamp": "2026-08-13T10:00:30",
+      "type": "response",
+      "question_number": 1,
+      "speaker": "gary_",
+      "text": "I think the IRR or the return on it can be high.",
+      "finals_text": "I think the IRR or the return on it",
+      "trailing_text": "can be high.",
+      "is_provisional": true
+    },
+    {
+      "_id": "r3",
+      "_case": "DROPPED_no_confirmed_words",
+      "_note": "Turn cut before Deepgram finalised anything. Nothing quotable remains, so the entry is removed from the report payload entirely and a WARNING is logged naming speaker + timestamp.",
+      "timestamp": "2026-08-13T10:00:45",
+      "type": "response",
+      "question_number": 1,
+      "speaker": "anshita",
+      "text": "so I would say the main thing is",
+      "finals_text": "",
+      "trailing_text": "so I would say the main thing is",
+      "is_provisional": true
+    },
+    {
+      "_id": "r4",
+      "_case": "legacy_pre_defect_f_no_new_keys",
+      "timestamp": "2026-08-13T10:01:00",
+      "type": "response",
+      "question_number": 1,
+      "speaker": "justin",
+      "text": "A transcript written before Defect F has none of the new fields."
+    },
+    {
+      "timestamp": "2026-08-13T10:01:10",
+      "type": "acknowledgment",
+      "speaker": "agent",
+      "text": "Thank you, Justin."
+    }
+  ],
+  "expected": {
+    "n_trimmed": 1,
+    "n_dropped": 1,
+    "n_chars": 44,
+    "surviving_ids": ["r1", "r2", "r4"],
+    "dropped_ids": ["r3"],
+    "r2_text_after": "I think the IRR or the return on it"
+  }
+}
