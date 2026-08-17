@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from livekit import agents, api
+from .domain.analysis_deadline import analyze_with_deadline
 from livekit.agents import Agent, AgentSession, RoomInputOptions, StopResponse
 from livekit.plugins import openai, google, silero, noise_cancellation
 from livekit.agents import LanguageCode
@@ -611,66 +612,36 @@ class CommunityModeratorAgent(Agent):
             len(_acc), _acc[-160:],
             len(_last_frag), _last_frag,
         )
-        analysis_task = asyncio.create_task(analyze_response(question_text, response_text, survey_desc))
+        # Defect B: the deadline logic lives in src/domain/analysis_deadline.py
+        # so it can be tested without LiveKit. This function keeps only what
+        # needs the agent: speaking the filler.
+        async def _say_filler():
+            self._analysis_filler_said = True
+            self._transition_filler_said = True  # telemetry only; the guard is _analysis_filler_said
+            logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
+            # #region agent log
+            import json as _json
+            _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}))
+            # #endregion
+            await self._safe_say("One moment...", allow_interruptions=False, context="analysis_filler")
 
-        # Defect B: the filler gets its OWN flag, re-armed per analysis.
-        # It previously shared _transition_filler_said with _fire_early_ack, so
-        # on an early-ack turn the filler was already consumed and a hang
-        # produced pure silence. Session 2 only got a filler because that turn
-        # happened to be post-analysis.
         self._analysis_filler_said = False
 
-        # ── Stage 1: wait `filler_threshold` just to decide whether to speak ──
-        # asyncio.shield() is deliberate here: this wait must NOT cancel the
-        # analysis, it only decides whether to fill the silence.
-        try:
-            result = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=filler_threshold)
-        except asyncio.TimeoutError:
-            if not self._analysis_filler_said and self.agent_session:
-                self._analysis_filler_said = True
-                self._transition_filler_said = True
-                logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
-                # #region agent log
-                import json as _json
-                _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}))
-                # #endregion
-                await self._safe_say("One moment...", allow_interruptions=False, context="analysis_filler")
+        # Assigned, never merely set: a successful analysis writes False here,
+        # so a timeout on one attempt cannot leak into a later retry.
+        result, self._analysis_timed_out = await analyze_with_deadline(
+            analyze_response(question_text, response_text, survey_desc),
+            filler_threshold=filler_threshold,
+            hard_deadline=ANALYSIS_HARD_DEADLINE,
+            on_filler=_say_filler,
+        )
 
-            # ── Stage 2: the REAL deadline (Defect B). ───────────────────────
-            # This is the line that hung for 29.5s. It was `await analysis_task`
-            # with no bound at all — the shielded wait_for above reads like a
-            # deadline but explicitly prevents cancellation, so nothing capped
-            # this. Budget the remaining time and cancel on expiry, or the task
-            # keeps running and can land a stale verdict on a later turn.
-            _remaining = max(ANALYSIS_HARD_DEADLINE - filler_threshold, 0.5)
-            try:
-                result = await asyncio.wait_for(analysis_task, timeout=_remaining)
-            except asyncio.TimeoutError:
-                analysis_task.cancel()
-                self._analysis_timed_out = True
-                logger.error(
-                    "🚨 ANALYSIS DEADLINE EXCEEDED (%.1fs) — failing OPEN: accepting "
-                    "the response as relevant and proceeding. Q#%s participant=%s",
-                    ANALYSIS_HARD_DEADLINE, self.current_question_num, _pid,
-                )
-                # Fail OPEN, not closed. The deterministic guards that matter
-                # most for UX already ran BEFORE this call in
-                # _process_captured_response: is_uncertain_response (CHECK 1)
-                # and is_repeat_request (CHECK 2). So a timeout only forfeits
-                # the LLM-only refinements (off-topic, partial-answer,
-                # already-answered). Blocking the turn instead would reproduce
-                # the 29.5s of dead air this fix exists to remove — a possibly
-                # unrefined transcript entry is the cheaper failure, and it is
-                # flagged via analysis_timed_out in the export.
-                result = ResponseAnalysis(
-                    is_relevant=True,
-                    is_already_answered_claim=False,
-                    is_repeat_request=False,
-                    partial_repeat_status="NO_REPEAT",
-                    partial_answer="",
-                    unanswered_questions="",
-                )
-
+        if self._analysis_timed_out:
+            logger.error(
+                "🚨 ANALYSIS DEADLINE EXCEEDED (%.1fs) — failing OPEN: accepting "
+                "the response as relevant and proceeding. Q#%s participant=%s",
+                ANALYSIS_HARD_DEADLINE, self.current_question_num, _pid,
+            )
         analysis_duration = (datetime.now() - self._analysis_start_time).total_seconds()
         logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
 

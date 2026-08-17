@@ -11,9 +11,10 @@ filler trigger rather than a deadline. The line that actually hung was a bare
 was constructed with no timeout and no max_retries (SDK defaults: 600s, 2
 retries -> ~30 minute worst case).
 
-Per CLAUDE.md these tests mirror the control flow rather than importing
-moderator_agent (heavy LiveKit deps). The mirrored shape below is the same
-two-stage structure as the source; if that changes, update this file.
+These tests import the real implementation from src/domain/analysis_deadline.py.
+It has no LiveKit dependency, so it loads without executing src/__init__.py
+(which eagerly imports moderator_agent). No mirror — the tests and the shipped
+code are the same function.
 """
 
 import asyncio
@@ -32,40 +33,26 @@ def _constants():
     spec.loader.exec_module(mod)
     return mod
 
-
-# ── Mirror of the two-stage control flow in _analyze_with_filler ─────────────
-
-class _FailOpen:
-    """Stand-in for the fail-open ResponseAnalysis."""
-    is_relevant = True
-    is_repeat_request = False
-    is_already_answered_claim = False
-    partial_repeat_status = "NO_REPEAT"
+# ── Load the real implementation ─────────────────────────────────────────────
 
 
-async def analyze_with_deadline(analysis_coro, *, filler_threshold, hard_deadline,
-                                on_filler=None):
-    """Mirrors src/moderator_agent.py::_analyze_with_filler.
+def _load_analysis_deadline():
+    import sys, types
+    for name in ("src", "src.domain"):
+        if name not in sys.modules:
+            m = types.ModuleType(name)
+            m.__path__ = [str(_ROOT / name.replace(".", "/"))]
+            sys.modules[name] = m
+    spec = importlib.util.spec_from_file_location(
+        "src.domain.analysis_deadline",
+        _ROOT / "src" / "domain" / "analysis_deadline.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["src.domain.analysis_deadline"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
-    Returns (result, timed_out). Stage 1 is shielded ON PURPOSE — it decides
-    whether to speak, and must not cancel the analysis. Stage 2 is the real
-    deadline and DOES cancel.
-    """
-    task = asyncio.create_task(analysis_coro)
-    filler_said = False
-    try:
-        return await asyncio.wait_for(asyncio.shield(task), timeout=filler_threshold), False
-    except asyncio.TimeoutError:
-        if not filler_said:
-            filler_said = True
-            if on_filler:
-                on_filler()
-        remaining = max(hard_deadline - filler_threshold, 0.5)
-        try:
-            return await asyncio.wait_for(task, timeout=remaining), False
-        except asyncio.TimeoutError:
-            task.cancel()
-            return _FailOpen(), True
+
+analyze_with_deadline = _load_analysis_deadline().analyze_with_deadline
 
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -173,3 +160,30 @@ async def test_stage_one_shield_does_not_kill_a_merely_slow_call():
     result, timed_out = await analyze_with_deadline(
         slow(), filler_threshold=0.02, hard_deadline=1.0)
     assert result == "REAL" and timed_out is False
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_leak_into_the_next_analysis():
+    """Regression guard for the retry leak.
+
+    The agent assigns `self._analysis_timed_out = timed_out` on every call. That
+    is only safe if a SUCCESSFUL analysis reports False — including immediately
+    after one that timed out. An earlier version SET the flag True on timeout and
+    relied on four scattered turn-level resets to clear it; the retry path in
+    _process_captured_response crossed none of them, so a validated response was
+    persisted as analysis_timed_out=True.
+    """
+    async def hang():
+        await asyncio.sleep(30)
+
+    async def quick():
+        await asyncio.sleep(0.01)
+        return "REAL"
+
+    _, first = await analyze_with_deadline(
+        hang(), filler_threshold=0.05, hard_deadline=0.30)
+    assert first is True, "the hang must time out"
+
+    result, second = await analyze_with_deadline(
+        quick(), filler_threshold=0.05, hard_deadline=0.30)
+    assert second is False, "a successful analysis must report False, not inherit True"
+    assert result == "REAL"
