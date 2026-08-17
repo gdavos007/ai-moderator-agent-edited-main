@@ -643,11 +643,19 @@ class CommunityModeratorAgent(Agent):
                 ANALYSIS_HARD_DEADLINE, self.current_question_num, _pid,
             )
         analysis_duration = (datetime.now() - self._analysis_start_time).total_seconds()
-        logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
+        if self._analysis_timed_out:
+            # NOT the call's true duration — it was abandoned at the deadline.
+            # Marked so timeouts can be excluded when re-sizing
+            # ANALYSIS_HARD_DEADLINE from this series. A bare 6000 here would
+            # make the deadline look like a natural ceiling and hide the very
+            # outliers it exists to catch.
+            logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f} timed_out=1")
+        else:
+            logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
 
         # #region agent log
         import json as _json
-        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "timed_out": self._analysis_timed_out,"filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
         # #endregion
 
         return result, analysis_duration
