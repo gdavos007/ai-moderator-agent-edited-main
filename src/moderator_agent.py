@@ -257,7 +257,13 @@ class CommunityModeratorAgent(Agent):
         self.pause_start_time: Optional[datetime] = None  # When pause started
         self.accumulated_pause_duration: float = 0.0  # Total paused time for current turn
         self._response_processing_start: Optional[datetime] = None  # LATENCY TRACKING: When response processing began
-        self._transition_filler_said: bool = False  # One-time filler guard per turn transition
+        # Telemetry only. The filler guard is now _analysis_filler_said (below);
+        # nothing branches on this — it is read solely by two _debug_log_write
+        # payloads as "filler_spoken". Kept under the old name because
+        # src/domain/turn_state.py writes it by name at 3 sites, plus 3 test
+        # files; renaming means touching the early-ack path, which belongs to
+        # Defect D. Fold the rename into that work.
+        self._transition_filler_said: bool = False
         # Defect B: filler guard owned by the analysis path, re-armed per
         # analysis so an early ack can't consume it.
         self._analysis_filler_said: bool = False
