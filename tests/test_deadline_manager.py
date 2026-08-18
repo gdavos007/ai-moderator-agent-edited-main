@@ -10,6 +10,7 @@ from src.domain.constants import (
     IDLE_NO_VAD_TIMEOUT,
     TTS_SAFETY_MARGIN,
     POST_NUDGE_EXTENSION_SECS,
+    STT_NUDGE_VAD_THRESHOLD
 )
 
 
@@ -121,19 +122,29 @@ class TestDeadline:
 # ── STT health watchdog tests ────────────────────────────────────────────────
 
 class TestCheckSttHealth:
-    def test_fires_after_6s_no_stt(self):
+    def test_fires_after_3s_no_stt(self):
         dm = DeadlineManager()
         signal = dm.check_stt_health(
             has_response=False, has_stt_transcript=False,
-            first_vad_seconds_ago=7.0, user_speaking=False,
+            first_vad_seconds_ago=4.0, user_speaking=False,
         )
         assert signal == WatchdogSignal.STT_NUDGE
 
-    def test_does_not_fire_under_6s(self):
+    def test_does_not_fire_under_3s(self):
         dm = DeadlineManager()
         signal = dm.check_stt_health(
             has_response=False, has_stt_transcript=False,
-            first_vad_seconds_ago=5.0, user_speaking=False,
+            first_vad_seconds_ago=2.0, user_speaking=False,
+        )
+        assert signal == WatchdogSignal.NONE
+
+    def test_does_not_fire_exactly_at_the_threshold(self):
+        """The check is `> STT_NUDGE_VAD_THRESHOLD`, so the threshold itself
+        must not fire. Guards against a `>` / `>=` slip during retuning."""
+        dm = DeadlineManager()
+        signal = dm.check_stt_health(
+            has_response=False, has_stt_transcript=False,
+            first_vad_seconds_ago=STT_NUDGE_VAD_THRESHOLD, user_speaking=False,
         )
         assert signal == WatchdogSignal.NONE
 
