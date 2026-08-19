@@ -15,6 +15,7 @@ from .constants import (
     SILENCE_WATCHDOG_TIMEOUT,
     IDLE_NO_VAD_TIMEOUT,
     TTS_SAFETY_MARGIN,
+    STT_NUDGE_VAD_THRESHOLD
 )
 
 logger = logging.getLogger(__name__)
@@ -174,7 +175,7 @@ class DeadlineManager:
         """Check if STT health nudge should fire.
 
         Fires when VAD detected speech but no STT transcripts arrived
-        within 6 seconds, and user has stopped speaking.
+        within STT_NUDGE_VAD_THRESHOLD seconds, and user has stopped speaking.
 
         Args:
             has_response: True if captured_response or latest_user_response exists
@@ -192,7 +193,7 @@ class DeadlineManager:
             return WatchdogSignal.NONE
         if user_speaking:
             return WatchdogSignal.NONE
-        if first_vad_seconds_ago > 3.0:
+        if first_vad_seconds_ago > STT_NUDGE_VAD_THRESHOLD:
             self._stt_nudge_given = True
             return WatchdogSignal.STT_NUDGE
         return WatchdogSignal.NONE

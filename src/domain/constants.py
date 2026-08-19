@@ -120,6 +120,12 @@ STABILIZATION_QUALITATIVE = 1.2
 POLL_WAIT_CAP_QUANTITATIVE = 0.4
 POLL_WAIT_CAP_DEFAULT = 2.0
 
+# STT-health nudge: fires when VAD heard speech but no transcript arrived at
+# all — i.e. STT itself is failing, not slow turn-taking. Lowered 6.0 -> 3.0 in
+# 0dbba0e (2026-06-03) with no recorded reasoning; the test and the docstring
+# were not updated and drifted for two months.
+STT_NUDGE_VAD_THRESHOLD = 3.0
+
 
 # ── Avatar health states ─────────────────────────────────────────────────────
 
