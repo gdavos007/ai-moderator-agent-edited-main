@@ -4786,6 +4786,15 @@ async def create_moderator_session(
             return True
         return False
 
+    # Defect A: agent.py gates the welcome on presence and needs this exact
+    # predicate. Exposed rather than reimplemented — there are already four
+    # near-duplicate "is this a human" filters in this codebase and a fifth
+    # would drift. agent.py FAILS CLOSED if this attribute is missing (it
+    # refuses to start the session), and tests/test_welcome_presence_gate.py
+    # asserts the attachment, so a refactor that drops this line is caught at
+    # test time rather than by a participant.
+    moderator._has_human_participant_now = _has_human_participant_now
+
     if moderator._audio_only_mode:
         logger.info("AVATAR_LIFECYCLE AUDIO_ONLY_MODE enabled — skipping avatar entirely")
         moderator._set_avatar_state(AVATAR_STATE_IDLE, reason="audio_only_mode")
