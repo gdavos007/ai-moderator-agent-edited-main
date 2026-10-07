@@ -32,6 +32,12 @@ _DEFAULT_MODEL = os.environ.get("REPORT_MODEL", "gpt-4o-2024-08-06")
 
 MIN_RESPONSES_FOR_FULL_REPORT = 1
 
+# Report generation is a background task, not in the conversation loop, so it can
+# afford a far longer bound than the moderator's 6s classifier deadline — but it
+# must still have one. A whole transcript through gpt-4o takes tens of seconds.
+REPORT_CLIENT_TIMEOUT = float(os.environ.get("REPORT_CLIENT_TIMEOUT", "120"))
+REPORT_CLIENT_RETRIES = int(os.environ.get("REPORT_CLIENT_RETRIES", "1"))
+
 
 # --------------------------------------------------------------------------- #
 # JSON Schema for structured output
@@ -236,7 +242,13 @@ async def _call_openai(system_prompt: str, user_content: str) -> Dict[str, Any]:
     """Call OpenAI chat.completions with strict json_schema response format."""
     import openai as openai_client  # local import so the module is importable without the SDK
 
-    client = openai_client.AsyncOpenAI()
+    # Bound the call. Without these the SDK defaults apply — a 600s timeout with
+    # 2 retries, i.e. a ~30 minute worst case on a request a user is waiting on.
+    # Same defect class as the moderator's relevance classifier (Defect B), and
+    # a hung report is client-facing even though it is not in the room.
+    client = openai_client.AsyncOpenAI(
+        timeout=REPORT_CLIENT_TIMEOUT, max_retries=REPORT_CLIENT_RETRIES
+    )
     resp = await client.chat.completions.create(
         model=_DEFAULT_MODEL,
         messages=[
