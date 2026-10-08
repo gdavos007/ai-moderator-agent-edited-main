@@ -458,6 +458,16 @@ async def entrypoint(ctx: agents.JobContext):
         # avatar is lazy-started by the first human it acted as a presence
         # gate by accident — then failed OPEN into an empty room when its 30s
         # expired (RM_Aq5EeHDjAozN: 59.3s of welcome, 0.6s of it audible).
+        #
+        # Arm the no-upload flag BEFORE the wait, and clear it only once the
+        # welcome has actually been spoken. Setting it per-exit-branch instead
+        # leaves the whole silent wait unguarded: a cancellation in that window
+        # (room deleted, deploy drain, disconnect) runs no branch at all and
+        # posts an empty transcript as a ghost session in the report portal.
+        # Observer mode returns above this point and delivers its own welcome,
+        # so it never sets the flag and uploads exactly as before.
+        moderator._ended_before_survey_started = True
+
         _has_human = getattr(moderator, "_has_human_participant_now", None)
         if _has_human is None:
             # Fail CLOSED. This predicate is attached unconditionally in
@@ -473,7 +483,6 @@ async def entrypoint(ctx: agents.JobContext):
                 "deliver the welcome; ending job. This is a wiring regression: "
                 "see moderator._has_human_participant_now in create_moderator_session."
             )
-            moderator._ended_before_survey_started = True
             ctx.shutdown(reason="presence_predicate_missing")
             return
 
@@ -491,7 +500,6 @@ async def entrypoint(ctx: agents.JobContext):
                 f"(waited {_presence_waited:.1f}s) — ending job without speaking. "
                 "This should never happen in normal use; check the dispatch/join flow."
             )
-            moderator._ended_before_survey_started = True
             ctx.shutdown(reason="no_participant_joined")
             return
         logger.info(
@@ -534,10 +542,31 @@ async def entrypoint(ctx: agents.JobContext):
                     f"welcome may desync"
                 )
 
+        # ── Re-check presence at the point of use ────────────────────────
+        # The avatar leg above can take up to AVATAR_WAIT_TIMEOUT +
+        # AVATAR_WARMUP_GRACE (~32s) when Anam is struggling to connect, and
+        # the presence check happened before it. A participant who joined and
+        # then left inside that window would get the full 59s welcome spoken
+        # into an empty room — Defect A again, through a narrower window.
+        # Presence must be true when we SPEAK, not 32 seconds earlier.
+        if not _has_human():
+            logger.critical(
+                "PRESENCE_GATE participant left during the avatar warm-up — "
+                "ending job without speaking rather than delivering the welcome "
+                "to an empty room."
+            )
+            ctx.shutdown(reason="participant_left_before_welcome")
+            return
+
         # WELCOME SECTION
         # Use welcome from survey config or default
         logger.info("Delivering welcome message...")
         wait_seconds = await handle_welcome_section(session, question_loader, config)
+
+        # The welcome has now actually been spoken, so this session is real and
+        # its transcript is worth uploading. Everything before this point is a
+        # session nobody attended (see the flag's arming above).
+        moderator._ended_before_survey_started = False
 
         # Smart waiting for participants - monitor for new joiners
         logger.info(f"Waiting {wait_seconds} seconds for participants to fully connect and unmute...")
