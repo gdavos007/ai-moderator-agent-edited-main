@@ -139,6 +139,21 @@ ANALYSIS_CLIENT_TIMEOUT = 8.0   # > ANALYSIS_HARD_DEADLINE so ours fires first
 ANALYSIS_CLIENT_RETRIES = 1
 
 
+# ── Welcome presence gate (Defect A) ─────────────────────────────────────────
+# How long the agent waits for the first human participant before giving up and
+# ending the job WITHOUT speaking. Sized from observed data: session
+# RM_Aq5EeHDjAozN had a 89.0s gap between agent dispatch and the first human
+# join, so any bound in the tens of seconds would fire during a normal-but-slow
+# join. 10 minutes is far beyond any real join delay — if this fires, something
+# is wrong with dispatch or the join flow, not with the participant.
+# NOT a latency knob: the agent is silent for the whole wait.
+PARTICIPANT_WAIT_TIMEOUT = 600.0
+
+# How often the presence gate re-checks for a human. The agent is idle and
+# silent during this wait, so a slow poll costs nothing.
+PARTICIPANT_WAIT_POLL_INTERVAL = 0.5
+
+
 # ── Avatar health states ─────────────────────────────────────────────────────
 
 AVATAR_STATE_IDLE = "idle"

@@ -37,6 +37,11 @@ from livekit import agents
 
 from config.agent_config import AgentConfig, get_moderator_instructions
 from src.moderator_agent import create_moderator_session, SurveyState
+from src.domain.presence_gate import wait_for_presence
+from src.domain.constants import (
+    PARTICIPANT_WAIT_TIMEOUT,
+    PARTICIPANT_WAIT_POLL_INTERVAL,
+)
 from src.question_loader import QuestionLoader
 from src.participant_manager import ParticipantManager
 from src.survey_config import SurveyConfigManager, SurveyConfig
@@ -156,6 +161,13 @@ async def _upload_transcript_on_shutdown(moderator) -> None:
     — it cannot block avatar cleanup or entrypoint completion. Exceptions are
     logged and swallowed; failure is never fatal.
     """
+    # Defect A: the presence gate can end the job before the welcome is ever
+    # spoken. That session has a session_id but no conversation, and uploading
+    # it creates a ghost row in the report portal for a session nobody attended.
+    if getattr(moderator, "_ended_before_survey_started", False):
+        logger.info("📤 Skipping transcript upload: session ended before the survey started")
+        return
+
     upload_url = os.environ.get("REPORT_UPLOAD_URL")
     upload_secret = os.environ.get("REPORT_UPLOAD_SECRET")
     if not (upload_url and upload_secret):
@@ -439,11 +451,67 @@ async def entrypoint(ctx: agents.JobContext):
 
         # ========== NORMAL MODE: Standard survey flow ==========
 
-        # If the avatar is configured but is still starting up (lazy-start
-        # triggered by participant_connected), wait for it to reach CONNECTED
-        # and then allow its video pipeline a short warm-up before delivering
-        # the welcome. Otherwise the first sentence plays before Anam's
-        # lip-sync pipeline has primed, causing the voice/avatar desync.
+        # ── Leg 1 of 2: PRESENCE (Defect A) ──────────────────────────────
+        # The intro is non-negotiable and every participant hears it in full,
+        # so the welcome waits for a human rather than running on a timer.
+        # Previously the avatar wait below was the only gate, and because the
+        # avatar is lazy-started by the first human it acted as a presence
+        # gate by accident — then failed OPEN into an empty room when its 30s
+        # expired (RM_Aq5EeHDjAozN: 59.3s of welcome, 0.6s of it audible).
+        #
+        # Arm the no-upload flag BEFORE the wait, and clear it only once the
+        # welcome has actually been spoken. Setting it per-exit-branch instead
+        # leaves the whole silent wait unguarded: a cancellation in that window
+        # (room deleted, deploy drain, disconnect) runs no branch at all and
+        # posts an empty transcript as a ghost session in the report portal.
+        # Observer mode returns above this point and delivers its own welcome,
+        # so it never sets the flag and uploads exactly as before.
+        moderator._ended_before_survey_started = True
+
+        _has_human = getattr(moderator, "_has_human_participant_now", None)
+        if _has_human is None:
+            # Fail CLOSED. This predicate is attached unconditionally in
+            # create_moderator_session, so it either works on every session or
+            # none — there is no flaky middle. Refusing to start means a build
+            # that lost the wiring is caught by the first session, before
+            # anyone is in the room; delivering the welcome anyway would ship
+            # Defect A silently restored and we would hear about it from a
+            # participant.
+            logger.critical(
+                "PRESENCE_GATE _has_human_participant_now missing on moderator — "
+                "cannot determine whether anyone is in the room. Refusing to "
+                "deliver the welcome; ending job. This is a wiring regression: "
+                "see moderator._has_human_participant_now in create_moderator_session."
+            )
+            ctx.shutdown(reason="presence_predicate_missing")
+            return
+
+        logger.info("PRESENCE_GATE waiting for first human participant before welcome...")
+        _presence_start = asyncio.get_event_loop().time()
+        _present = await wait_for_presence(
+            _has_human,
+            timeout=PARTICIPANT_WAIT_TIMEOUT,
+            poll_interval=PARTICIPANT_WAIT_POLL_INTERVAL,
+        )
+        _presence_waited = asyncio.get_event_loop().time() - _presence_start
+        if not _present:
+            logger.critical(
+                f"PRESENCE_GATE no human joined within {PARTICIPANT_WAIT_TIMEOUT:.0f}s "
+                f"(waited {_presence_waited:.1f}s) — ending job without speaking. "
+                "This should never happen in normal use; check the dispatch/join flow."
+            )
+            ctx.shutdown(reason="no_participant_joined")
+            return
+        logger.info(
+            f"PRESENCE_GATE human present after {_presence_waited:.1f}s — proceeding to avatar wait"
+        )
+
+        # ── Leg 2 of 2: AVATAR WARM-UP (lip-sync, not presence) ──────────
+        # A human is now in the room, so the avatar has already been
+        # lazy-started by on_participant_connected and this timeout measures a
+        # real connection attempt rather than an event that cannot happen yet.
+        # Without the grace, the first sentence plays before Anam's lip-sync
+        # pipeline has primed, causing the voice/avatar desync.
         if os.environ.get("ANAM_AVATAR_ID") and not moderator._audio_only_mode:
             AVATAR_WAIT_TIMEOUT = 30.0  # Anam cold-start can exceed 10s on slow links
             AVATAR_WARMUP_GRACE = 2.0   # let video pipeline stabilize post-CONNECT
@@ -474,10 +542,31 @@ async def entrypoint(ctx: agents.JobContext):
                     f"welcome may desync"
                 )
 
+        # ── Re-check presence at the point of use ────────────────────────
+        # The avatar leg above can take up to AVATAR_WAIT_TIMEOUT +
+        # AVATAR_WARMUP_GRACE (~32s) when Anam is struggling to connect, and
+        # the presence check happened before it. A participant who joined and
+        # then left inside that window would get the full 59s welcome spoken
+        # into an empty room — Defect A again, through a narrower window.
+        # Presence must be true when we SPEAK, not 32 seconds earlier.
+        if not _has_human():
+            logger.critical(
+                "PRESENCE_GATE participant left during the avatar warm-up — "
+                "ending job without speaking rather than delivering the welcome "
+                "to an empty room."
+            )
+            ctx.shutdown(reason="participant_left_before_welcome")
+            return
+
         # WELCOME SECTION
         # Use welcome from survey config or default
         logger.info("Delivering welcome message...")
         wait_seconds = await handle_welcome_section(session, question_loader, config)
+
+        # The welcome has now actually been spoken, so this session is real and
+        # its transcript is worth uploading. Everything before this point is a
+        # session nobody attended (see the flag's arming above).
+        moderator._ended_before_survey_started = False
 
         # Smart waiting for participants - monitor for new joiners
         logger.info(f"Waiting {wait_seconds} seconds for participants to fully connect and unmute...")
