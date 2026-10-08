@@ -59,14 +59,19 @@ class SurveyTranscript:
         logger.info(f"📝 Recorded question #{question_number} to {participant}")
         self._save()
 
-    def add_response(self, question_number: int, participant: str, response_text: str):
+    def add_response(self, question_number: int, participant: str, response_text: str,
+                     analysis_timed_out: bool = False):
         """Record a participant's response (from STT)"""
         self.transcript["conversation"].append({
             "timestamp": datetime.now().isoformat(),
             "type": "response",
             "question_number": question_number,
             "speaker": participant,
-            "text": response_text
+            "text": response_text,
+            # Defect B: True when the relevance classifier blew its deadline
+            # and we failed open. The response was accepted WITHOUT LLM
+            # validation — visible rather than assumed.
+            "analysis_timed_out": analysis_timed_out,
         })
 
         # Track participants

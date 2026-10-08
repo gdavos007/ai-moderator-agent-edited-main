@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 
 from livekit import agents, api
+from .domain.analysis_deadline import analyze_with_deadline
 from livekit.agents import Agent, AgentSession, RoomInputOptions, StopResponse
 from livekit.plugins import openai, google, silero, noise_cancellation
 from livekit.agents import LanguageCode
@@ -74,6 +75,7 @@ from .domain.constants import (
     MIN_COMMITTED_CHARS, PAUSE_COOLDOWN_QUANTITATIVE, PAUSE_COOLDOWN_QUALITATIVE,
     STABILIZATION_QUANTITATIVE, STABILIZATION_QUALITATIVE,
     POLL_WAIT_CAP_QUANTITATIVE, POLL_WAIT_CAP_DEFAULT,
+    ANALYSIS_HARD_DEADLINE, ANALYSIS_CLIENT_TIMEOUT, ANALYSIS_CLIENT_RETRIES,
     AVATAR_STATE_IDLE, AVATAR_STATE_STARTING, AVATAR_STATE_CONNECTED,
     AVATAR_STATE_DISCONNECTED, AVATAR_STATE_RECONNECTING, AVATAR_STATE_FAILED,
     ANAM_AVATAR_IDENTITY,
@@ -255,7 +257,19 @@ class CommunityModeratorAgent(Agent):
         self.pause_start_time: Optional[datetime] = None  # When pause started
         self.accumulated_pause_duration: float = 0.0  # Total paused time for current turn
         self._response_processing_start: Optional[datetime] = None  # LATENCY TRACKING: When response processing began
-        self._transition_filler_said: bool = False  # One-time filler guard per turn transition
+        # Telemetry only. The filler guard is now _analysis_filler_said (below);
+        # nothing branches on this — it is read solely by two _debug_log_write
+        # payloads as "filler_spoken". Kept under the old name because
+        # src/domain/turn_state.py writes it by name at 3 sites, plus 3 test
+        # files; renaming means touching the early-ack path, which belongs to
+        # Defect D. Fold the rename into that work.
+        self._transition_filler_said: bool = False
+        # Defect B: filler guard owned by the analysis path, re-armed per
+        # analysis so an early ack can't consume it.
+        self._analysis_filler_said: bool = False
+        # Defect B: True when the classifier blew its deadline and we failed
+        # open. Surfaced in the export so unvalidated classification is visible.
+        self._analysis_timed_out: bool = False
         self._analysis_start_time: Optional[datetime] = None  # For analysis_ms metric
         self._silence_confirmed_time: Optional[datetime] = None  # For silence_confirmation_ms metric
         self.turn_time_exceeded: bool = False  # Flag set when turn monitor detects time exceeded and user stopped
@@ -604,27 +618,50 @@ class CommunityModeratorAgent(Agent):
             len(_acc), _acc[-160:],
             len(_last_frag), _last_frag,
         )
-        analysis_task = asyncio.create_task(analyze_response(question_text, response_text, survey_desc))
+        # Defect B: the deadline logic lives in src/domain/analysis_deadline.py
+        # so it can be tested without LiveKit. This function keeps only what
+        # needs the agent: speaking the filler.
+        async def _say_filler():
+            self._analysis_filler_said = True
+            self._transition_filler_said = True  # telemetry only; the guard is _analysis_filler_said
+            logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
+            # #region agent log
+            import json as _json
+            _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}))
+            # #endregion
+            await self._safe_say("One moment...", allow_interruptions=False, context="analysis_filler")
 
-        try:
-            result = await asyncio.wait_for(asyncio.shield(analysis_task), timeout=filler_threshold)
-        except asyncio.TimeoutError:
-            if not self._transition_filler_said and self.agent_session:
-                self._transition_filler_said = True
-                logger.info(f"🔊 Transition filler triggered (analysis > {filler_threshold}s)")
-                # #region agent log
-                import json as _json
-                _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Filler triggered", "data": {"threshold_s": filler_threshold, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "FILLER"}))
-                # #endregion
-                await self._safe_say("One moment...", allow_interruptions=False, context="analysis_filler")
-            result = await analysis_task
+        self._analysis_filler_said = False
 
+        # Assigned, never merely set: a successful analysis writes False here,
+        # so a timeout on one attempt cannot leak into a later retry.
+        result, self._analysis_timed_out = await analyze_with_deadline(
+            analyze_response(question_text, response_text, survey_desc),
+            filler_threshold=filler_threshold,
+            hard_deadline=ANALYSIS_HARD_DEADLINE,
+            on_filler=_say_filler,
+        )
+
+        if self._analysis_timed_out:
+            logger.error(
+                "🚨 ANALYSIS DEADLINE EXCEEDED (%.1fs) — failing OPEN: accepting "
+                "the response as relevant and proceeding. Q#%s participant=%s",
+                ANALYSIS_HARD_DEADLINE, self.current_question_num, _pid,
+            )
         analysis_duration = (datetime.now() - self._analysis_start_time).total_seconds()
-        logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
+        if self._analysis_timed_out:
+            # NOT the call's true duration — it was abandoned at the deadline.
+            # Marked so timeouts can be excluded when re-sizing
+            # ANALYSIS_HARD_DEADLINE from this series. A bare 6000 here would
+            # make the deadline look like a natural ceiling and hide the very
+            # outliers it exists to catch.
+            logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f} timed_out=1")
+        else:
+            logger.info(f"📊 METRIC: analysis_ms={analysis_duration * 1000:.0f}")
 
         # #region agent log
         import json as _json
-        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
+        _debug_log_write(_json.dumps({"location": "moderator_agent.py:_analyze_with_filler", "message": "Analysis complete", "data": {"analysis_ms": round(analysis_duration * 1000), "timed_out": self._analysis_timed_out,"filler_spoken": self._transition_filler_said, "is_relevant": result.is_relevant, "question_num": self.current_question_num}, "timestamp": int(datetime.now().timestamp() * 1000), "hypothesisId": "METRICS"}))
         # #endregion
 
         return result, analysis_duration
@@ -690,6 +727,7 @@ class CommunityModeratorAgent(Agent):
         self._prewarmed_ack_text = None
         self._first_utterance_greeting_guard_used = False
         self._transition_filler_said = False
+        self._analysis_timed_out = False  # Defect B: per-turn
         self._estimated_remaining_tts = 0.0
 
         # Timeout / turn monitoring
@@ -1830,6 +1868,7 @@ class CommunityModeratorAgent(Agent):
             question_number=self.current_question_num,
             participant=actual_speaker,
             response_text=corrected_response,
+            analysis_timed_out=self._analysis_timed_out,
         )
 
         # CSV export
@@ -1840,6 +1879,7 @@ class CommunityModeratorAgent(Agent):
             question_text=question_text,
             response_options=response_options,
             response_text=corrected_response,
+            analysis_timed_out=self._analysis_timed_out,
         )
 
         # Mark participant as answered
@@ -1999,6 +2039,7 @@ class CommunityModeratorAgent(Agent):
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
+        self._analysis_timed_out = False  # Defect B: per-turn
         self._ack_already_spoken = False
         self._prewarmed_ack_text = None
         self._first_utterance_greeting_guard_used = False  # Fixed: was missing — greeting guard fires on repeated question
@@ -2253,6 +2294,7 @@ class CommunityModeratorAgent(Agent):
         self.waiting_for_response = True
         self.last_speech_time = None
         self._transition_filler_said = False
+        self._analysis_timed_out = False  # Defect B: per-turn
         self._ack_already_spoken = False
         self._prewarmed_ack_text = None
 
@@ -3667,6 +3709,7 @@ class CommunityModeratorAgent(Agent):
         # Reset response flag before asking question
         self.response_captured = False
         self._transition_filler_said = False
+        self._analysis_timed_out = False  # Defect B: per-turn
 
         # Clean up any existing turn monitoring from previous question
         if self.turn_monitor_task:

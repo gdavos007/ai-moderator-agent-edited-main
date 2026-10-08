@@ -7,6 +7,8 @@ from dataclasses import dataclass
 
 import openai as openai_client
 
+from .constants import ANALYSIS_CLIENT_TIMEOUT, ANALYSIS_CLIENT_RETRIES
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,7 +145,13 @@ Participant's Response: {response_text}
 
 Analyze this response and output in the exact format: relevance|already_answered|repeat_request|partial_status|partial_answer|unanswered_questions"""
 
-        client = openai_client.AsyncOpenAI()
+        # Defect B: the SDK defaults are a 600s timeout with 2 retries — a
+        # ~30 minute worst case on a call that sits in the live conversation
+        # loop. Bound it just above the orchestration deadline so ours fires
+        # first and we keep control of the fallback.
+        client = openai_client.AsyncOpenAI(
+            timeout=ANALYSIS_CLIENT_TIMEOUT, max_retries=ANALYSIS_CLIENT_RETRIES
+        )
         llm_response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

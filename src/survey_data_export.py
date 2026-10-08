@@ -35,6 +35,7 @@ class SurveyDataExport:
             'question_text',
             'response_options',
             'response_text',
+            'analysis_timed_out',  # Defect B: accepted without LLM validation
             'timestamp'
         ])
 
@@ -52,7 +53,7 @@ class SurveyDataExport:
 
     def add_response(self, participant: str, question_number: int, question_id: str,
                      question_text: str, response_options: List[str],
-                     response_text: str):
+                     response_text: str, analysis_timed_out: bool = False):
         """Add a participant response to the DataFrame"""
 
         # Track unique participants
@@ -73,6 +74,7 @@ class SurveyDataExport:
             'question_text': question_text,
             'response_options': options_str,
             'response_text': formatted_response,
+            'analysis_timed_out': analysis_timed_out,
             'timestamp': datetime.now().isoformat()
         }])
 

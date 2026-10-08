@@ -125,6 +125,18 @@ POLL_WAIT_CAP_DEFAULT = 2.0
 # 0dbba0e (2026-06-03) with no recorded reasoning; the test and the docstring
 # were not updated and drifted for two months.
 STT_NUDGE_VAD_THRESHOLD = 3.0
+# ── Response-analysis deadline (Defect B) ────────────────────────────────────
+# Hard ceiling on the relevance-classifier LLM call. Sized from observed data:
+# session RM_Aq5EeHDjAozN n=25 median 1052ms p90 1709ms max 3844ms;
+# RM_Txc3zKUpnAWe n=17 median 1001ms p90 3285ms max 29515ms (the defect).
+# 6.0s clears the slowest legitimate call (3.8s) with margin while capping dead
+# air at 6s instead of the 29.5s observed in front of stakeholders.
+ANALYSIS_HARD_DEADLINE = 6.0
+
+# Client-side bounds for the same call. Without these the OpenAI SDK defaults
+# apply — 600s timeout with 2 retries, i.e. a ~30 minute worst case.
+ANALYSIS_CLIENT_TIMEOUT = 8.0   # > ANALYSIS_HARD_DEADLINE so ours fires first
+ANALYSIS_CLIENT_RETRIES = 1
 
 
 # ── Avatar health states ─────────────────────────────────────────────────────
